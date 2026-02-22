@@ -1,23 +1,41 @@
 # ===== execution.py =====
 import logging
 import pickle
+import pathlib
 import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
+import time
+from datetime import datetime, timedelta
 
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
-    CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point,ENTRY_OFFSET, ORDER_TYPE
-    
+    CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
+    MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE, symbols
 )
 from setup import (
-    df, fyers, fyers_asysc, ticker, option_chain, df, spot_price,
-    start_time, end_time, hist_data, time_zone )
-from indicators import (
-    calculate_cpr, calculate_traditional_pivots, calculate_camarilla_pivots,
-    resolve_atr, daily_atr, candles_3m, get_dynamic_target
+    df, fyers, ticker, option_chain, spot_price,
+    start_time, end_time, hist_data
 )
-from signals import detect_signal
+from indicators import (
+    calculate_cpr,
+    calculate_traditional_pivots,
+    calculate_camarilla_pivots,
+    resolve_atr,
+    daily_atr,
+    williams_r,
+    calculate_cci,
+    momentum_ok
+    
+)
+
+from signals import detect_signal, get_opening_range
+# from tickdb import tick_db
+from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
+from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
+from position_manager import (PositionManager, TradeLogger, make_replay_pm, make_paper_pm, make_live_pm)
+from day_type import (make_day_type_classifier, apply_day_type_to_pm,
+                      DayType, DayTypeResult)
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -39,6 +57,8 @@ except NameError:
 
 #===================================================================
 
+today_str = datetime.now().strftime("%Y-%m-%d")
+
 def map_status_code(code):
     status_map = {
         1: "CANCELLED",
@@ -57,19 +77,173 @@ def status_color(status):
 # ===== Shared state =====
 last_signal_candle_time = None
 
-# ===== Persistence =====
-def store(data, account_type_):
+# ── PositionManager singletons (paper & live) ─────────────────────────────
+# Initialised lazily on first call to paper_order / live_order so that
+# send_paper_exit_order / send_live_exit_order are already defined.
+# One PM per account type — single position at a time (CALL or PUT).
+paper_pm: "PositionManager | None" = None
+live_pm:  "PositionManager | None" = None
+
+# Monotonic bar counter used as bar_idx for PM.update() in paper/live mode.
+# Increments every second (called from main_strategy_code every second).
+_pm_bar_counter: int = 0
+
+# Session-level trade log written by PM.close() — used for end-of-day
+# summary and CSV export alongside the legacy filled_df.
+paper_trade_log: list = []
+live_trade_log:  list = []
+
+
+def get_live_option_ltp(state: dict) -> float:
+    """
+    Return the live option premium LTP for an open position.
+
+    Data source priority:
+      1. df.loc[option_name, "ltp"]
+         The WebSocket live-quote DataFrame (setup.py, updated every tick).
+         This is the ONLY consistent source for option premium in LIVE mode.
+         It is updated by onmessage() in data_feed.py on every tick.
+
+      2. state["buy_price"]  (entry premium)
+         Used as a fallback ONLY when the WebSocket has not yet received
+         a tick for this option symbol (e.g. first second after entry,
+         or if Fyers is not streaming that strike).
+         Conservative: implies 0 PnL since entry — never wrong direction.
+
+    Why NOT df_slice["close"]:
+      df_slice contains NIFTY index candles (close ≈ 25,600).
+      state["stop"], state["pt"], state["tg"] are set in OPTION PREMIUM
+      space (e.g. 123, 187, 217). Comparing them against NIFTY close
+      produces SL that never fires and TARGET that always fires immediately.
+
+    This function is called every second during LIVE / PAPER trading.
+    It is NEVER called in run_offline_replay — that path uses the
+    PositionManager which computes option premium from underlying delta.
+
+    Returns:
+      float — option premium ≥ 0.05 (minimum tick)
+    """
+    option_name  = state.get("option_name", "")
+    entry_price  = state.get("buy_price", 0.0)
+
+    # Primary: live WebSocket quote
     try:
-        pickle.dump(data, open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'wb'))
+        ltp = df.loc[option_name, "ltp"]
+        if ltp is not None and not pd.isna(ltp):
+            ltp = float(ltp)
+            if ltp > 0:
+                logging.debug(
+                    f"[OPT LTP] {option_name} live={ltp:.2f} "
+                    f"entry={entry_price:.2f}"
+                )
+                return ltp
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    # Fallback: entry price (conservative — implies 0 PnL, never wrong direction)
+    logging.debug(
+        f"[OPT LTP FALLBACK] {option_name} WebSocket LTP unavailable. "
+        f"Using entry price={entry_price:.2f}"
+    )
+    return float(entry_price) if entry_price and entry_price > 0 else 0.05
+
+# # ===== Persistence =====
+# def store(data, account_type_):
+#     try:
+#         pickle.dump(data, open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'wb'))
+#     except Exception as e:
+#         logging.error(f"Failed to store state: {e}")
+
+# def load(account_type_):
+#     try:
+#         return pickle.load(open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'rb'))
+#     except Exception as e:
+#         logging.warning(f"State load failed (fresh start): {e}")
+#         raise
+
+# ===== Persistence with Ledger =====
+
+def store(data, account_type_):
+    """
+    Append trading state to a ledger stored in a pickle file.
+    Each call adds a new snapshot to the list instead of overwriting.
+    Compatible with both legacy dict and new ledger format.
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
+    try:
+        # Try to load existing ledger
+        try:
+            with open(filename, "rb") as f:
+                ledger = pickle.load(f)
+
+            # Normalize legacy formats
+            if isinstance(ledger, dict):
+                # Old format: single dict snapshot
+                ledger = [ledger]
+            elif not isinstance(ledger, list):
+                # Unexpected format: reset to empty list
+                ledger = []
+        except Exception:
+            ledger = []
+
+        # Append current snapshot with timestamp + state
+        snapshot = {
+            "timestamp": dt.now(time_zone),
+            "state": data
+        }
+        ledger.append(snapshot)
+
+        # Save back to pickle
+        with open(filename, "wb") as f:
+            pickle.dump(ledger, f, protocol=pickle.HIGHEST_PROTOCOL)
+
     except Exception as e:
         logging.error(f"Failed to store state: {e}")
 
+
 def load(account_type_):
+    """
+    Load the latest trading state from pickle file.
+    Returns the most recent snapshot's state dict.
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
     try:
-        return pickle.load(open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'rb'))
+        with open(filename, "rb") as f:
+            ledger = pickle.load(f)
+
+        # Ledger is a list of snapshots; return the latest state
+        if isinstance(ledger, list) and ledger:
+            return ledger[-1]["state"]
+        elif isinstance(ledger, dict):
+            # Legacy single snapshot
+            return ledger
+        else:
+            raise ValueError("Ledger format invalid or empty")
     except Exception as e:
         logging.warning(f"State load failed (fresh start): {e}")
         raise
+
+
+def load_ledger(account_type_):
+    """
+    Load the full ledger (all snapshots) from pickle file.
+    Useful for audit, replay, or debugging.
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
+    try:
+        with open(filename, "rb") as f:
+            ledger = pickle.load(f)
+
+        # Normalize legacy formats
+        if isinstance(ledger, dict):
+            return [ledger]
+        elif isinstance(ledger, list):
+            return ledger
+        else:
+            return []
+    except Exception as e:
+        logging.warning(f"Ledger load failed: {e}")
+        return []
 
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
@@ -126,39 +300,267 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
 
     return sel.squeeze(), strike
 
-# ===== Dynamic levels =====
-def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
+
+
+def check_exit_condition(df_slice, state, option_ltp: float = None):
     """
-    Build stop-loss, partial/full targets, and trailing parameters.
-    Long-only logic (same for CALL and PUT):
-    - Stop below entry
-    - Targets above entry
+    Exit logic for options buying (CALL and PUT are both LONG positions).
+
+    DATA CONSISTENCY:
+      option_ltp  — live option premium from get_live_option_ltp().
+                    Must be in OPTION PREMIUM space (e.g. 50-400).
+                    Used for ALL price-level checks: SL, target, partial, trail.
+
+      df_slice    — NIFTY index 3m candles.
+                    Used ONLY for structural checks: CCI, RSI, Williams%R,
+                    SuperTrend bias, reversal candle direction, EMA gap.
+                    Never used for absolute price comparisons vs option levels.
+
+    Why two sources:
+      state["stop"], state["pt"], state["tg"] are set in option premium space.
+      df_slice["close"] is NIFTY index close (~25,600).
+      Comparing NIFTY close against option SL (123) or TG (217) is wrong:
+        SL never fires: 25600 <= 123 is always False.
+        TG always fires: 25600 >= 217 is always True after min hold.
+
+    FIXES vs original:
+    - current_ltp now uses option_ltp (premium space), not df_slice close (index space)
+    - Reversal candle direction is side-aware (df_slice still used here — correct)
+    - partial_booked initialised and used correctly
+    - buffer_points = 5 (was 12, too large for option premiums)
+    - trail_updates uses .get() to avoid KeyError
     """
-    risk_points   = max(profit_loss_point, atr * 0.25)
-    reward_points = risk_points * rr_ratio
 
-    stop  = entry_price - risk_points
-    partial_target = entry_price + reward_points / 2
-    full_target    = entry_price + reward_points
+    i            = len(df_slice) - 1
+    side         = state["side"]
+    entry_price  = state.get("buy_price", 0)
+    entry_candle = state.get("entry_candle", i)
 
-    trail_start = reward_points / 2
-    trail_step  = atr * 0.1
+    # ── Option premium LTP — the ONLY correct price for SL/TG/trail checks ──
+    # option_ltp comes from get_live_option_ltp() via process_order.
+    # Fallback to entry_price (not df_slice close) if not provided.
+    if option_ltp is None or pd.isna(option_ltp) or option_ltp <= 0:
+        option_ltp = float(entry_price) if entry_price > 0 else 0.05
+    current_ltp = option_ltp    # option premium — correct universe
 
-    return stop, full_target, partial_target, trail_start, trail_step
+    # Minimum hold: 2 candles
+    if i - entry_candle < 2:
+        return False, None
 
-def update_trailing_stop(current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
+    stop       = state.get("stop")
+    pt         = state.get("pt")
+    tg         = state.get("tg")
+    trail_step = state.get("trail_step", 5)
+
+    # 1. Hard stop loss
+    if stop is not None and current_ltp <= stop:
+        logging.info(f"{RED}[EXIT][SL_HIT] {side} ltp={current_ltp:.2f} stop={stop:.2f}{RESET}")
+        return True, "SL_HIT"
+
+    # 2. Full target
+    if tg is not None and current_ltp >= tg:
+        logging.info(f"{GREEN}[EXIT][TARGET_HIT] {side} ltp={current_ltp:.2f} tg={tg:.2f}{RESET}")
+        return True, "TARGET_HIT"
+
+    # 3. Partial target + lock break-even
+    if pt is not None and not state.get("partial_booked", False):
+        if current_ltp >= pt:
+            state["partial_booked"] = True
+            if (state.get("stop") or 0) < entry_price:
+                state["stop"] = entry_price
+            logging.info(
+                f"{GREEN}[PARTIAL] {side} ltp={current_ltp:.2f} >= pt={pt:.2f} "
+                f"→ stop locked to entry {entry_price:.2f}{RESET}"
+            )
+
+    # 4. Trailing stop (buffer = 5 option pts)
+    pnl = current_ltp - entry_price
+    if pnl >= 5 and trail_step > 0:
+        new_stop = current_ltp - trail_step
+        if new_stop > state.get("stop", 0):
+            state["stop"] = new_stop
+            state["trail_updates"] = state.get("trail_updates", 0) + 1
+            logging.info(f"{CYAN}[TRAIL] {side} stop → {new_stop:.2f} ltp={current_ltp:.2f}{RESET}")
+
+    # 5. Oscillator exhaustion (2-of-3)
+    osc_hits = []
+    try:
+        cci_s = calculate_cci(df_slice) if "cci20" not in df_slice.columns else df_slice["cci20"]
+        cci   = float(cci_s.iloc[-1]) if not cci_s.empty else None
+        if cci and not pd.isna(cci):
+            if side == "CALL" and cci >  130: osc_hits.append(f"CCI={cci:.0f}")
+            if side == "PUT"  and cci < -130: osc_hits.append(f"CCI={cci:.0f}")
+    except Exception: pass
+
+    try:
+        rsi_col = df_slice["rsi14"] if "rsi14" in df_slice.columns else pd.Series(dtype=float)
+        rsi     = float(rsi_col.iloc[-1]) if not rsi_col.empty else None
+        if rsi and not pd.isna(rsi):
+            if side == "CALL" and rsi >  75: osc_hits.append(f"RSI={rsi:.0f}")
+            if side == "PUT"  and rsi <  25: osc_hits.append(f"RSI={rsi:.0f}")
+    except Exception: pass
+
+    try:
+        wr = williams_r(df_slice)
+        if wr and not pd.isna(wr):
+            if side == "CALL" and wr > -10: osc_hits.append(f"WR={wr:.0f}")
+            if side == "PUT"  and wr < -88: osc_hits.append(f"WR={wr:.0f}")
+    except Exception: pass
+
+    if len(osc_hits) >= 2:
+        if OSCILLATOR_EXIT_MODE == "HARD":
+            logging.info(f"{YELLOW}[EXIT][OSC] {side} {'+'.join(osc_hits)}{RESET}")
+            return True, "OSC_EXHAUSTION"
+        else:
+            if state.get("stop", 0) < entry_price:
+                state["stop"] = entry_price
+
+    # 6. Supertrend flip: 2 consecutive opposing candles
+    if "supertrend_bias" in df_slice.columns and len(df_slice) >= 2:
+        def norm(b):
+            return "UP" if b in ("UP","BULLISH") else ("DOWN" if b in ("DOWN","BEARISH") else "N")
+        b1 = norm(df_slice["supertrend_bias"].iloc[-1])
+        b2 = norm(df_slice["supertrend_bias"].iloc[-2])
+        if side == "CALL" and b1 == "DOWN" and b2 == "DOWN":
+            logging.info(f"{YELLOW}[EXIT][ST_FLIP] CALL bearish x2{RESET}")
+            return True, "ST_FLIP"
+        if side == "PUT"  and b1 == "UP"   and b2 == "UP":
+            logging.info(f"{YELLOW}[EXIT][ST_FLIP] PUT bullish x2{RESET}")
+            return True, "ST_FLIP"
+
+    # 7. Consecutive reversal candles (direction-aware — FIX)
+    last_c = df_slice.iloc[-1]
+    is_reversal = (
+        (side == "CALL" and last_c["close"] < last_c["open"]) or
+        (side == "PUT"  and last_c["close"] > last_c["open"])
+    )
+    state["consec_count"] = (state.get("consec_count", 0) + 1) if is_reversal else 0
+    if state["consec_count"] >= 3:
+        logging.info(f"{YELLOW}[EXIT][REVERSAL] {side} {state['consec_count']} reversal candles{RESET}")
+        return True, "REVERSAL_EXIT"
+
+    # 8. EMA plateau + momentum drop
+    ema9  = df_slice["close"].ewm(span=9,  adjust=False).mean().iloc[-1]
+    ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
+    ema_gap = abs(ema9 - ema13)
+
+    _, momentum = momentum_ok(df_slice, side)
+    momentum = momentum or 0
+
+    prev_gap      = state.get("prev_gap", ema_gap)
+    peak_momentum = state.get("peak_momentum", abs(momentum))
+
+    if ema_gap > prev_gap:
+        state["prev_gap"]      = ema_gap
+        state["peak_momentum"] = max(peak_momentum, abs(momentum))
+        state["plateau_count"] = 0
+        return False, None
+
+    state["plateau_count"] = state.get("plateau_count", 0) + 1
+    state["prev_gap"]      = ema_gap
+
+    if state["plateau_count"] >= 2 and abs(momentum) < peak_momentum * 0.4 and len(osc_hits) >= 1:
+        logging.info(f"{YELLOW}[EXIT][MOMENTUM] {side} plateau+drop+osc{RESET}")
+        return True, "MOMENTUM_EXIT"
+
+    # 9. Time guard: 8 candles with no trail
+    if i - entry_candle >= 8 and state.get("trail_updates", 0) == 0:
+        logging.info(f"{YELLOW}[EXIT][TIME] {side} {i-entry_candle} candles no trail{RESET}")
+        return True, "TIME_EXIT"
+
+    return False, None
+
+
+def build_dynamic_levels(entry_price, atr, side, entry_candle,
+                         rr_ratio=2.0, profit_loss_point=5, candles_df=None):
+    """
+    Build SL/PT/TG/trail for OPTIONS BUYING (long call or long put).
+
+    FIX: Uses % of option premium (entry_price), not underlying index ATR.
+    ATR on Nifty index = 30-100 pts. Option premium = 50-300 pts.
+    Setting SL = entry - 1.5*ATR = entry - 75 pts for a 100-pt option premium
+    means SL is below zero — meaningless.
+
+    % approach: SL at 18% below premium, PT at 25%, TG at 45%.
+    Example: entry=150 → SL=123, PT=187.5, TG=217.5
+    """
+    if entry_price is None or entry_price <= 0:
+        logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
+        return None, None, None, None, None
+
+    if atr is None or pd.isna(atr):
+        logging.warning("[LEVELS] ATR unavailable")
+        return None, None, None, None, None
+
+    # Regime from underlying ATR
+    if atr <= 80:
+        mode = "normal"
+    elif atr <= 200:
+        mode = "volatile"
+    else:
+        logging.warning(f"[LEVELS][EXTREME] ATR={atr:.0f} — skipping trade")
+        return None, None, None, None, None
+
+    # % of option premium — entirely independent of underlying ATR
+    if mode == "normal":
+        sl_pct   = 0.18   # 18% below entry
+        pt_pct   = 0.25   # partial target
+        tg_pct   = 0.45   # full target
+        step_pct = 0.06   # trail step
+    else:  # volatile
+        sl_pct   = 0.22
+        pt_pct   = 0.30
+        tg_pct   = 0.55
+        step_pct = 0.09
+
+    stop           = round(entry_price * (1 - sl_pct),  2)
+    partial_target = round(entry_price * (1 + pt_pct),  2)
+    full_target    = round(entry_price * (1 + tg_pct),  2)
+    trail_start    = round(entry_price * pt_pct * 0.5,  2)
+    trail_step     = round(max(entry_price * step_pct, 2.0), 2)
+
+    logging.info(
+        f"{CYAN}[LEVELS][{mode.upper()}] {side} entry={entry_price:.2f} "
+        f"SL={stop:.2f}(-{sl_pct*100:.0f}%) "
+        f"PT={partial_target:.2f}(+{pt_pct*100:.0f}%) "
+        f"TG={full_target:.2f}(+{tg_pct*100:.0f}%) "
+        f"Step={trail_step:.2f} indexATR={atr:.1f}{RESET}"
+    )
+    return stop, partial_target, full_target, trail_start, trail_step
+
+def update_trailing_stop(current_price, entry_price, current_stop,
+                         trail_start_pnl, trail_step_points, buffer_points=12):
     """
     Update trailing stop once partial target booked.
-    Long-only logic (same for CALL and PUT):
-    - Move stop up as option price rises
+    Adjustments for live market:
+    - Buffered trailing (≥ buffer_points move in favor)
+    - Ratchets stop upward/downward depending on side
     """
+
     pnl = current_price - entry_price
-    if pnl >= trail_start_pnl:
-        candidate = current_price - trail_step_points
-        return max(current_stop, candidate)  # stop ratchets upward
+
+    # Only trail if price has moved enough in favor
+    if abs(pnl) >= buffer_points and trail_step_points > 0:
+        candidate = current_price - trail_step_points if pnl > 0 else current_price + trail_step_points
+        new_stop = max(current_stop, candidate) if pnl > 0 else min(current_stop, candidate)
+
+        if new_stop != current_stop:
+            logging.info(
+                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}{RESET}"
+            )
+        return new_stop
+
     return current_stop
 
+
 # ===== PAPER/LIVE STATE INIT =====
+
+risk_info = {
+    "session_pnl": 0,
+    "peak_equity": 0,
+    "halt_trading": False
+}
+
 if account_type == 'PAPER':
     try:
         paper_info = load(account_type)
@@ -210,9 +612,13 @@ if account_type == 'PAPER':
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'put_buy': {
                 'option_name': put_option,
@@ -226,14 +632,19 @@ if account_type == 'PAPER':
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'condition': False,
             'total_pnl': 0,
             'trade_count': 0,
-            'max_trades': MAX_TRADES_PER_DAY
+            'max_trades': MAX_TRADES_PER_DAY,
+            'last_exit_time': None,
         }
 
 else:
@@ -287,9 +698,13 @@ else:
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'put_buy': {
                 'option_name': put_option,
@@ -303,17 +718,24 @@ else:
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'condition': False,
             'total_pnl': 0,
             'trade_count': 0,
-            'max_trades': MAX_TRADES_PER_DAY
+            'max_trades': MAX_TRADES_PER_DAY,
+            'last_exit_time': None,
         }
 
+
 # ===== Broker order functions =====
+
 def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
     """
     Place a live LIMIT entry order via Fyers API.
@@ -347,13 +769,15 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
         response = fyers.place_order(data=order_data)
 
         if response.get("s") == "ok":
+            logging.info(f"{YELLOW}[LIVE ENTRY] {symbol} Qty={qty}{RESET}")
             return True, response.get("id")
+
         else:
-            logging.error(f"[LIVE ENTRY FAILED] {symbol} {response}")
+            logging.error(f"{CYAN}[LIVE ENTRY FAILED] {symbol} {response}{RESET}")
             return False, None
 
     except Exception as e:
-        logging.error(f"[LIVE ENTRY ERROR] {symbol} {e}")
+        logging.error(f"{CYAN}[LIVE ENTRY ERROR] {symbol} {e}{RESET}")
         return False, None
 
 
@@ -387,16 +811,16 @@ def send_live_exit_order(symbol, qty, reason):
 
         if response.get("s") == "ok":
             logging.info(
-                f"{MAGENTA}[LIVE EXIT][{reason}] {symbol} Qty={qty} "
+                f"{YELLOW}[LIVE EXIT][{reason}] {symbol} Qty={qty}{RESET}"
                 f"OrderID={response.get('id')}{RESET}"
             )
             return True, response.get("id")
         else:
-            logging.error(f"[LIVE EXIT FAILED] {symbol} {response}")
+            logging.error(f"{RED}[LIVE EXIT FAILED] {symbol} {response}{RESET}")
             return False, None
 
     except Exception as e:
-        logging.error(f"{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}")
+        logging.error(f"{RED}{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}{RESET}")
         return False, None
     
 def send_paper_exit_order(symbol, qty, reason):
@@ -406,7 +830,7 @@ def send_paper_exit_order(symbol, qty, reason):
     - Always log the exit with reason and quantity
     - Return success flag and synthetic order_id
     """
-    logging.info(f"{MAGENTA}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
+    logging.info(f"{CYAN}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
     return True, f"paper_exit_{symbol}_{reason}"
 
 def update_order_status(order_id, status, filled_qty, avg_price, symbol):
@@ -471,103 +895,120 @@ def check_order_status(order_id, fyers):
         logging.error(f"{RED}[ORDER STATUS ERROR] {e}{RESET}")
         return None, None
 
-def process_order(side, symbol, price, info, hist_data):
-    trade = info["call_buy"] if side == "CALL" else info["put_buy"]
-    entry = trade["buy_price"]
-    qty   = trade["quantity"]
-    account_type = info.get("account_type", "paper")
+# =================== Dynamic Order Processing / ATR based SL/PT/TG ==========================
 
-    # --- Stop-loss check (long-only for both CALL and PUT) ---
-    sl_hit = price <= trade["current_stop_price"]
-    if sl_hit:
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(trade["option_name"], qty, "STOPLOSS")
+# ===== process_order =====
+def process_order(state, df_slice, info, spot_price,
+                  account_type="paper", mode="LIVE"):
+    """
+    Manage exits for an active trade using SL/Target + hybrid exit logic.
+    - mode="LIVE": full DB persistence + live orders
+    - mode="REPLAY": skip DB writes, only simulate exits
+
+    DATA CONSISTENCY:
+      All price-level exit checks (SL, target, partial, trail) operate in
+      OPTION PREMIUM space using option_ltp from get_live_option_ltp().
+
+      df_slice (NIFTY index candles) is passed to check_exit_condition
+      ONLY for structural pattern checks (ST_FLIP, REVERSAL, OSC, EMA gap).
+      It is NEVER used for absolute price comparisons against option levels.
+
+      spot_price (NIFTY index) is kept for logging / record context only.
+      It is NOT used for any exit trigger comparison.
+    """
+
+    side   = state["side"]
+    symbol = state.get("option_name", "N/A")
+    entry  = state.get("buy_price", 0)
+    qty    = state.get("quantity", 0)
+
+    # ── Option premium LTP — single consistent price source for all exits ──
+    # Primary: df.loc[option_name, "ltp"] — WebSocket live quote (every tick).
+    # Fallback: state["buy_price"] — entry price (conservative, never wrong dir).
+    # NEVER use df_slice["close"] (NIFTY ~25,600) vs option levels (50–400).
+    option_ltp = get_live_option_ltp(state)
+
+    buffer = 2.0
+    exit_reason = None
+
+    # --- Price-level SL / Target checks — option premium space only ---
+    # For options buying, both CALL and PUT are LONG positions.
+    # SL fires when premium drops below stop level.
+    # Target fires when premium rises above partial target level.
+    # (put option premium rises when underlying falls — same logic applies)
+    if side == "CALL":
+        if option_ltp <= state["stop"] + buffer:
+            exit_reason = "SL_HIT"
+        elif option_ltp >= state.get("tg", float("inf")) - buffer:
+            exit_reason = "TARGET_HIT"
+    elif side == "PUT":
+        if option_ltp <= state["stop"] + buffer:
+            exit_reason = "SL_HIT"
+        elif option_ltp >= state.get("tg", float("inf")) - buffer:
+            exit_reason = "TARGET_HIT"
+
+    # --- Structural / pattern exits — NIFTY candle df_slice (correct) ---
+    # check_exit_condition receives option_ltp for premium-level checks
+    # (SL, trail, partial) and uses df_slice only for pattern checks.
+    if not exit_reason:
+        triggered, reason = check_exit_condition(df_slice, state, option_ltp=option_ltp)
+        if triggered and reason:
+            exit_reason = reason
+
+    if not exit_reason:
+        return False, None
+
+    # --- Route exit order ---
+    if account_type.lower() == "paper":
+        success, order_id = send_paper_exit_order(symbol, qty, exit_reason)
+    else:
+        if mode == "LIVE":
+            success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
         else:
-            success, order_id = send_live_exit_order(trade["option_name"], qty, "STOPLOSS")
+            # REPLAY mode → simulate success, no DB
+            success, order_id = True, "REPLAY_ORDER"
 
-        if success:
-            trade["order_id"] = order_id
-            pnl_points = price - entry   # ✅ unified for CALL and PUT
-            trade["pnl"] += pnl_points * qty
-            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
-            trade["trade_flag"] = 0
-            trade["quantity"] = 0
-            trade["filled_df"].loc[dt.now(time_zone)] = [
-                symbol, price, "SELL", trade["current_stop_price"],
-                trade.get("full_target_price", 0), spot_price, qty
-            ]
-            logging.info(f"{RED}[EXIT][{account_type.upper()} STOPLOSS] LONG {side} {symbol} Qty={qty} Price={price:.2f}{RESET}")
-            update_order_status(order_id, "PENDING", qty, price, symbol)
-            return True   # EXIT occurred
-        return False
+    if success:
+        # ── Exit price = option premium at exit, not NIFTY close ──
+        # option_ltp is already fetched above — use it directly.
+        exit_price = option_ltp
+        pnl_points = exit_price - entry if side == "CALL" else entry - exit_price
+        pnl_value  = pnl_points * qty
 
-    # --- Partial Profit Booking (long-only for both CALL and PUT) ---
-    partial_hit = price >= trade["partial_target_price"]
-    if not trade.get("partial_booked", False) and partial_hit:
-        half_qty = qty // 2
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(trade["option_name"], half_qty, "PARTIAL")
-        else:
-            success, order_id = send_live_exit_order(trade["option_name"], half_qty, "PARTIAL")
+        trade = info["call_buy"] if side == "CALL" else info["put_buy"]
+        trade["pnl"] += pnl_value
+        info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
+        trade["trade_flag"] = 0
+        trade["quantity"] = 0
 
-        if success:
-            trade["order_id"] = order_id
-            pnl_points = price - entry   # ✅ unified for CALL and PUT
-            trade["pnl"] += pnl_points * half_qty
-            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
-            trade["quantity"] -= half_qty
-            trade["partial_booked"] = True
-            trade["current_stop_price"] = entry  # move SL to cost
-            trade["filled_df"].loc[dt.now(time_zone)] = [
-                symbol, price, "SELL", trade["current_stop_price"],
-                trade.get("full_target_price", 0), spot_price, half_qty
-            ]
-            logging.info(f"{CYAN}[EXIT][{account_type.upper()} PARTIAL] LONG {side} {symbol} HalfQty={half_qty} Price={price:.2f}{RESET}")
-            update_order_status(order_id, "PENDING", half_qty, price, symbol)
+        trade["filled_df"].loc[dt.now(time_zone)] = [
+            symbol, entry, exit_price, side,
+            state.get("reason", "UNKNOWN"),
+            exit_reason,
+            state.get("entry_candle", -1),
+            len(df_slice) - 1,
+            pnl_points, pnl_value,
+            spot_price, qty
+        ]
 
-    # --- Full Target Check (long-only for both CALL and PUT) ---
-    full_hit = price >= trade["full_target_price"]
-    if full_hit:
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(trade["option_name"], trade["quantity"], "TARGET")
-        else:
-            success, order_id = send_live_exit_order(trade["option_name"], trade["quantity"], "TARGET")
-
-        if success:
-            trade["order_id"] = order_id
-            pnl_points = price - entry   # ✅ unified for CALL and PUT
-            qty_exit = trade["quantity"]
-            trade["pnl"] += pnl_points * qty_exit
-            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
-            trade["trade_flag"] = 0
-            trade["quantity"] = 0
-            trade["filled_df"].loc[dt.now(time_zone)] = [
-                symbol, price, "SELL", trade["current_stop_price"],
-                trade.get("full_target_price", 0), spot_price, qty_exit
-            ]
-            logging.info(f"{GREEN}[EXIT][{account_type.upper()} TARGET] LONG {side} {symbol} Qty={qty_exit} Price={price:.2f}{RESET}")
-            update_order_status(order_id, "PENDING", qty_exit, price, symbol)
-            return True   # EXIT occurred
-        return False
-
-    # --- Trailing Stop Update (long-only for both CALL and PUT) ---
-    if trade.get("partial_booked", False):
-        new_stop = update_trailing_stop(
-            price, entry,
-            trade["current_stop_price"],
-            trade["trail_start_pnl"],
-            trade["trail_step_points"]
+        logging.info(
+            f"{YELLOW}[EXIT][{account_type.upper()} {exit_reason}] {side} {symbol} "
+            f"EntryCandle={state['entry_candle']} ExitCandle={len(df_slice)-1} "
+            f"OptionLTP={option_ltp:.2f} Entry={entry:.2f} Exit={exit_price:.2f} Qty={qty} "
+            f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) "
+            f"Underlying={spot_price:.2f} "
+            f"Reason={state.get('reason','UNKNOWN')} "
+            f"TrailUpdates={state.get('trail_updates',0)}{RESET}"
         )
-        if new_stop != trade["current_stop_price"]:
-            trade["current_stop_price"] = new_stop
-            logging.info(f"{MAGENTA}[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}{RESET}")
 
-    # --- MTM Logging ---
-    logging.info(
-        f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM LONG {side} {symbol} LTP={price:.2f} Entry={entry:.2f}"
-    )
+        if mode == "LIVE":
+            update_order_status(order_id, "PENDING", qty, exit_price, symbol)
+        else:
+            logging.info("[REPLAY] Skipping DB update")
 
-    return False   # No full exit occurred
+        return True, exit_reason
+
+    return False, None
 
 
 def cleanup_trade_exit(info, leg, side, name, qty, exit_price, mode, reason):
@@ -601,303 +1042,1467 @@ def force_close_old_trades(info, mode):
                 exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
                 cleanup_trade_exit(info, leg, side, name, qty, exit_price, mode, "FORCE_CLEANUP")
 
-# ===== paper_order =====
-def paper_order():
-    global quantity, paper_info, df, spot_price, last_signal_candle_time
 
-    # --- Safety reset: ensure no lingering trade_flag=2 ---
-    for leg in ["call_buy", "put_buy"]:
-        if paper_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
-            paper_info[leg]["trade_flag"] = 0
-    
+def update_risk(trade_info, risk_info):
+    """
+    Update risk metrics after each exit.
+    trade_info: paper_info or live_info dict
+    risk_info: session-level dict
+    """
+    # Calculate cumulative PnL
+    total_pnl = sum([
+        trade_info["call_buy"].get("pnl", 0),
+        trade_info["put_buy"].get("pnl", 0)
+    ])
+    risk_info["session_pnl"] = total_pnl
+
+    # Update peak equity
+    risk_info["peak_equity"] = max(risk_info["peak_equity"], total_pnl)
+
+    # Check daily max loss
+    if total_pnl <= MAX_DAILY_LOSS:
+        risk_info["halt_trading"] = True
+        logging.warning(f"[RISK HALT] Daily loss limit breached: {total_pnl:.2f}")
+
+    # Check drawdown
+    if (total_pnl - risk_info["peak_equity"]) <= MAX_DRAWDOWN:
+        risk_info["halt_trading"] = True
+        logging.warning(
+            f"[RISK HALT] Max drawdown breached: {total_pnl:.2f} vs peak {risk_info['peak_equity']:.2f}"
+        )
+
+def _pm_record_to_info(record: dict, info: dict, trade_log: list) -> None:
+    """
+    Bridge PositionManager.close() record → legacy info dict and trade_log.
+
+    Called after every PM exit (HARD_STOP, TRAIL_STOP, OSC_EXHAUSTION, etc.)
+    to keep paper_info / live_info in sync with PM state.
+
+    Responsibilities:
+      1. Reset trade_flag to 0 so next entry is allowed.
+      2. Write exit row to filled_df (CSV export backward compat).
+      3. Accumulate PnL in info["total_pnl"].
+      4. Append record to session trade_log.
+      5. Call update_risk() so daily-loss / drawdown halts fire correctly.
+    """
+    side    = record["side"]
+    leg     = "call_buy" if side == "CALL" else "put_buy"
+    t       = info[leg]
+
+    # ── 1. Reset trade flag ──────────────────────────────────────────────────
+    t["trade_flag"] = 0
+    t["quantity"]   = 0
+
+    # ── 2. Accumulate PnL ────────────────────────────────────────────────────
+    t["pnl"] = t.get("pnl", 0) + record["pnl_value"]
+    info["total_pnl"] = (
+        info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
+    )
+
+    # ── 3. Write exit row to filled_df ────────────────────────────────────────
+    # Column layout matches process_order exit write:
+    # symbol, entry, exit_price, side, entry_reason, exit_reason,
+    # entry_candle, exit_candle, pnl_points, pnl_value, spot_price, qty
+    import pendulum as _dt
+    from config import time_zone as _tz
+    exit_ts = _dt.now(_tz)
+    t["filled_df"].loc[exit_ts] = [
+        record.get("option_name", t.get("option_name", "?")),
+        record["entry_premium"],
+        record["exit_premium"],
+        side,
+        record.get("source", t.get("reason", "?")),
+        record["exit_reason"],
+        record.get("entry_bar", -1),
+        record.get("exit_bar",  -1),
+        record["pnl_points"],
+        record["pnl_value"],
+        record.get("exit_ul", 0),
+        record["lot_size"],
+    ]
+
+    # ── 4. Append to session trade log ───────────────────────────────────────
+    trade_log.append(record)
+
+    # ── 5. Risk gate update ──────────────────────────────────────────────────
+    update_risk(info, risk_info)
+
+    logging.info(
+        f"[PM→INFO] {side} leg={leg} trade_flag→0 "
+        f"session_pnl={info['total_pnl']:+.2f} "
+        f"exit={record['exit_reason']}"
+    )
+
+
+def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY"):
+    """
+    Paper trading order manager.
+
+    EXIT PATH — PositionManager (paper_pm):
+      paper_pm.update() is called on every invocation while a position is open.
+      It receives get_live_option_ltp() as `underlying` so all price-level
+      exits (HARD_STOP, TRAIL_STOP, PARTIAL, OSC, MOMENTUM_PEAK) operate in
+      option premium space.  Structural exits (ST_FLIP_2, REVERSAL_3, EMA_CROSS)
+      use the indicator row from candles_3m.iloc[-1] — correct and unchanged.
+
+    ENTRY PATH — unchanged detect_signal() → PM.open():
+      Same signal scoring, option selection, entry price read.
+      paper_info[leg]["trade_flag"] still gates entries (one trade at a time).
+
+    REPLAY SNAPSHOT mode (mode="REPLAY"):
+      paper_order is called once with the full snapshot.
+      PM path is still used — PM resets cleanly on each fresh paper_order call
+      because paper_pm is a module-level singleton reset guard is handled by
+      trade_flag == 0 / pm.is_open() being consistent.
+    """
+    global quantity, paper_info, df, spot_price, last_signal_candle_time
+    global risk_info, paper_pm, _pm_bar_counter, paper_trade_log
+
+    COOLDOWN_SECONDS = 120
     ct = dt.now(time_zone)
 
-    # 1. Refresh spot price (simulated)
-    try:
-        quote = fyers.quotes(data={"symbols": ticker})
-        spot_price = quote["d"][0]["v"]["lp"]
-        logging.info(f"Spot={spot_price}")
-    except Exception as e:
-        logging.warning(f"[PAPER] Spot fetch failed: {e}")
+    # ── Lazy PM initialisation (needs send_paper_exit_order defined first) ──
+    if paper_pm is None:
+        paper_pm = make_paper_pm(
+            broker_exit_fn=send_paper_exit_order,
+            lot_size=quantity,
+        )
+        logging.info("[PAPER] PositionManager initialised")
 
-    # 2. EOD FORCE EXIT
+    # 1. Safety reset on legacy trade_flag
+    for leg in ["call_buy", "put_buy"]:
+        if paper_info[leg].get("trade_flag", 0) == 2:
+            logging.warning(f"[RESET] lingering trade_flag=2 for {leg}")
+            paper_info[leg]["trade_flag"] = 0
+
+    # 2. Spot price from last candle close (NIFTY index)
+    if candles_3m is not None and not candles_3m.empty:
+        spot_price = float(candles_3m.iloc[-1]["close"])
+        logging.info(f"[PAPER] Spot={spot_price:.2f}")
+
+    # 3. End-of-day force exit via PM
     if ct > end_time:
-        logging.info("[PAPER] End time reached, closing open positions")
-        for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if paper_info[leg]["trade_flag"] == 1:  # still active
-                name = paper_info[leg]["option_name"]
-                qty  = paper_info[leg]["quantity"]
-
-                success, order_id = send_paper_exit_order(name, qty, "EOD")
-                if success:
-                    exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(
-                        paper_info, leg, side, name, qty, exit_price, "PAPER", "EOD"
-                    )
-                    update_order_status(order_id, "PENDING", qty, exit_price, name)
+        logging.info("[PAPER] EOD — closing open positions via PM")
+        if paper_pm.is_open():
+            # Determine which leg is open to get option_name for LTP lookup
+            open_leg  = next(
+                (leg for leg in ["call_buy", "put_buy"]
+                 if paper_info[leg].get("trade_flag", 0) == 1), None
+            )
+            eod_ltp = (
+                get_live_option_ltp(paper_info[open_leg])
+                if open_leg else spot_price
+            )
+            bar_time_str = str(ct)
+            record = paper_pm.force_close_eod(
+                _pm_bar_counter, bar_time_str, eod_ltp
+            )
+            if record:
+                _pm_record_to_info(record, paper_info, paper_trade_log)
+                paper_info["last_exit_time"] = ct
+        store(paper_info, account_type)
         return
 
-    # 3. SIGNAL EVALUATION
-    signal = None
-    if not candles_3m.empty:
-        last_candle_time = candles_3m.iloc[-1]["time"]
-        if last_signal_candle_time != last_candle_time:
-            last_signal_candle_time = last_candle_time
-            atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
+    # 4. EXIT MANAGEMENT — PositionManager (every call, before de-dup)
+    # ─────────────────────────────────────────────────────────────────
+    # PM.update() receives get_live_option_ltp() as `underlying`.
+    # In PAPER mode: cur = max(0.1, underlying) — direct option LTP. ✅
+    # Indicator row = candles_3m.iloc[-1] — for structural exits. ✅
+    _pm_bar_counter += 1
+
+    if paper_pm.is_open() and candles_3m is not None and not candles_3m.empty:
+        # Identify open leg to get option_name for LTP lookup
+        open_leg = next(
+            (leg for leg in ["call_buy", "put_buy"]
+             if paper_info[leg].get("trade_flag", 0) == 1), None
+        )
+        if open_leg:
+            option_ltp   = get_live_option_ltp(paper_info[open_leg])
+            indicator_row = candles_3m.iloc[-1]
+            bar_time_str  = str(candles_3m.iloc[-1].get("time", str(ct)))
+
+            decision = paper_pm.update(
+                _pm_bar_counter, bar_time_str,
+                option_ltp,      # underlying = option premium in PAPER mode
+                indicator_row,
             )
-            prev_day = hist_data.iloc[-1]
-            cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-            trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            signal = detect_signal(cpr, trad, cam, atr, candles_3m)
 
-    # 4. PAPER ENTRY LOGIC
-    if signal:
-        side, reason = signal
-        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
+            if decision.should_exit:
+                record = paper_pm.close(
+                    _pm_bar_counter, bar_time_str,
+                    spot_price,          # underlying = NIFTY spot for record
+                    decision.exit_px,    # exit_px = option premium at exit
+                    decision.reason,
+                    paper_info[open_leg]["quantity"],
+                )
+                _pm_record_to_info(record, paper_info, paper_trade_log)
+                paper_info["last_exit_time"] = ct
+                logging.info(
+                    f"[EXIT DONE][PAPER] {record['side']} "
+                    f"reason={record['exit_reason']} "
+                    f"pnl={record['pnl_value']:+.0f}₹"
+                )
 
-        leg = "call_buy" if side == "CALL" else "put_buy"
-        logging.info(f"[DEBUG ENTRY] side={side}, leg={leg}, trade_flag={paper_info[leg]['trade_flag']}")
+    if candles_3m is None or candles_3m.empty:
+        return
 
-        try:
-            if paper_info[leg]["trade_flag"] == 0:
+    # 5. De-duplication — gates ENTRY only (exit runs every call above)
+    last_candle_time = str(candles_3m.iloc[-1].get("time", len(candles_3m)))
+    if last_signal_candle_time == last_candle_time:
+        return
+    last_signal_candle_time = last_candle_time
+
+    # Risk gate
+    if risk_info.get("halt_trading", False):
+        logging.info("[ENTRY BLOCKED][RISK] Halt active")
+        return
+
+    # Cooldown
+    if paper_info.get("last_exit_time"):
+        elapsed = (ct - paper_info["last_exit_time"]).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s < {COOLDOWN_SECONDS}s")
+            return
+
+    # 6. Signal evaluation
+    atr, _ = resolve_atr(candles_3m)
+
+    tpma = (
+        float(candles_3m["vwap"].iloc[-1])
+        if "vwap" in candles_3m.columns and not pd.isna(candles_3m["vwap"].iloc[-1])
+        else None
+    )
+    orb_h, orb_l = get_opening_range(candles_3m)
+
+    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+    signal = detect_signal(
+        candles_3m=candles_3m,
+        candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
+        cpr_levels=cpr,
+        camarilla_levels=cam,
+        traditional_levels=trad,
+        atr=atr,
+        include_partial=False,
+        current_time=ct,
+        vwap=tpma,
+        orb_high=orb_h,
+        orb_low=orb_l,
+    )
+
+    # 7. Entry
+    if not signal:
+        _save_trades_paper()
+        store(paper_info, account_type)
+        return
+
+    side   = signal["side"]
+    reason = signal["reason"]
+    source = signal.get("source", "UNKNOWN")
+    logging.info(
+        f"[SIGNAL][PAPER] {side} score={signal.get('score','?')} "
+        f"source={source} tpma={f'{tpma:.1f}' if tpma else 'N/A'} | {reason}"
+    )
+
+    if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+        bias15 = hist_yesterday_15m.iloc[-1].get("supertrend_bias", "NEUTRAL")
+        logging.info(f"[BIAS][15m] {bias15}")
+
+    if risk_info.get("halt_trading", False):
+        return
+
+    # Guard: don't open a new position if PM already has one open
+    if paper_pm.is_open():
+        logging.info("[ENTRY BLOCKED] PM position already open")
+        return
+
+    leg = "call_buy" if side == "CALL" else "put_buy"
+    try:
+        if paper_info[leg]["trade_flag"] == 0:
+            if paper_info.get("trade_count", 0) >= paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info("[ENTRY SKIP] Max trades reached")
+            else:
                 opt_type = "CE" if side == "CALL" else "PE"
                 opt_name, strike = get_option_by_moneyness(
                     spot_price, opt_type,
                     moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
                 )
 
-                logging.info(f"[DEBUG ENTRY] opt_type={opt_type}, opt_name={opt_name}, strike={strike}")
-
                 if opt_name and opt_name in df.index:
-                    entry_price = df.loc[opt_name, "ltp"] or spot_price
-                    logging.info(f"[DEBUG ENTRY] Using entry_price={entry_price}")
+                    ltp_val     = df.loc[opt_name, "ltp"]
+                    entry_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                    if not entry_price or entry_price <= 0:
+                        logging.warning(f"[ENTRY SKIP] invalid entry_price={entry_price}")
+                        return
 
-                    stop, full_target, partial_target, trail_start, trail_step = \
-                        build_dynamic_levels(entry_price, side, atr)
+                    atr_val = atr if atr else 50.0
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                        entry_price, atr_val, side,
+                        entry_candle=len(candles_3m) - 1,
+                        candles_df=candles_3m
+                    )
+                    if stop is None:
+                        logging.warning(f"[ENTRY SKIP] {side} levels failed (ATR extreme?)")
+                        return
 
+                    # ── Open position in PositionManager ──────────────────────
+                    # Inject option_name + st_bias into signal for PM record.
+                    signal["option_name"] = opt_name
+                    signal["st_bias"]     = str(
+                        candles_3m.iloc[-1].get("supertrend_bias", "?")
+                    )
+                    bar_time_str = str(candles_3m.iloc[-1].get("time", str(ct)))
+
+                    paper_pm.open(
+                        _pm_bar_counter,
+                        bar_time_str,
+                        spot_price,    # underlying = NIFTY spot (for entry record)
+                        entry_price,   # entry_premium = option LTP at fill
+                        signal,
+                    )
+
+                    # ── Legacy paper_info state (entry gating + CSV + pickle) ─
                     paper_info[leg].update({
-                        "option_name": opt_name,
-                        "quantity": quantity,
-                        "buy_price": entry_price,
-                        "order_type": ORDER_TYPE,
-                        "current_stop_price": stop,
-                        "full_target_price": full_target,
-                        "partial_target_price": partial_target,
-                        "trail_start_pnl": trail_start,
-                        "trail_step_points": trail_step,
-                        "trade_flag": 1,
+                        "option_name":    opt_name,
+                        "quantity":       quantity,
+                        "buy_price":      entry_price,
+                        "order_type":     ORDER_TYPE,
+                        "trade_flag":     1,
+                        "pnl":            0,
+                        "reason":         reason,
+                        "source":         source,
+                        "order_id":       f"paper_{opt_name}_{ct}",
+                        "entry_time":     ct,
+                        "entry_candle":   len(candles_3m) - 1,
+                        "side":           side,
+                        "stop":           stop,
+                        "pt":             pt,
+                        "tg":             tg,
+                        "trail_start":    trail_start,
+                        "trail_step":     trail_step,
+                        "trail_updates":  0,
+                        "consec_count":   0,
+                        "prev_gap":       0,
+                        "peak_momentum":  0,
+                        "peak_candle":    len(candles_3m) - 1,
+                        "plateau_count":  0,
                         "partial_booked": False,
-                        "pnl": 0,
-                        "reason": reason,
-                        "order_id": f"paper_{opt_name}_{ct}",
-                        "entry_time": ct,
                     })
 
                     paper_info[leg]["filled_df"].loc[ct] = [
-                        opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity
+                        opt_name, entry_price, float("nan"), side,
+                        reason, None, len(candles_3m) - 1,
+                        None, None, None, spot_price, quantity, source
                     ]
                     paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"{GREEN}[ENTRY][PAPER] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                        f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                        f"ATR={atr_val:.1f} step={trail_step:.2f} "
+                        f"score={signal.get('score','?')} source={source}{RESET}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}")
-            else:
-                logging.info(f"[ENTRY SKIPPED] {side} because trade_flag={paper_info[leg]['trade_flag']}")
-        except Exception as e:
-            logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
+                    logging.warning(f"[ENTRY SKIP] no option for {side} strike={strike}")
+    except Exception as e:
+        logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
-    # 5. TRAILING STOP + EXIT MANAGEMENT
-    for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-        if paper_info[leg]["trade_flag"] != 1:
-            continue
-        name = paper_info[leg]["option_name"]
-        price = df.loc[name, "ltp"] if name in df.index else None
-        if price is None or pd.isna(price):
-            continue
-        exit_triggered = process_order(side, name, price, paper_info, hist_data)
-        if exit_triggered:
-            paper_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"{MAGENTA}[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}{RESET}")
+    _save_trades_paper()
+    store(paper_info, account_type)
 
-    # 6. SAVE TRADES
+
+def _save_trades_paper():
     frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
-        combined = pd.concat(frames)
-        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
-    store(paper_info, account_type)
+        pd.concat(frames).to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}_PAPER.csv", index=True
+        )
 
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
-def real_order():
+def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
+    """
+    Live trading order manager — mirrors paper_order structure exactly.
+    EXIT PATH uses live_pm (PositionManager, mode=LIVE).
+    ENTRY PATH unchanged: detect_signal → live_pm.open().
+    Broker calls: send_live_entry_order / send_live_exit_order (via PM).
+    """
     global quantity, live_info, df, spot_price, last_signal_candle_time
+    global risk_info, live_pm, _pm_bar_counter, live_trade_log
 
-    # --- Safety reset: ensure no lingering trade_flag=2 ---
-    for leg in ["call_buy", "put_buy"]:
-        if live_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
-            live_info[leg]["trade_flag"] = 0
-    
+    COOLDOWN_SECONDS = 120
     ct = dt.now(time_zone)
 
-    # 1. Refresh spot price
+    # ── Lazy PM initialisation ──────────────────────────────────────────────
+    if live_pm is None:
+        live_pm = make_live_pm(
+            broker_exit_fn=send_live_exit_order,
+            lot_size=quantity,
+        )
+        logging.info("[LIVE] PositionManager initialised")
+
+    # 1. Safety reset
+    for leg in ["call_buy", "put_buy"]:
+        if live_info[leg].get("trade_flag", 0) == 2:
+            logging.warning(f"[RESET] lingering trade_flag=2 for {leg}")
+            live_info[leg]["trade_flag"] = 0
+
+    # 2. Refresh spot price via Fyers quote API
     try:
-        quote = fyers.quotes(data={"symbols": ticker})
-        spot_price = quote["d"][0]["v"]["lp"]
-        logging.info(f"Spot={spot_price}")
+        quote      = fyers.quotes(data={"symbols": ticker})
+        spot_price = float(quote["d"][0]["v"]["lp"])
+        logging.info(f"[LIVE] Spot={spot_price:.2f}")
     except Exception as e:
         logging.warning(f"[LIVE] Spot fetch failed: {e}")
 
-    # 2. LIVE EOD FORCE EXIT
+    # 3. End-of-day force exit via PM
     if ct > end_time:
-        logging.info("[LIVE] End time reached, closing open positions")
-        for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if live_info[leg]["trade_flag"] == 1:  # still active
-                name = live_info[leg]["option_name"]
-                qty  = live_info[leg]["quantity"]
-
-                success, order_id = send_live_exit_order(name, qty, "EOD")
-                if success:
-                    exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(
-                        live_info, leg, side, name, qty, exit_price, "LIVE", "EOD"
-                    )
-                    update_order_status(order_id, "PENDING", qty, exit_price, name)
+        logging.info("[LIVE] EOD — closing positions via PM")
+        if live_pm.is_open():
+            open_leg = next(
+                (leg for leg in ["call_buy", "put_buy"]
+                 if live_info[leg].get("trade_flag", 0) == 1), None
+            )
+            eod_ltp = (
+                get_live_option_ltp(live_info[open_leg])
+                if open_leg else spot_price
+            )
+            record = live_pm.force_close_eod(
+                _pm_bar_counter, str(ct), eod_ltp
+            )
+            if record:
+                _pm_record_to_info(record, live_info, live_trade_log)
+                update_order_status(
+                    record.get("order_id", "EOD"), "PENDING",
+                    quantity, eod_ltp,
+                    live_info[open_leg]["option_name"] if open_leg else "?"
+                )
         return
 
-    # 3. SIGNAL EVALUATION (new 3M candle only)
-    signal = None
-    if not candles_3m.empty:
-        last_candle_time = candles_3m.iloc[-1]["time"]
-        if last_signal_candle_time != last_candle_time:
-            last_signal_candle_time = last_candle_time
-            atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
+    # 4. EXIT MANAGEMENT — PositionManager (every call, before de-dup)
+    _pm_bar_counter += 1
+
+    if live_pm.is_open() and candles_3m is not None and not candles_3m.empty:
+        open_leg = next(
+            (leg for leg in ["call_buy", "put_buy"]
+             if live_info[leg].get("trade_flag", 0) == 1), None
+        )
+        if open_leg:
+            option_ltp    = get_live_option_ltp(live_info[open_leg])
+            indicator_row = candles_3m.iloc[-1]
+            bar_time_str  = str(candles_3m.iloc[-1].get("time", str(ct)))
+
+            decision = live_pm.update(
+                _pm_bar_counter, bar_time_str,
+                option_ltp,      # option premium → cur = option_ltp in LIVE mode
+                indicator_row,
             )
-            prev_day = hist_data.iloc[-1]
-            cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-            trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            signal = detect_signal(cpr, trad, cam, atr, candles_3m)
 
-    # 4. LIVE ENTRY LOGIC
-    if signal:
-        side, reason = signal
-        logging.info(f"{GREEN}[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}{RESET}")
+            if decision.should_exit:
+                record = live_pm.close(
+                    _pm_bar_counter, bar_time_str,
+                    spot_price,          # underlying = NIFTY spot for record
+                    decision.exit_px,    # exit_px = option premium at exit
+                    decision.reason,
+                    live_info[open_leg]["quantity"],
+                )
+                _pm_record_to_info(record, live_info, live_trade_log)
+                update_order_status(
+                    live_info[open_leg].get("order_id", "?"),
+                    "PENDING", live_info[open_leg]["quantity"],
+                    decision.exit_px,
+                    live_info[open_leg]["option_name"],
+                )
+                live_info["last_exit_time"] = ct
+                logging.info(
+                    f"[EXIT DONE][LIVE] {record['side']} "
+                    f"reason={record['exit_reason']} "
+                    f"pnl={record['pnl_value']:+.0f}₹"
+                )
 
-        try:
-            # Block conditions
-            if live_info["call_buy"]["trade_flag"] == 1 or live_info["put_buy"]["trade_flag"] == 1:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Existing trade active{RESET}")
+    if candles_3m is None or candles_3m.empty:
+        return
+
+    # 5. De-duplication — gates entry only
+    last_candle_time = str(candles_3m.iloc[-1].get("time", len(candles_3m)))
+    if last_signal_candle_time == last_candle_time:
+        return
+    last_signal_candle_time = last_candle_time
+
+    if risk_info.get("halt_trading", False):
+        return
+
+    if live_info.get("last_exit_time"):
+        elapsed = (ct - live_info["last_exit_time"]).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s")
+            return
+
+    # 6. Signal evaluation
+    atr, _ = resolve_atr(candles_3m)
+
+    tpma = (
+        float(candles_3m["vwap"].iloc[-1])
+        if "vwap" in candles_3m.columns and not pd.isna(candles_3m["vwap"].iloc[-1])
+        else None
+    )
+    orb_h, orb_l = get_opening_range(candles_3m)
+
+    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+    signal = detect_signal(
+        candles_3m=candles_3m,
+        candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
+        cpr_levels=cpr,
+        camarilla_levels=cam,
+        traditional_levels=trad,
+        atr=atr,
+        include_partial=False,
+        current_time=ct,
+        vwap=tpma,
+        orb_high=orb_h,
+        orb_low=orb_l,
+    )
+
+    # 7. Entry
+    if not signal:
+        _save_trades_live()
+        store(live_info, account_type)
+        return
+
+    side   = signal["side"]
+    reason = signal["reason"]
+    source = signal.get("source", "UNKNOWN")
+    logging.info(
+        f"[SIGNAL][LIVE] {side} score={signal.get('score','?')} "
+        f"source={source} tpma={f'{tpma:.1f}' if tpma else 'N/A'} | {reason}"
+    )
+
+    if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+        bias15 = hist_yesterday_15m.iloc[-1].get("supertrend_bias", "NEUTRAL")
+        logging.info(f"[BIAS][15m] {bias15}")
+
+    if risk_info.get("halt_trading", False):
+        return
+
+    if live_pm.is_open():
+        logging.info("[ENTRY BLOCKED] PM position already open")
+        return
+
+    leg = "call_buy" if side == "CALL" else "put_buy"
+    try:
+        if live_info[leg]["trade_flag"] == 0:
+            if live_info.get("trade_count", 0) >= live_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info("[ENTRY SKIP] Max trades reached")
                 return
-            if live_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Max trades reached{RESET}")
-                return
-            if live_info.get("last_exit_time"):
-                elapsed = (dt.now(time_zone) - live_info["last_exit_time"]).total_seconds()
-                if elapsed < 180:
-                    logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Cool-down active{RESET}")
-                    return
 
-            leg = "call_buy" if side == "CALL" else "put_buy"
             opt_type = "CE" if side == "CALL" else "PE"
-
-            logging.info(f"[DEBUG ENTRY] side={side}, leg={leg}, trade_flag={live_info[leg]['trade_flag']}")
-
             opt_name, strike = get_option_by_moneyness(
                 spot_price, opt_type,
                 moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
             )
 
-            logging.info(f"[DEBUG ENTRY] opt_type={opt_type}, opt_name={opt_name}, strike={strike}")
-
             if opt_name and opt_name in df.index:
-                entry_price = df.loc[opt_name, "ltp"] or spot_price
-                logging.info(f"[DEBUG ENTRY] Using entry_price={entry_price}")
-
-                success, order_id = send_live_entry_order(opt_name, quantity, "BUY")
-                if not success:
-                    logging.warning(f"{RED}[LIVE ENTRY] Failed to place {side} for {opt_name}{RESET}")
+                ltp_val     = df.loc[opt_name, "ltp"]
+                entry_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                if not entry_price or entry_price <= 0:
                     return
 
+                atr_val = atr if atr else 50.0
+                stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                    entry_price, atr_val, side,
+                    entry_candle=len(candles_3m) - 1,
+                    candles_df=candles_3m
+                )
+                if stop is None:
+                    logging.warning(f"[ENTRY SKIP] {side} levels failed")
+                    return
+
+                # ── Broker entry order ────────────────────────────────────────
+                success, order_id = send_live_entry_order(opt_name, quantity, 1)
+                if not success:
+                    logging.warning(f"[ENTRY FAILED][LIVE] {side} {opt_name}")
+                    return
+
+                # ── Open position in PositionManager ──────────────────────────
+                signal["option_name"] = opt_name
+                signal["st_bias"]     = str(
+                    candles_3m.iloc[-1].get("supertrend_bias", "?")
+                )
+                bar_time_str = str(candles_3m.iloc[-1].get("time", str(ct)))
+
+                live_pm.open(
+                    _pm_bar_counter,
+                    bar_time_str,
+                    spot_price,
+                    entry_price,
+                    signal,
+                )
+
+                # ── Legacy live_info (entry gating + CSV + pickle) ────────────
                 live_info[leg].update({
-                    "option_name": opt_name,
-                    "quantity": quantity,
-                    "order_type": ORDER_TYPE,
-                    "trade_flag": 0,   # pending until filled
-                    "order_id": order_id,
-                    "reason": reason,
-                    "entry_time": ct,
+                    "option_name":    opt_name,
+                    "quantity":       quantity,
+                    "buy_price":      entry_price,
+                    "order_type":     ORDER_TYPE,
+                    "trade_flag":     1,
+                    "pnl":            0,
+                    "reason":         reason,
+                    "source":         source,
+                    "order_id":       order_id,
+                    "entry_time":     ct,
+                    "entry_candle":   len(candles_3m) - 1,
+                    "side":           side,
+                    "stop":           stop,
+                    "pt":             pt,
+                    "tg":             tg,
+                    "trail_start":    trail_start,
+                    "trail_step":     trail_step,
+                    "trail_updates":  0,
+                    "consec_count":   0,
+                    "prev_gap":       0,
+                    "peak_momentum":  0,
+                    "peak_candle":    len(candles_3m) - 1,
+                    "plateau_count":  0,
+                    "partial_booked": False,
                 })
-                logging.info(f"{YELLOW}[LIVE ENTRY PENDING] {side} {opt_name} OrderID={order_id}{RESET}")
 
-                status, filled_price = check_order_status(order_id, fyers)
-                logging.info(f"[DEBUG ENTRY] Order status={status}, filled_price={filled_price}")
+                live_info[leg]["filled_df"].loc[ct] = [
+                    opt_name, entry_price, float("nan"), side,
+                    reason, None, len(candles_3m) - 1,
+                    None, None, None, spot_price, quantity, source
+                ]
+                live_info["trade_count"] = live_info.get("trade_count", 0) + 1
 
-                if status == "TRADED":
-                    stop, full_target, partial_target, trail_start, trail_step = \
-                        build_dynamic_levels(filled_price, side, atr)
-
-                    live_info[leg].update({
-                        "buy_price": filled_price,
-                        "current_stop_price": stop,
-                        "full_target_price": full_target,
-                        "partial_target_price": partial_target,
-                        "trail_start_pnl": trail_start,
-                        "trail_step_points": trail_step,
-                        "trade_flag": 1,
-                        "partial_booked": False,
-                        "pnl": 0,
-                    })
-
-                    live_info[leg]["filled_df"].loc[ct] = [
-                        opt_name, filled_price, "BUY", stop, full_target, spot_price, quantity
-                    ]
-                    live_info["trade_count"] = live_info.get("trade_count", 0) + 1
-
-                    logging.info(
-                        f"{GREEN}[{side} ENTRY CONFIRMED][LIVE] LONG {side} {opt_name} BUY @ {filled_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
-                    )
-                elif status == "PENDING":
-                    logging.info(f"{YELLOW}[LIVE ENTRY STILL PENDING] {side} {opt_name} OrderID={order_id}{RESET}")
-                elif status == "CANCELLED":
-                    logging.warning(f"{MAGENTA}[LIVE ENTRY CANCELLED] {side} {opt_name} OrderID={order_id}{RESET}")
-                    live_info[leg]["trade_flag"] = 0
-                    live_info[leg]["order_id"] = None
+                logging.info(
+                    f"{GREEN}[ENTRY][LIVE] {side} {opt_name} @ {entry_price:.2f} "
+                    f"SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                    f"ATR={atr_val:.1f} score={signal.get('score','?')} source={source}{RESET}"
+                )
             else:
-                logging.warning(f"[ENTRY SKIPPED][LIVE] {side} no valid option found in df for strike={strike}")
-        except Exception as e:
-            logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
+                logging.warning(f"[ENTRY SKIP] {side} no option. opt_name={opt_name}")
+    except Exception as e:
+        logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
 
-    # 5. TRAILING STOP + EXIT MANAGEMENT
-    for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-        if live_info[leg]["trade_flag"] != 1:
-            continue
-        name = live_info[leg]["option_name"]
-        price = df.loc[name, "ltp"] if name in df.index else None
-        if price is None or pd.isna(price):
-            continue
-        exit_triggered = process_order(side, name, price, live_info, hist_data)
-        if exit_triggered:
-            live_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"{MAGENTA}[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}{RESET}")
+    _save_trades_live()
+    store(live_info, account_type)
 
-    # 6. SAVE TRADES
+
+def _save_trades_live():
     frames = [live_info["call_buy"]["filled_df"], live_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
-        combined = pd.concat(frames)
-        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
-    store(live_info, account_type)
+        pd.concat(frames).to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv", index=True
+        )
+# ============================================== RUN Strategy ==============================================
+
+
+# --- Helper: sleep until next boundary ---
+def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
+    """Sleep until next candle boundary. Only used in LIVE fallback mode."""
+    now           = dt.now(tz)
+    seconds       = now.minute * 60 + now.second
+    next_boundary = ((seconds // interval) + 1) * interval
+    sleep_secs    = next_boundary - seconds
+    logging.debug(f"[SLEEP] {sleep_secs}s until next {interval}s boundary")
+    time.sleep(sleep_secs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OFFLINE REPLAY ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_replay_summary():
+    """Print trade summary after a replay run."""
+    frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        logging.info("[REPLAY SUMMARY] No trades taken.")
+        return
+
+    combined = pd.concat(frames)
+    total    = len(combined)
+    winners  = (combined["pnl_points"] > 0).sum() if "pnl_points" in combined.columns else 0
+    losers   = (combined["pnl_points"] < 0).sum() if "pnl_points" in combined.columns else 0
+    total_pnl = combined["pnl_value"].sum() if "pnl_value" in combined.columns else 0
+    win_rate  = winners / total * 100 if total > 0 else 0
+
+    logging.info(
+        f"\n{'='*60}\n"
+        f"  REPLAY SUMMARY\n"
+        f"{'='*60}\n"
+        f"  Total trades : {total}\n"
+        f"  Winners      : {winners}  ({win_rate:.1f}%)\n"
+        f"  Losers       : {losers}\n"
+        f"  Total PnL    : {total_pnl:.2f}\n"
+        f"{'='*60}"
+    )
+
+    if "exit_reason" in combined.columns:
+        logging.info("[REPLAY] Exit reasons:")
+        for reason, count in combined["exit_reason"].value_counts().items():
+            logging.info(f"  {reason:20s}: {count}")
+
+    if "source" in combined.columns:
+        logging.info("[REPLAY] Signal sources:")
+        for src, count in combined["source"].value_counts().items():
+            logging.info(f"  {src:20s}: {count}")
+
+    if "side" in combined.columns:
+        logging.info("[REPLAY] By side:")
+        for side, count in combined["side"].value_counts().items():
+            logging.info(f"  {side:20s}: {count}")
+
+
+def run_offline_replay(tick_db, symbols_list=None, date_str=None,
+                       min_warmup_candles=35, signal_only=False,
+                       output_dir=".", db_path=None):
+    """
+    Candle-by-candle offline replay using tick_db data. No live connection needed.
+
+    Simulates exactly how the live bot sees data: at each 3m bar boundary
+    only candles[0..i] are visible — no lookahead. Indicators are rebuilt
+    incrementally on each slice.
+
+    Args:
+        tick_db             TickDatabase instance
+        symbols_list        list of symbols; defaults to config symbols
+        date_str            'YYYY-MM-DD' to filter replay to a specific date.
+                            Warmup bars from the previous day are always prepended
+                            for indicator accuracy regardless of this filter.
+                            None = use all data in DB.
+        min_warmup_candles  3m bars needed before evaluation starts.
+                            Supertrend/ADX need 14+; 30 is a safe default.
+        signal_only         True  → log signals, skip trade simulation.
+                            False → simulate entries, SL/PT/TG exits, log PnL.
+        output_dir          Directory for CSV trade log. Default = current dir.
+
+    Two CSVs are saved when signal_only=False:
+        signals_<sym>_<date>.csv   — every signal that fired (bar, time, side, score, reason)
+        trades_<sym>_<date>.csv    — every completed trade (entry, exit, PnL)
+
+    Typical usage:
+        # Terminal:
+        python execution.py                  # trade simulation
+        python execution.py --signal-only    # signals only
+
+        # From Python / notebook:
+        from tickdb import tick_db
+        from execution import run_strategy
+        run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE", tick_db=tick_db,
+                     date_str="2026-02-20", signal_only=True)
+    """
+    import os
+    from collections import Counter
+    # build_indicator_dataframe imported at top of module (from orchestration_v3)
+    from signals import detect_signal
+
+    if symbols_list is None:
+        symbols_list = symbols if isinstance(symbols, list) else [symbols]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    logging.info(
+        f"\n{'='*64}\n"
+        f"  OFFLINE REPLAY\n"
+        f"  date        = {date_str or 'all available'}\n"
+        f"  signal_only = {signal_only}\n"
+        f"  warmup      = {min_warmup_candles} bars\n"
+        f"{'='*64}\n"
+    )
+
+    # ── Helper: find the sort/align column (prefer tz-aware "date") ───────────
+    def _time_col(df):
+        for c in ("date", "time", "timestamp", "candle_time"):
+            if c in df.columns:
+                return c
+        return df.columns[0]
+
+    # ── Helper: find string column for date-prefix filtering (YYYY-MM-DD...) ──
+    # Direct SQL output has both "date" (datetime) and "time" (string).
+    # Use "time" for startswith-style date filtering.
+    def _str_col(df):
+        return "time" if "time" in df.columns else _time_col(df)
+
+    # ── Helper: merge and dedup two DataFrames on their time column ───────────
+    def _merge_candles(hist, today):
+        dfs = [d for d in [hist, today] if d is not None and not d.empty]
+        if not dfs:
+            return pd.DataFrame()
+        out  = pd.concat(dfs, ignore_index=True)
+        tcol = _time_col(out)
+        return (out.drop_duplicates(subset=[tcol])
+                   .sort_values(tcol)
+                   .reset_index(drop=True))
+
+    # ── Helper: option premium proxy from underlying move ─────────────────────
+    # tick_db has no option prices. We simulate a 1.5× leveraged option premium.
+    # Entry premium = ATM option rough value (underlying * 0.006).
+    # Subsequent moves: delta ≈ 0.5, gamma amplification ≈ 1.5×.
+    # This is intentionally approximate — the signal quality is what matters.
+    def _option_premium(underlying_close, entry_underlying, entry_premium, side):
+        move = underlying_close - entry_underlying
+        if side == "PUT":
+            move = -move                         # PUT profits when market falls
+        delta_pnl = move * 0.5 * 1.5            # delta 0.5, 1.5× leverage
+        return max(entry_premium + delta_pnl, 1.0)
+
+    # ── Resolve DB path: explicit arg → tick_db attributes → give up ──────────
+    _db_path = db_path
+    if _db_path is None:
+        for _attr in ("db_path", "path", "database", "db_file", "_db_path"):
+            _val = getattr(tick_db, _attr, None)
+            if isinstance(_val, str) and _val:
+                _db_path = _val
+                break
+    if _db_path:
+        logging.info(f"[REPLAY] DB path: {_db_path}")
+    else:
+        logging.warning(
+            "[REPLAY] Could not determine DB path from tick_db. "
+            "Pass it explicitly: run_strategy(..., db_path=r'C:\\SQLite\\ticks\\ticks_2026-02-20.db')"
+        )
+
+    # ── Helper: query SQLite directly using confirmed schema ─────────────────
+    # Schema (from DB inspection):
+    #   candles_3m_ist / candles_15m_ist
+    #   Columns: trade_date TEXT, ist_slot TEXT, symbol TEXT,
+    #            open REAL, high REAL, low REAL, close REAL, volume REAL
+    #
+    # Output column "date": tz-aware IST datetime — required by
+    # build_indicator_dataframe and detect_signal.
+    # "time": "YYYY-MM-DD HH:MM:SS" string — used for de-dup and date filtering.
+    def _load_direct(interval, sym):
+        if not _db_path:
+            return pd.DataFrame()
+        table = "candles_3m_ist" if "3m" in interval else "candles_15m_ist"
+        try:
+            import sqlite3
+            conn  = sqlite3.connect(_db_path)
+            query = f"""
+                SELECT
+                    trade_date || 'T' || ist_slot  AS _dt,
+                    trade_date || ' ' || ist_slot  AS time,
+                    trade_date, ist_slot,
+                    open, high, low, close,
+                    COALESCE(volume, 0) AS volume
+                FROM {table}
+                WHERE symbol = ?
+                ORDER BY trade_date, ist_slot
+            """
+            df   = pd.read_sql_query(query, conn, params=(sym,))
+            conn.close()
+
+            if df.empty:
+                logging.warning(f"  [{table}] 0 rows for symbol={sym}")
+                return pd.DataFrame()
+
+            # Build tz-aware "date" column (IST) — this is what downstream expects
+            ist       = "Asia/Kolkata"
+            df["date"] = (pd.to_datetime(df["_dt"])
+                            .dt.tz_localize(ist))
+            df = df.drop(columns=["_dt"])
+
+            for col in ("open", "high", "low", "close", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            logging.info(
+                f"  [{table}] {len(df)} rows  "
+                f"({df['time'].iloc[0]} → {df['time'].iloc[-1]})"
+            )
+            return df.reset_index(drop=True)
+
+        except Exception as e:
+            logging.error(f"  Direct SQL failed ({table}): {e}")
+            return pd.DataFrame()
+
+    def _load_best(interval, sym):
+        # Direct SQL first — always correct, bypasses use_yesterday date filtering
+        df = _load_direct(interval, sym)
+        if not df.empty:
+            return df
+        # Fallback to fetch_candles (works during live session)
+        for flag in (False, True):
+            try:
+                df = tick_db.fetch_candles(interval, use_yesterday=flag, symbol=sym)
+                if df is not None and not df.empty:
+                    logging.debug(f"  fetch_candles(use_yesterday={flag}) → {len(df)} rows")
+                    return df
+            except Exception as e:
+                logging.debug(f"  fetch_candles(use_yesterday={flag}): {e}")
+        return pd.DataFrame()
+
+    for sym in symbols_list:
+        logging.info(f"[REPLAY] Loading candles for {sym} ...")
+
+        # Load using best-of-both strategy (handles post-market and live sessions)
+        try:
+            df_3m_all  = _load_best("3m",  sym)
+            df_15m_all = _load_best("15m", sym)
+        except Exception as e:
+            logging.error(f"[REPLAY] DB load failed for {sym}: {e}")
+            continue
+
+        # ── Load previous trading day(s) of 15m data for indicator warmup ───────
+        # ADX14 needs 28 bars, CCI20 needs 20 bars → need >28 15m rows before today.
+        # Scan up to 5 prev trading days from the replay DB date and prepend them.
+        if _db_path and date_str:
+            import sqlite3 as _sql2, os as _os2
+            _db_dir   = str(pathlib.Path(_db_path).parent)
+            _ref_date = pd.Timestamp(date_str)
+            _prev_frames_15m = []
+            _prev_frames_3m  = []
+            _days_back        = 0
+            _days_found       = 0
+            while _days_back < 14 and _days_found < 5:
+                _days_back += 1
+                _cand = (_ref_date - pd.Timedelta(days=_days_back))
+                if _cand.weekday() >= 5:          # skip Sat/Sun
+                    continue
+                _cand_str  = _cand.strftime("%Y-%m-%d")
+                _cand_path = _os2.path.join(_db_dir, f"ticks_{_cand_str}.db")
+                if not _os2.path.exists(_cand_path):
+                    continue
+                try:
+                    for _tbl, _lst in [("candles_15m_ist", _prev_frames_15m),
+                                        ("candles_3m_ist",  _prev_frames_3m)]:
+                        _q = f"""
+                            SELECT
+                                trade_date || 'T' || ist_slot  AS _dt,
+                                trade_date || ' ' || ist_slot  AS time,
+                                trade_date, ist_slot,
+                                open, high, low, close,
+                                COALESCE(volume, 0) AS volume
+                            FROM {_tbl}
+                            WHERE symbol = ?
+                            ORDER BY trade_date, ist_slot
+                        """
+                        with _sql2.connect(_cand_path) as _c2:
+                            _tmp = pd.read_sql_query(_q, _c2, params=(sym,))
+                        if not _tmp.empty:
+                            _ist = "Asia/Kolkata"
+                            _tmp["date"] = pd.to_datetime(_tmp["_dt"]).dt.tz_localize(_ist)
+                            _tmp = _tmp.drop(columns=["_dt"])
+                            for _col in ("open","high","low","close","volume"):
+                                _tmp[_col] = pd.to_numeric(_tmp[_col], errors="coerce")
+                            _lst.append(_tmp)
+                except Exception as _ex:
+                    logging.debug(f"[REPLAY WARMUP] {_cand_str}: {_ex}")
+                    continue
+                _days_found += 1
+
+            if _prev_frames_15m:
+                _prev_15m = pd.concat(_prev_frames_15m, ignore_index=True)
+                df_15m_all = pd.concat([_prev_15m, df_15m_all], ignore_index=True)
+                df_15m_all = (df_15m_all.drop_duplicates(subset=["time"])
+                                         .sort_values("time")
+                                         .reset_index(drop=True))
+                logging.info(f"[REPLAY] 15m warmup: prepended {len(_prev_15m)} rows "
+                             f"from {_days_found} prev day(s) → total {len(df_15m_all)} 15m rows")
+
+            if _prev_frames_3m:
+                _prev_3m = pd.concat(_prev_frames_3m, ignore_index=True)
+                df_3m_all = pd.concat([_prev_3m, df_3m_all], ignore_index=True)
+                df_3m_all = (df_3m_all.drop_duplicates(subset=["time"])
+                                       .sort_values("time")
+                                       .reset_index(drop=True))
+
+        if df_3m_all.empty:
+            logging.warning(
+                f"[REPLAY] No 3m candles found for {sym}. "
+                f"Check that the DB file has session data."
+            )
+            continue
+
+        tc3  = _time_col(df_3m_all)          # datetime col for sorting/alignment
+        sc3  = _str_col(df_3m_all)           # string col for date-prefix filtering
+        tc15 = _time_col(df_15m_all) if not df_15m_all.empty else tc3
+        sc15 = _str_col(df_15m_all)  if not df_15m_all.empty else sc3
+        total_bars = len(df_3m_all)
+
+        # Show available range
+        logging.info(
+            f"[REPLAY] {sym}: {total_bars} total 3m bars  "
+            f"({df_3m_all.iloc[0][sc3]} → {df_3m_all.iloc[-1][sc3]})"
+        )
+
+        # Auto-reduce warmup if DB has fewer bars than requested
+        effective_warmup = min_warmup_candles
+        if total_bars <= min_warmup_candles:
+            effective_warmup = max(14, total_bars // 3)
+            logging.warning(
+                f"[REPLAY] Only {total_bars} bars but warmup={min_warmup_candles}. "
+                f"Auto-reduced to {effective_warmup}."
+            )
+            if total_bars <= effective_warmup + 1:
+                logging.warning(
+                    f"[REPLAY] Still not enough bars ({total_bars}). "
+                    f"The DB may only contain post-market data."
+                )
+                continue
+
+        # ── Optional date filter ───────────────────────────────────────────────
+        replay_start_idx = effective_warmup
+        if date_str:
+            try:
+                mask    = df_3m_all[sc3].astype(str).str.startswith(date_str)
+                matches = mask[mask].index
+                if len(matches) == 0:
+                    available = sorted(df_3m_all[sc3].astype(str).str[:10].unique())
+                    logging.warning(
+                        f"[REPLAY] No bars for date={date_str}. "
+                        f"Dates in DB: {available}"
+                    )
+                    continue
+                first_match      = int(matches[0])
+                replay_start_idx = max(first_match, effective_warmup)
+                logging.info(
+                    f"[REPLAY] Date {date_str}: bars {first_match}–{total_bars-1} "
+                    f"(replay from bar {replay_start_idx})"
+                )
+            except Exception as e:
+                logging.warning(f"[REPLAY] Date filter error: {e}")
+
+        replay_bars = total_bars - replay_start_idx
+        logging.info(
+            f"[REPLAY] Warmup={replay_start_idx} | Evaluating={replay_bars} bars\n"
+        )
+
+        # ── Per-run state ─────────────────────────────────────────────────────
+        signals_fired  = []
+        trade_log      = []
+        blocker_counts = Counter()
+
+        global last_signal_candle_time
+        last_signal_candle_time = None  # reset dedup so replay is clean
+
+        # ── PositionManager — single source of truth for open position ─────────
+        # Prevents repeated orders: once a trade is open, detect_signal is
+        # bypassed entirely. Each bar instead runs pm.update() to monitor the
+        # position and decide HOLD vs EXIT using:
+        #   HARD_STOP   — premium drops to 50% of entry
+        #   TRAIL_STOP  — ratcheting stop after 40% gain
+        #   PARTIAL     — book half at 60% gain, move stop to breakeven
+        #   MOMENTUM_PEAK — RSI extreme + (CCI extreme OR slope reversal)
+        #   ST_FLIP     — SuperTrend flips against position
+        #   MAX_HOLD    — safety valve at MAX_HOLD_BARS bars
+        #   EOD_EXIT    — force close at 15:15 IST
+
+        # ── Position Manager (imported from position_manager.py) ──────────────
+        # Single source of truth for all exit logic across replay, paper, live.
+        # Replacing the former inline _PM class — thresholds live in position_manager.py
+        pm = make_replay_pm(lot_size=quantity)
+        cooldown_until = 0   # bar index after which new entries are allowed again
+
+        # ── Day Type Classifier — initialized once per session ────────────
+        # Uses previous day OHLC from the first replay bar to build pivot context.
+        # DTC is updated every bar; locked at 12:00 (midday — classification stable).
+        _dtc      = None   # populated on first bar below
+        _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
+
+        # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
+        class _FakeTime:
+            __slots__ = ("hour", "minute")
+            def __init__(self, h, m):
+                self.hour, self.minute = h, m
+
+        # ── Main loop ─────────────────────────────────────────────────────────
+        for i in range(replay_start_idx, total_bars):
+            slice_3m = df_3m_all.iloc[:i + 1].copy()
+            cur_time = slice_3m.iloc[-1][tc3]    # tz-aware datetime for 15m alignment
+
+            # Align 15m: bars whose datetime <= current 3m datetime
+            if not df_15m_all.empty:
+                slice_15m = df_15m_all[df_15m_all[tc15] <= cur_time].copy()
+            else:
+                slice_15m = pd.DataFrame()
+
+            # Build indicators
+            try:
+                slice_3m = build_indicator_dataframe(sym, slice_3m, interval="3m")
+                if not slice_15m.empty:
+                    slice_15m = build_indicator_dataframe(sym, slice_15m, interval="15m")
+            except Exception as e:
+                logging.debug(f"[REPLAY bar={i}] indicator error: {e}")
+                continue
+
+            last_row  = slice_3m.iloc[-1]
+            bar_time  = last_row.get(sc3, str(cur_time))
+            bar_close = float(last_row["close"])
+
+            # ── Bar time gate ─────────────────────────────────────────────────
+            ts    = pd.Timestamp(bar_time)
+            bar_t = ts.hour * 60 + ts.minute
+
+            # ── Day Type Classifier — update every bar ─────────────────────────
+            # Initialize DTC on first bar using previous-session OHLC
+            if _dtc is None and len(slice_3m) >= 2:
+                try:
+                    prev_bar = slice_3m.iloc[-2]
+                    _cpr0  = calculate_cpr(float(prev_bar["high"]),
+                                           float(prev_bar["low"]),
+                                           float(prev_bar["close"]))
+                    _cam0  = calculate_camarilla_pivots(float(prev_bar["high"]),
+                                                        float(prev_bar["low"]),
+                                                        float(prev_bar["close"]))
+                    _dtc   = make_day_type_classifier(
+                        _cam0, _cpr0,
+                        float(prev_bar["high"]),
+                        float(prev_bar["low"]),
+                        float(prev_bar["close"]),
+                    )
+                    logging.info(
+                        f"[DAY TYPE] Classifier initialized "
+                        f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
+                        f"S3={_cam0['s3']:.0f} S4={_cam0['s4']:.0f} "
+                        f"NarrowCPR={_dtc.pc.is_narrow_cpr} "
+                        f"CompressedCam={_dtc.pc.is_compressed_camarilla}"
+                    )
+                except Exception as _e:
+                    logging.debug(f"[DAY TYPE] init error: {_e}")
+
+            if _dtc is not None:
+                _day_type = _dtc.update(slice_3m)
+                # Lock classification at 12:00 (midday — stable for rest of session)
+                if bar_t == 12 * 60 and _day_type.confidence in ("MEDIUM", "HIGH"):
+                    _dtc.lock_classification()
+                    _day_type.log()
+
+            # ── POSITION MONITOR — runs every bar when a trade is open ─────────
+            # Works in both signal_only=True AND False modes.
+            # While pm.is_open(): detect_signal is bypassed — no repeated orders.
+            if pm.is_open():
+                decision = pm.update(i, bar_time, bar_close, last_row)
+                if decision.should_exit:
+                    record = pm.close(i, bar_time, bar_close,
+                                      decision.exit_px, decision.reason, quantity)
+                    trade_log.append(record)
+                    cooldown_until = i + 2   # 2-bar cooldown before next entry
+                    # After exit: don't evaluate entry on the same bar
+                continue
+
+            # ── COOLDOWN — bars immediately after an exit ─────────────────────
+            if i < cooldown_until:
+                blocker_counts["COOLDOWN"] = blocker_counts.get("COOLDOWN", 0) + 1
+                continue
+
+            # ── POST-MARKET GATE — no entries after close ─────────────────────
+            if bar_t >= 15 * 60 + 30:
+                blocker_counts["POST_MARKET"] = blocker_counts.get("POST_MARKET", 0) + 1
+                continue
+
+            # ── ENTRY EVALUATION — only runs when no position is open ──────────
+            atr, _ = resolve_atr(slice_3m)
+
+            # TPMA (stored as "vwap" by build_indicator_dataframe)
+            tpma = (float(slice_3m["vwap"].iloc[-1])
+                    if "vwap" in slice_3m.columns
+                    and not pd.isna(slice_3m["vwap"].iloc[-1]) else None)
+
+            orb_h, orb_l = get_opening_range(slice_3m)
+
+            pivot_src = slice_3m.iloc[-2] if len(slice_3m) >= 2 else slice_3m.iloc[-1]
+            cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+            trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+            cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+            fake_time = _FakeTime(ts.hour, ts.minute)
+
+            try:
+                signal = detect_signal(
+                    candles_3m=slice_3m,
+                    candles_15m=slice_15m,
+                    cpr_levels=cpr,
+                    camarilla_levels=cam,
+                    traditional_levels=trad,
+                    atr=atr,
+                    include_partial=False,
+                    current_time=fake_time,
+                    vwap=tpma,
+                    orb_high=orb_h,
+                    orb_low=orb_l,
+                    day_type_result=_day_type,
+                )
+            except Exception as e:
+                logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
+                continue
+
+            if not signal:
+                blocked_by = signal.get("reason", "SCORE_LOW") if signal else "NO_SIGNAL"
+                blocker_counts[blocked_by] += 1
+                continue
+
+            side   = signal["side"]
+            score  = signal.get("score", "?")
+            reason = signal["reason"]
+            source = signal.get("source", "?")
+
+            # Enrich signal with current ST and day type for PM entry tracking
+            signal["st_bias"]  = str(last_row.get("supertrend_bias", "?"))
+            signal["pivot"]    = signal.get("pivot", "")
+            signal["day_type"] = _day_type.name.value
+
+            # Apply day type overrides to PM (trail step, max hold)
+            apply_day_type_to_pm(pm, _day_type)
+
+            # Option premium approximation: ATM ≈ 0.6% of underlying
+            entry_premium = round(bar_close * 0.006, 1)
+
+            # ── Log the entry signal ───────────────────────────────────────────
+            logging.info(
+                f"  {GREEN}[SIGNAL→ENTRY] bar={i} {bar_time} | "
+                f"{side} score={score} src={source} pivot={signal.get('pivot','')}{RESET}"
+            )
+            logging.info(
+                f"    underlying={bar_close:.2f}  "
+                f"premium≈{entry_premium:.1f}  "
+                f"ST={last_row.get('supertrend_bias','?')}  "
+                f"EMA9={last_row.get('ema9', float('nan')):.1f}  "
+                f"CCI={last_row.get('cci20', float('nan')):.1f}  "
+                f"RSI={last_row.get('rsi14', float('nan')):.1f}"
+            )
+            logging.info(f"    reason: {reason}")
+
+            # Track in signals_fired (first entry only per trade)
+            signals_fired.append({
+                "bar":         i,
+                "time":        bar_time,
+                "side":        side,
+                "score":       score,
+                "reason":      reason,
+                "source":      source,
+                "pivot":       signal.get("pivot", ""),
+                "underlying":  bar_close,
+                "est_premium": entry_premium,
+            })
+
+            # ── Open position via PositionManager ─────────────────────────────
+            # This locks out all subsequent bars from calling detect_signal
+            # until this trade is exited.
+            pm.open(i, bar_time, bar_close, entry_premium, signal)
+
+        # ── Force close if still open at end of data ──────────────────────────
+        if pm.is_open():
+            last_ul = float(df_3m_all.iloc[-1]["close"])
+            record  = pm.force_close_eod(
+                total_bars - 1, df_3m_all.iloc[-1][sc3], last_ul
+            )
+            if record:
+                trade_log.append(record)
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        safe_sym  = sym.replace(":", "_")
+        date_tag  = date_str or "all"
+        sep       = "─" * 64
+
+        logging.info(f"\n{sep}")
+        logging.info(f"  RESULTS: {sym}  ({date_tag})")
+        logging.info(sep)
+        logging.info(f"  Trades taken  : {len(signals_fired)}  "
+                     f"(one entry per trade — PM locks out re-entry while open)")
+
+        if signals_fired:
+            call_ct = sum(1 for s in signals_fired if s["side"] == "CALL")
+            put_ct  = sum(1 for s in signals_fired if s["side"] == "PUT")
+            scores  = [s["score"] for s in signals_fired if isinstance(s["score"], (int, float))]
+            avg_sc  = sum(scores) / len(scores) if scores else 0
+            logging.info(f"    CALL={call_ct}  PUT={put_ct}  avg_score={avg_sc:.1f}")
+            sig_csv = os.path.join(output_dir, f"signals_{safe_sym}_{date_tag}.csv")
+            pd.DataFrame(signals_fired).to_csv(sig_csv, index=False)
+            logging.info(f"    → {sig_csv}")
+
+        # Trade log shown in all modes (PM tracks exits even in signal_only)
+        if trade_log:
+            wins     = sum(1 for t in trade_log if t["pnl_points"] > 0)
+            losses   = len(trade_log) - wins
+            tot_pnl  = sum(t["pnl_value"] for t in trade_log)
+            win_rate = wins / len(trade_log) * 100
+            logging.info(f"\n  Trades closed : {len(trade_log)}")
+            logging.info(f"  Win / Loss    : {wins} / {losses}  ({win_rate:.1f}%)")
+            logging.info(f"  Total PnL (₹) : {tot_pnl:+.2f}")
+            logging.info(f"\n  Exit breakdown:")
+            for reason, cnt in Counter(t["exit_reason"] for t in trade_log).most_common():
+                logging.info(f"    {reason:22s}: {cnt}")
+            logging.info(f"\n  Trade details:")
+            for t in trade_log:
+                color = GREEN if t["pnl_points"] >= 0 else RED
+                logging.info(
+                    f"    {color}{t['side']:4s} entry={t['entry_time']} "
+                    f"exit={t['exit_time']} held={t['bars_held']}bars "
+                    f"pnl={t['pnl_points']:+.1f}pts ({t['pnl_value']:+.0f}₹) "
+                    f"[{t['exit_reason']}]{RESET}"
+                )
+            trd_csv = os.path.join(output_dir, f"trades_{safe_sym}_{date_tag}.csv")
+            pd.DataFrame(trade_log).to_csv(trd_csv, index=False)
+            logging.info(f"\n  → {trd_csv}")
+        else:
+            logging.info("  Trades closed : 0")
+
+        if blocker_counts:
+            logging.info(f"\n  Signal blockers:")
+            for reason, cnt in blocker_counts.most_common(10):
+                logging.info(f"    {reason:30s}: {cnt} bars")
+
+        logging.info(f"{sep}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN STRATEGY — LIVE fallback + entry point for run_offline_replay
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_strategy(symbols, tz=time_zone, end_time=None,
+                 replay_data=None, mode="LIVE",
+                 tick_db=None, date_str=None,
+                 signal_only=False, min_warmup_candles=35,
+                 output_dir=".", db_path=None):
+    """
+    Unified strategy entry point.
+
+    mode="LIVE"
+        Single-pass fallback. Primary live execution runs via main.py.
+
+    mode="REPLAY"
+        Snapshot replay — pass replay_data={sym: (df_3m, df_15m)}.
+        Calls paper_order() once with the full snapshot.
+
+    mode="OFFLINE"
+        Candle-by-candle walk-through using tick_db. No live connection needed.
+
+        Required:
+            tick_db             TickDatabase instance
+
+        Optional:
+            date_str            'YYYY-MM-DD' to replay a specific date
+            signal_only         True = signals only, no trade simulation
+            min_warmup_candles  bars before evaluation starts (default 30)
+            output_dir          directory for CSV output (default '.')
+
+        Usage:
+            from tickdb import tick_db
+            from execution import run_strategy
+
+            # Signal evaluation only — fastest way to check what fires
+            run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE",
+                         tick_db=tick_db, date_str="2026-02-20",
+                         signal_only=True)
+
+            # Full trade simulation with PnL
+            run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE",
+                         tick_db=tick_db, date_str="2026-02-20",
+                         signal_only=False, output_dir="./replay_results")
+    """
+
+    # ── OFFLINE ──────────────────────────────────────────────────────────────
+    if mode == "OFFLINE":
+        if tick_db is None:
+            logging.error("[run_strategy] mode=OFFLINE requires tick_db argument")
+            return
+        run_offline_replay(
+            tick_db=tick_db,
+            symbols_list=symbols if isinstance(symbols, list) else [symbols],
+            date_str=date_str,
+            min_warmup_candles=min_warmup_candles,
+            signal_only=signal_only,
+            output_dir=output_dir,
+            db_path=db_path,
+        )
+        return
+
+    # ── LIVE (single-pass fallback) ───────────────────────────────────────────
+    if mode == "LIVE":
+        for sym in symbols:
+            logging.info(f"{GRAY}[STRATEGY][LIVE] {sym}{RESET}")
+            spot_local = None
+            try:
+                q = fyers.quotes(data={"symbols": sym})
+                spot_local = q["d"][0]["v"]["lp"]
+            except Exception as e:
+                logging.debug(f"[STRATEGY] Quote API: {e}")
+
+            candles_3m, candles_15m = update_candles_and_signals(
+                symbol=sym, spot_price=spot_local, tick_db=tick_db
+            )
+            if candles_3m is None or candles_3m.empty:
+                logging.warning(f"[STRATEGY] No candles for {sym}")
+                continue
+
+            if account_type.upper() == "PAPER":
+                paper_order(candles_3m, hist_yesterday_15m=candles_15m, mode=mode)
+            else:
+                live_order(candles_3m, hist_yesterday_15m=candles_15m)
+        return
+
+    # ── REPLAY (snapshot) ─────────────────────────────────────────────────────
+    for sym in symbols:
+        if not replay_data or sym not in replay_data:
+            continue
+        candles_3m, candles_15m = replay_data[sym]
+        if candles_3m is None or candles_3m.empty:
+            continue
+        logging.info(
+            f"[REPLAY] {sym}: "
+            f"3m={len(candles_3m)} "
+            f"15m={len(candles_15m) if not candles_15m.empty else 0}"
+        )
+        if account_type.upper() == "PAPER":
+            paper_order(candles_3m, hist_yesterday_15m=candles_15m, mode="REPLAY")
+        else:
+            live_order(candles_3m, hist_yesterday_15m=candles_15m)
+
+    _print_replay_summary()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDALONE ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    """
+    Run offline replay from the terminal — no live connection needed.
+
+    Usage:
+        python execution.py                           # trade simulation, today's DB data
+        python execution.py --signal-only             # signals only
+        python execution.py --date 2026-02-20         # specific date
+        python execution.py --date 2026-02-20 --signal-only
+        python execution.py --out ./results           # custom output directory
+        python execution.py --warmup 50               # more warmup bars
+    """
+    import sys, os, argparse
+
+    parser = argparse.ArgumentParser(description="Offline replay using tick_db data")
+    parser.add_argument("--date",        default=None,  help="Date to replay YYYY-MM-DD")
+    parser.add_argument("--signal-only", action="store_true", help="Log signals only, no trade sim")
+    parser.add_argument("--out",         default=".",   help="Output directory for CSVs")
+    parser.add_argument("--warmup",      default=30,    type=int, help="Warmup bars (default 30)")
+    parser.add_argument("--sym",         default="NSE:NIFTY50-INDEX", help="Symbol to replay")
+    parser.add_argument("--db",          default=None,
+                        help=r"Direct SQLite DB path, e.g. C:\SQLite\ticks\ticks_2026-02-20.db "
+                             "(use when fetch_candles returns too few rows post-market)")
+    args = parser.parse_args()
+
+    try:
+        from tickdb import tick_db as _tick_db
+    except ImportError:
+        logging.error("tickdb module not found — cannot run offline replay")
+        sys.exit(1)
+
+    run_strategy(
+        symbols=[args.sym],
+        mode="OFFLINE",
+        tick_db=_tick_db,
+        date_str=args.date,
+        signal_only=args.signal_only,
+        min_warmup_candles=args.warmup,
+        output_dir=args.out,
+        db_path=args.db,
+    )

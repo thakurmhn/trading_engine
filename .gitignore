@@ -1,0 +1,25 @@
+# Ignore Python virtual environment
+.venv/
+.env
+access*
+# Ignore config file with credentials
+#config.py
+
+# Common Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.log
+*.sqlite3
+*.db
+*.log
+*.csv
+*.pickle
+*.db
+
+# IDE/editor files
+.vscode/
+.idea/
+.ticks/

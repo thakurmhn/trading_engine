@@ -1,221 +1,402 @@
-# ===== indicators.py =====
+# ===== indicators.py part1 =====
+
 import logging
 import pandas as pd
+import numpy as np
 import pendulum as dt
+import datetime
 
-from config import time_zone, profit_loss_point
-from setup import spot_price, hist_data
+from config import time_zone, ATR_VALUE
+from setup import spot_price
+from tickdb import TickDatabase
+tick_db = TickDatabase()
+from tickdb import tick_db
 
-# globals (must exist once in your script)
+# ===========================================================
+# Globals
 ticks_buffer = []
 candles_3m = pd.DataFrame(columns=["open","high","low","close","time"])
 current_3m_start = None
 
-# ===========================================================
-# ANSI COLORS for order logs
+# ANSI COLORS
 RESET   = "\033[0m"
 GREEN   = "\033[92m"
 YELLOW  = "\033[93m"
 RED     = "\033[91m"
 MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
+CYAN    = "\033[96m"
+# ===========================================================
 
-#===========================================================
 
+# ===== Pivot Calculations =====
 
-def calculate_cpr(high, low, close):
-    pivot = (high + low + close) / 3
-    bc = (high + low) / 2
+def calculate_cpr(prev_high, prev_low, prev_close):
+    pivot = (prev_high + prev_low + prev_close) / 3
+    bc = (prev_high + prev_low) / 2
     tc = (pivot - bc) + pivot
-    return {
-        "pivot": round(pivot, 2),
-        "bc": round(bc, 2),
-        "tc": round(tc, 2)
-    }
+    if round(tc, 2) == round(bc, 2):
+        tc = pivot + 0.0005 * pivot
+        bc = pivot - 0.0005 * pivot
+    return {"pivot": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2)}
 
-def calculate_traditional_pivots(high, low, close):
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
-    return {
-        "pivot": round(pivot, 2),
-        "r1": round(r1, 2),
-        "s1": round(s1, 2),
-        "r2": round(r2, 2),
-        "s2": round(s2, 2)
-    }
+def calculate_traditional_pivots(prev_high, prev_low, prev_close):
+    pivot = (prev_high + prev_low + prev_close) / 3
+    r1 = (2 * pivot) - prev_low
+    s1 = (2 * pivot) - prev_high
+    r2 = pivot + (prev_high - prev_low)
+    s2 = pivot - (prev_high - prev_low)
+    if prev_high == prev_low:
+        r1 = pivot + 0.0005 * pivot
+        s1 = pivot - 0.0005 * pivot
+        r2 = pivot + 0.001 * pivot
+        s2 = pivot - 0.001 * pivot
+    return {"pivot": round(pivot, 2), "r1": round(r1, 2), "s1": round(s1, 2),
+            "r2": round(r2, 2), "s2": round(s2, 2)}
 
-def calculate_camarilla_pivots(high, low, close):
-    range_val = high - low
-    r3 = close + (range_val * 1.1 / 4)
-    r4 = close + (range_val * 1.1 / 2)
-    s3 = close - (range_val * 1.1 / 4)
-    s4 = close - (range_val * 1.1 / 2)
-    return {
-        "r3": round(r3, 2),
-        "r4": round(r4, 2),
-        "s3": round(s3, 2),
-        "s4": round(s4, 2)
-    }
+def calculate_camarilla_pivots(prev_high, prev_low, prev_close):
+    range_val = prev_high - prev_low
+    if range_val == 0:
+        range_val = 0.001 * prev_close
+    r3 = prev_close + (range_val * 1.1 / 4)
+    r4 = prev_close + (range_val * 1.1 / 2)
+    s3 = prev_close - (range_val * 1.1 / 4)
+    s4 = prev_close - (range_val * 1.1 / 2)
+    return {"r3": round(r3, 2), "r4": round(r4, 2),
+            "s3": round(s3, 2), "s4": round(s4, 2)}
 
-# ===== ATR =====
-def calculate_atr(df_, period=14):
-    if len(df_) < period + 1:
+# # ===== ATR =====
+
+def calculate_atr(candles: pd.DataFrame, period: int = 14):
+    """
+    Calculate ATR using a rolling window of `period` candles.
+    Returns the latest ATR value.
+    """
+    highs = candles['high'].astype(float)
+    lows = candles['low'].astype(float)
+    closes = candles['close'].astype(float)
+
+    # True Range (TR)
+    prev_close = closes.shift(1)
+    tr = pd.concat([
+        highs - lows,
+        (highs - prev_close).abs(),
+        (lows - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    # Average True Range (ATR)
+    atr = tr.rolling(period).mean()
+
+    return atr.iloc[-1] if not atr.empty else None
+
+
+def resolve_atr(candles_3m, daily_atr=None, period=14):
+    """
+    Resolve ATR value for signal detection.
+    - If daily_atr is provided, use it.
+    - Otherwise, calculate rolling ATR from candles_3m up to latest candle.
+    """
+    if daily_atr is not None:
+        try:
+            return float(daily_atr), "daily override"
+        except Exception:
+            return None, "daily override invalid"
+
+    if candles_3m is not None and isinstance(candles_3m, pd.DataFrame):
+        atr_val = calculate_atr(candles_3m, period=period)
+        if atr_val is not None:
+            logging.debug(f"[ATR CALC] period={period} value={atr_val:.2f}")
+            return atr_val, "calculated"
+        else:
+            return None, "calculation failed"
+
+    return None, "unavailable"
+
+def daily_atr(df_daily, period=7):
+    """
+    Daily ATR calculation with NaN handling.
+    """
+    if df_daily is None or len(df_daily) < period + 1:
         return None
 
-    hl = df_["high"] - df_["low"]
-    hc = (df_["high"] - df_["close"].shift()).abs()
-    lc = (df_["low"] - df_["close"].shift()).abs()
-
+    hl = df_daily["high"] - df_daily["low"]
+    hc = (df_daily["high"] - df_daily["close"].shift()).abs()
+    lc = (df_daily["low"] - df_daily["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
 
-def resolve_atr(candles_3m_, daily_atr_):
-    """
-    Priority:
-    1. Live 3m ATR (after enough candles)
-    2. Daily ATR
-    3. Bootstrap range (temporary)
-    """
-    atr_3m = calculate_atr(candles_3m_)
-
-    if atr_3m is not None:
-        return atr_3m, "ATR_3M"
-
-    if daily_atr_ is not None:
-        return daily_atr_, "ATR_DAILY"
-
-    # Emergency bootstrap (first few minutes only)
-    if len(candles_3m_) >= 2:
-        atr_boot = candles_3m_["high"].max() - candles_3m_["low"].min()
-        logging.warning(f"[BOOTSTRAP ATR] using range={atr_boot:.2f}")
-        return atr_boot, "ATR_BOOTSTRAP"
-
-    return None, None
+    atr_series = tr.rolling(period).mean().dropna()
+    if atr_series.empty:
+        return None
+    val = atr_series.iloc[-1]
+    return None if pd.isna(val) else float(val)
 
 # ===== Momentum =====
 def momentum_ok(candles, side):
-    last = candles.iloc[-1]
-    prev = candles.iloc[-2]
-
+    if len(candles) < 2:
+        return False, 0
+    last, prev = candles.iloc[-1], candles.iloc[-2]
     momentum = last.close - prev.close
-
-    if side == "CALL":
-        ok = momentum > 0
-    else:
-        ok = momentum < 0
-
+    ok = momentum > 0 if side == "CALL" else momentum < 0
     return ok, momentum
 
-# ===== Candle builder =====
-def build_3min_candle(price):
-    global ticks_buffer, candles_3m, current_3m_start
+# ===== Indicators =====
+def calculate_ema(df, period=20, column="close"):
+    """Exponential Moving Average (EMA) from a DataFrame column."""
+    if df is None or df.empty or column not in df.columns:
+        logging.error("[EMA] Empty or invalid DataFrame")
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
 
-    if price is None or pd.isna(price):
-        return
+    series = df[column].dropna()
+    return series.ewm(span=period, adjust=False).mean()
 
-    ct = dt.now(time_zone)
-
-    # --- 1️⃣ Initialize first candle aligned to 3-minute boundary ---
-    if current_3m_start is None:
-        minute_bucket = (ct.minute // 3) * 3
-        current_3m_start = ct.replace(
-            minute=minute_bucket,
-            second=0,
-            microsecond=0
-        )
-        ticks_buffer.clear()
-        return
-
-    # --- 2️⃣ Accumulate ticks ---
-    ticks_buffer.append(float(price))
-
-    # --- 3️⃣ Close candle ONLY after full 3 minutes elapsed ---
-    if ct >= current_3m_start + dt.duration(minutes=3):
-
-        if len(ticks_buffer) > 0:
-            candle = {
-                "open": ticks_buffer[0],
-                "high": max(ticks_buffer),
-                "low":  min(ticks_buffer),
-                "close": ticks_buffer[-1],
-                "time": current_3m_start
-            }
-
-            candles_3m.loc[len(candles_3m)] = candle
-
-            logging.info(
-                f"{YELLOW}[3M CANDLE CLOSED] {current_3m_start.strftime('%H:%M:%S')} | "
-                f"O={candle['open']} H={candle['high']} "
-                f"L={candle['low']} C={candle['close']} |"
-                f"Spot={spot_price}{RESET}"
-            )
-
-        # --- 4️⃣ Advance to next 3-minute window ---
-        current_3m_start += dt.duration(minutes=3)
-
-        # --- 5️⃣ Reset buffer ---
-        ticks_buffer.clear()
-
-# ===== Build levels once (optional print) + Daily ATR =====
-prev_day = hist_data.iloc[-1]
-prev_high, prev_low, prev_close = float(prev_day['high']), float(prev_day['low']), float(prev_day['close'])
-
-cpr_levels_base = calculate_cpr(prev_high, prev_low, prev_close)
-traditional_levels_base = calculate_traditional_pivots(prev_high, prev_low, prev_close)
-camarilla_levels_base = calculate_camarilla_pivots(prev_high, prev_low, prev_close)
-
-print(
-    f"CPR: Pivot={cpr_levels_base['pivot']}, TC={cpr_levels_base['tc']}, BC={cpr_levels_base['bc']}\n"
-    f"Traditional: Pivot={traditional_levels_base['pivot']}, R1={traditional_levels_base['r1']}, S1={traditional_levels_base['s1']}, "
-    f"R2={traditional_levels_base['r2']}, S2={traditional_levels_base['s2']}\n"
-    f"Camarilla: R3={camarilla_levels_base['r3']}, R4={camarilla_levels_base['r4']}, S3={camarilla_levels_base['s3']}, S4={camarilla_levels_base['s4']}"
-)
-
-daily_atr = calculate_atr(hist_data, period=14)
-
-logging.info(
-    f"[INIT] Daily ATR loaded = {daily_atr:.2f}"
-    if daily_atr is not None else
-    "[INIT] Daily ATR unavailable"
-)
-
-def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
+def calculate_cci(df, period=20):
     """
-    Decide dynamic target based on method and side.
-    side: "CALL" or "PUT"
-    entry_price: option entry price
-    pivots: dict with classic pivot levels {"pivot":..., "r1":..., "s1":..., ...}
-    cpr: dict with CPR levels {"tc":..., "bc":..., "pivot":...}
-    camarilla: dict with camarilla levels {"r3":..., "r4":..., "s3":..., "s4":...}
-    method: "classic", "cpr", "camarilla", or "auto"
+    Commodity Channel Index (CCI) as a Series.
+
+    Fixes vs original:
+    - min_periods = period//4 (=5): produces values from bar 9 instead of bar 39.
+      Eliminates NA at live-mode startup when < 39 bars exist.
+    - md.replace(0, np.nan): eliminates division-by-zero when all prices identical
+      (e.g. end-of-session flat close). Returns NaN instead of 0/0.
+    """
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        logging.warning("[CCI] No data")
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+
+    min_p = max(period // 4, 3)          # 5 for period=20 → valid from bar 9
+    tp    = (df["high"] + df["low"] + df["close"]) / 3
+    ma    = tp.rolling(period, min_periods=min_p).mean()
+    md    = (tp - ma).abs().rolling(period, min_periods=min_p).mean()
+    return  (tp - ma) / (0.015 * md.replace(0, np.nan))
+
+def ema_bias(df, period=20):
+    """EMA bias: compares last close vs EMA."""
+    if df is None or df.empty or "close" not in df.columns:
+        return "NEUTRAL"
+    ema = df["close"].ewm(span=period).mean()
+    if ema.empty or pd.isna(ema.iloc[-1]):
+        return "NEUTRAL"
+    last_close = df["close"].iloc[-1]
+    return "BULLISH" if last_close > ema.iloc[-1] else "BEARISH"
+
+def cci_bias(df, period=20, threshold=60):
+    """CCI bias: checks last CCI value against thresholds."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        return "NEUTRAL"
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    ma = tp.rolling(period).mean()
+    md = (tp - ma).abs().rolling(period).mean()
+    cci = (tp - ma) / (0.015 * md)
+
+    if cci.empty or pd.isna(cci.iloc[-1]):
+        return "NEUTRAL"
+
+    last_cci = cci.iloc[-1]
+    if last_cci > threshold:
+        return "BULLISH"
+    elif last_cci < -threshold:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
+
+
+def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
+    """
+    Compute Supertrend bias and slope.
+    - df: DataFrame with 'high','low','close'
+    - atr_val: optional float ATR override (from resolve_atr)
+    - period: ATR period if computing internally
+    - multiplier: Supertrend multiplier
+    - slope_lookback: number of candles to measure slope
+    Returns tuple: (bias, slope)
     """
 
-    target = None
+    if df is None or df.empty:
+        logging.warning("[SUPERTREND] No candles provided")
+        return "NEUTRAL", "FLAT"
 
-    if method == "classic":
-        target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
+    # --- ATR resolution ---
+    if atr_val is None or pd.isna(atr_val):
+        high_low   = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close  = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr_series = tr.rolling(period).mean().dropna()
+        if atr_series.empty:
+            logging.warning("[SUPERTREND] ATR unavailable (internal calc)")
+            return "NEUTRAL", "FLAT"
+        atr_val = float(atr_series.iloc[-1])
+        logging.debug(f"[SUPERTREND] ATR calculated={atr_val:.2f}")
+    else:
+        try:
+            atr_val = float(atr_val)
+            logging.debug(f"[SUPERTREND] ATR override={atr_val:.2f}")
+        except Exception:
+            logging.error("[SUPERTREND] Invalid ATR override")
+            return "NEUTRAL", "FLAT"
 
-    elif method == "cpr":
-        # For option BUY (CALL or PUT), premium profits when price rises → use tc
-        target = cpr.get("tc", entry_price + profit_loss_point)
+    # --- Supertrend bands ---
+    hl2 = (df['high'] + df['low']) / 2
+    upperband = hl2 + (multiplier * atr_val)
+    lowerband = hl2 - (multiplier * atr_val)
 
-    elif method == "camarilla":
-        target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+    # --- Bias decision ---
+    last = df.iloc[-1]
+    if last.close > upperband.iloc[-1]:
+        bias = "BULLISH"
+    elif last.close < lowerband.iloc[-1]:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
 
-    elif method == "auto":
-        atr = pivots.get("atr", 0)
-        if atr < 20:
-            target = cpr.get("tc", entry_price + profit_loss_point)
-        elif atr < 40:
-            target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
+    # --- Slope detection ---
+    if len(hl2) >= slope_lookback:
+        slope_val = hl2.iloc[-1] - hl2.iloc[-slope_lookback]
+        threshold = 0.2 * atr_val  # avoid noise
+        if abs(slope_val) <= threshold:
+            slope = "FLAT"
+        elif slope_val > 0:
+            slope = "UP"
         else:
-            target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+            slope = "DOWN"
+    else:
+        slope = "FLAT"
 
-    # Fallback
-    if target is None:
-        target = entry_price + profit_loss_point
+    logging.info(f"[SUPERTREND] Bias={bias} Slope={slope} (ATR={atr_val:.2f})")
+    return bias, slope
 
-    return target
+def calculate_adx(df, period=14):
+    """
+    Average Directional Index (ADX) using Wilder EWM smoothing.
+
+    Fixes vs original:
+    - Wilder EWM (alpha=1/period) instead of rolling sum × 2.
+      Original needed 2×14=28 bars before first non-NaN.
+      Wilder EWM needs period+1=15 bars. Matches TradingView/Bloomberg.
+      Eliminates NA at live-mode startup when < 28 bars exist.
+    """
+    if not {"high", "low", "close"}.issubset(df.columns):
+        logging.error("[ADX] Missing required columns")
+        return pd.Series(dtype=float, index=df.index)
+
+    if len(df) < period + 1:
+        return pd.Series([float("nan")] * len(df), index=df.index)
+
+    df    = df.copy()
+    alpha = 1.0 / period
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"]  - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    up   = df["high"].diff()
+    dn   = (-df["low"].diff())
+    plus_dm  = pd.Series(np.where((up > dn) & (up > 0),   up,  0.0), index=df.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0),   dn,  0.0), index=df.index)
+
+    tr_s     = tr.ewm(alpha=alpha,       adjust=False).mean()
+    pdm_s    = plus_dm.ewm(alpha=alpha,  adjust=False).mean()
+    mdm_s    = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+
+    plus_di  = 100 * pdm_s  / tr_s.replace(0, np.nan)
+    minus_di = 100 * mdm_s  / tr_s.replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() /                (plus_di + minus_di).replace(0, np.nan)
+    adx      = dx.ewm(alpha=alpha, adjust=False).mean()
+    adx.iloc[:period] = float("nan")   # blank first (period) rows — insufficient history
+    return adx
+
+def adx_bias(df, period=14, threshold=20):
+    """ADX bias: compares +DI vs -DI with ADX strength check."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        logging.warning("[ADX BIAS] No data")
+        return "NEUTRAL"
+
+    high, low, close = df["high"], df["low"], df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean().dropna()
+    if atr.empty:
+        logging.warning("[ADX BIAS] ATR unavailable")
+        return "NEUTRAL"
+
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    adx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).rolling(period).mean()
+
+    if adx.empty or pd.isna(adx.iloc[-1]):
+        logging.warning("[ADX BIAS] ADX unavailable")
+        return "NEUTRAL"
+
+    adx_val = adx.iloc[-1]
+    logging.debug(f"[ADX BIAS] +DI={plus_di.iloc[-1]:.2f}, -DI={minus_di.iloc[-1]:.2f}, ADX={adx_val:.2f}")
+
+    if adx_val < threshold:
+        return "NEUTRAL"
+    return "BULLISH" if plus_di.iloc[-1] > minus_di.iloc[-1] else "BEARISH"
+
+
+def williams_r(candles, period=14):
+    """
+    Compute Williams %R oscillator.
+    - candles: DataFrame with 'high','low','close'
+    - period: lookback period (default=14)
+    Returns float W%R value in range [-100, 0].
+    """
+
+    if candles is None or candles.empty or len(candles) < period:
+        logging.warning("[W%R] Not enough candles")
+        return np.nan
+
+    # --- Highest high and lowest low over lookback ---
+    highest_high = candles['high'].tail(period).max()
+    lowest_low   = candles['low'].tail(period).min()
+    last_close   = candles['close'].iloc[-1]
+
+    if highest_high == lowest_low:
+        logging.warning("[W%R] Invalid range (high == low)")
+        return np.nan
+
+    # --- Williams %R formula ---
+    wr = ((highest_high - last_close) / (highest_high - lowest_low)) * -100
+
+    logging.debug(
+        f"[W%R] high={highest_high:.2f}, low={lowest_low:.2f}, "
+        f"close={last_close:.2f}, W%R={wr:.2f}"
+    )
+    return wr
+
+
+def compute_rsi(series, period=14):
+    """
+    Compute Relative Strength Index (RSI).
+    series: pandas Series of closing prices
+    period: lookback period (default 14)
+    Returns: pandas Series of RSI values
+    """
+    delta = series.diff()
+
+    # Separate gains and losses
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Use exponential moving average for smoothing
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
