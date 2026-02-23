@@ -110,7 +110,7 @@ class PositionManager:
     # Premium-based exits (fractions of entry premium)
     HARD_STOP_FRAC  : float = 0.45   # exit if LTP drops to 45 % of entry
     PARTIAL_FRAC    : float = 0.50   # lock breakeven after 50 % gain
-    TRAIL_ACTIVATE  : float = 0.25   # start trailing after 25 % gain
+    TRAIL_ACTIVATE  : float = 0.10   # start trailing after 10 % gain (~15 pts on 150 entry)
     TRAIL_STEP      : float = 0.15   # trail gives back ≤15 % of peak gain
 
     # Oscillator exit thresholds
@@ -367,22 +367,49 @@ class PositionManager:
                 return self._exit(cur, "EMA_CROSS", cur_gain, gain, t["bars_held"])
 
         # ── 6. SUPERTREND FLIP × 2 consecutive bars ───────────────────────────
+        # Suppression: only hold through a 3m ST flip when BOTH conditions met:
+        #   (a) position is currently profitable (cur_gain > 0)
+        #   (b) 15m ST is still aligned with the trade (bounce not reversal)
+        # If losing: always exit on ST_FLIP_2 — the trade is wrong, cut it.
         st_against = (side == "CALL" and st == "DOWN") or \
                      (side == "PUT"  and st == "UP")
         if st_against:
             t["st_flip_bars"] += 1
         else:
-            t["st_flip_bars"] = 0
+            # Sticky reset: if losing and we've seen a flip before, only reduce
+            # by 1 (don't fully reset to 0). Prevents oscillating ST from
+            # continuously resetting the counter in a losing trade.
+            if cur_gain <= 0 and t["st_flip_bars"] > 0:
+                t["st_flip_bars"] = max(0, t["st_flip_bars"] - 1)
+            else:
+                t["st_flip_bars"] = 0
 
         if t["st_flip_bars"] >= 2:
-            return self._exit(cur, "ST_FLIP_2", cur_gain, gain, t["bars_held"])
+            try:
+                bias_15m_raw = str(row.get("st_bias_15m", "") if hasattr(row, "get") else getattr(row, "st_bias_15m", "")).upper()
+            except Exception:
+                bias_15m_raw = ""
+
+            _15m_aligned = (side == "CALL" and bias_15m_raw in ("UP", "BULLISH")) or \
+                           (side == "PUT"  and bias_15m_raw in ("DOWN", "BEARISH"))
+            _in_profit   = cur_gain > 0
+
+            if _15m_aligned and _in_profit:
+                # Counter-trend bounce in a profitable trade — suppress exit
+                logging.debug(
+                    f"  [ST_FLIP_2 SUPPRESSED] in profit (+{cur_gain:.1f}) "
+                    f"15m={bias_15m_raw} — holding {side} through bounce"
+                )
+            else:
+                # Losing trade OR 15m also flipped — exit immediately
+                return self._exit(cur, "ST_FLIP_2", cur_gain, gain, t["bars_held"])
 
         # ── 7. REVERSAL CANDLES × 3 consecutive ──────────────────────────────
         # Suppressed during strong trends (ADX≥25): in a trending market, 3
         # consecutive pullback candles are normal consolidation — NOT reversal.
         # Only meaningful in choppy / range-bound conditions (ADX<25).
         adx_val   = _f("adx14", float("nan"))   # column name from build_indicator_dataframe
-        _trending = math.isfinite(adx_val) and adx_val >= 25.0
+        _trending = math.isfinite(adx_val) and adx_val >= 22.0   # was 25 — lowered to keep trending trades alive
 
         try:
             o = float(row["open"]  if hasattr(row, "__getitem__") else row.open)
