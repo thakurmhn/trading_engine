@@ -638,342 +638,269 @@ class PositionManager:
                 peak_gain=peak_gain, bars_held=t["bars_held"]
             )
 
-        # ── STRATEGIC EXIT RULES (v6) ────────────────────────────────────────
-        # Decision order (one rule per bar): LOSS_CUT -> QUICK_PROFIT -> WIN_HOLD -> EARLY_REJECTION
-        # Configurable thresholds (small ints here for clarity)
-        LOSS_CUT_PTS       = -8    # exit early if loss worse than this within early bars (tuned to catch -7.97pts, -8.37pts)
-        LOSS_CUT_MAX_BARS  = 5     # only apply loss cut within first N bars
-        QUICK_PROFIT_UL_PTS= 5     # UL move (pts) equivalent to ~₹650 for lot=130
-        WIN_HOLD_PTS       = 20    # extend hold if gain >= this and momentum confirms
-        WIN_HOLD_EXTEND_BARS = 6   # additional bars to extend max_hold
-
-        # 1) LOSS CUT: cut losers quickly within first few bars
-        if t["bars_held"] <= LOSS_CUT_MAX_BARS and cur_gain <= LOSS_CUT_PTS:
-            logging.info(f"[LOSS CUT] early exit triggered gain={cur_gain:.2f}pts bar={bar_idx} held={t['bars_held']}")
-            logging.info(f"[EXIT DECISION] rule=LOSS_CUT reason=early_loss<={LOSS_CUT_PTS}pts gain={cur_gain:.2f}pts")
+        # ══════════════════════════════════════════════════════════════════════
+        #  STRATEGIC EXIT RULES (v7 simplified)
+        # ══════════════════════════════════════════════════════════════════════
+        # Decision hierarchy (ONE rule fires per bar):
+        #   1) LOSS_CUT (highest priority) — prevent large losses
+        #   2) QUICK_PROFIT — book small wins early
+        #   3) DRAWDOWN_EXIT — protect peak gains
+        #   4) BREAKOUT_HOLD (lowest priority) — extend hold on breakouts
+        
+        # ═══════════════════════════════════════════════════════════════
+        # v8: DYNAMIC THRESHOLDS (scaled by ATR / volatility)
+        # ═══════════════════════════════════════════════════════════════
+        # Rule constants (BASE values - will be scaled by ATR)
+        LOSS_CUT_PTS_BASE        = -10   # BASE: exit if loss < -10 pts
+        LOSS_CUT_MAX_BARS        = 5     # only in first 5 bars
+        QUICK_PROFIT_UL_PTS_BASE = 10    # BASE: UL move >= 10 pts (≈₹1300 lot=130)
+        DRAWDOWN_THRESHOLD_BASE  = 9     # BASE: exit if peak_gain - cur_gain >= 9 pts
+        
+        # v8: Dynamic scaling factors
+        LOSS_CUT_SCALE         = 0.5  # LOSS_CUT scales with 0.5 × ATR(10)
+        QUICK_PROFIT_SCALE     = 1.0  # QUICK_PROFIT scales with 1.0 × ATR(10)
+        BREAKOUT_SUSTAIN_MIN   = 3    # Require 3+ bars at R4/S4 before hold (v8 refinement)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # v9: ADAPTIVE RULES (new enhancements)
+        # ═══════════════════════════════════════════════════════════════
+        # Dynamic breakout sustain (scales with volatility)
+        BREAKOUT_SUSTAIN_BASE  = 2      # v9: Base sustain bars (low volatility)
+        BREAKOUT_SUSTAIN_SCALE = 10     # v9: ATR divisor for scaling (1 bar per 10 pts ATR)
+        
+        # Time-based quick profit (urgency exit if capital locked too long)
+        TIME_QUICK_PROFIT_MAX  = 10     # v9: Max bars to wait for QUICK_PROFIT
+        TIME_QUICK_PROFIT_MIN_GAIN = 3.0  # v9: Minimum gain pts to exit on timeout
+        
+        # Capital utilization tracking (efficiency metrics)
+        CAPITAL_TRACKING_ENABLED = True  # v9: Enable per-trade capital metrics
+        
+        # Calculate ATR(10) for dynamic scaling
+        atr_val = self._calculate_atr(row, period=10)
+        
+        # v9: Calculate dynamic sustain requirement (scales with volatility)
+        sustain_required = max(BREAKOUT_SUSTAIN_BASE, 
+                              BREAKOUT_SUSTAIN_BASE + math.ceil(atr_val / BREAKOUT_SUSTAIN_SCALE))
+        
+        # Dynamic threshold = min(BASE, SCALE × ATR) for loss cut
+        # (smaller = tighter, prevents exiting on volatility)
+        loss_cut_threshold = max(LOSS_CUT_PTS_BASE, -LOSS_CUT_SCALE * atr_val) if atr_val > 0 else LOSS_CUT_PTS_BASE
+        
+        # Dynamic threshold = min(BASE, SCALE × ATR) for quick profit
+        # (smaller = tighter, more filters in high vol)
+        quick_profit_threshold = min(QUICK_PROFIT_UL_PTS_BASE, QUICK_PROFIT_SCALE * atr_val) if atr_val > 0 else QUICK_PROFIT_UL_PTS_BASE
+        
+        # Store thresholds and metrics for capital efficiency tracking
+        if self._t is not None:
+            self._t["atr_val"] = atr_val
+            self._t["loss_cut_threshold"] = loss_cut_threshold
+            self._t["quick_profit_threshold"] = quick_profit_threshold
+            self._t["sustain_required"] = sustain_required  # v9: dynamic sustain
+            self._t["capital_deployed_at_profit"] = -1  # v9: set when profit triggered
+        
+        logging.debug(
+            f"[DYNAMIC THRESHOLDS v8] atr={atr_val:.2f}pts | "
+            f"loss_cut={loss_cut_threshold:.2f}pts (scale={LOSS_CUT_SCALE}) | "
+            f"quick_profit={quick_profit_threshold:.2f}pts (scale={QUICK_PROFIT_SCALE})"
+        )
+        
+        logging.debug(
+            f"[DYNAMIC SUSTAIN v9] sustain_required={sustain_required} bars | "
+            f"atr={atr_val:.2f}pts | regime={'tight' if atr_val<10 else 'normal' if atr_val<20 else 'wide'}"
+        )
+        
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 1: LOSS_CUT (exit quickly on early losses) - v8: ATR-scaled
+        # ────────────────────────────────────────────────────────────────────
+        if t["bars_held"] <= LOSS_CUT_MAX_BARS and cur_gain < loss_cut_threshold:
+            logging.info(
+                f"[LOSS CUT] gain={cur_gain:.2f}pts < {loss_cut_threshold:.2f}pts (ATR-scaled, atr={atr_val:.2f}) | "
+                f"bar={bar_idx} held={t['bars_held']}bars | "
+                f"side={side} entry={ep:.2f} cur={cur:.2f}"
+            )
+            logging.info(
+                f"[EXIT DECISION] rule=LOSS_CUT priority=1 [DYNAMIC EXIT] "
+                f"reason=early_loss gain={cur_gain:.2f}pts threshold={loss_cut_threshold:.2f}pts(ATR={atr_val:.2f}) bars={t['bars_held']}"
+            )
             return self._hard_exit(
                 cur, "LOSS_CUT",
-                f"Early loss cut: gain={cur_gain:.2f}pts within {t['bars_held']} bars (prevents deeper losses)",
+                f"Loss cut: gain={cur_gain:.2f}pts < {loss_cut_threshold:.2f}pts (ATR-scaled) within {t['bars_held']} bars "
+                f"(prevents further deterioration)",
                 cur_gain, peak_gain, t["bars_held"]
             )
 
-        # 2) QUICK PROFIT: book 50% when underlying moved enough for ~₹650 profit
-        if not t.get("half_qty", False) and ul_peak_move >= QUICK_PROFIT_UL_PTS:
-            # Book 50% and move stop to breakeven
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 2: QUICK_PROFIT (book 50% when UL reaches dynamic threshold) - v8: ATR-scaled
+        # ────────────────────────────────────────────────────────────────────
+        if not t.get("half_qty", False) and ul_peak_move >= quick_profit_threshold:
             t["partial_done"] = True
             t["half_qty"]     = True
-            t["hard_stop"]    = ep
-            t["hard_stop_ul"] = t["entry_ul"]
-            logging.info(f"[QUICK PROFIT] booked=~Rs650 ul_move=+{ul_peak_move:.1f}pts stop->BE bar={bar_idx}")
-            logging.info(f"[EXIT DECISION] rule=QUICK_PROFIT reason=ul_peak_move>={QUICK_PROFIT_UL_PTS}pts gain={cur_gain:.2f}pts")
+            t["hard_stop"]    = ep              # option-price BE
+            t["hard_stop_ul"] = t["entry_ul"]   # UL BE (post-partial guard)
+            
+            # v8: Capital efficiency tracking
+            t["capital_utilized_bars"] = t["bars_held"]  # Track how long to profit
+            
+            pnl_half = cur_gain * (self.lot_size // 2)  # P&L for half position
+            logging.info(
+                f"[QUICK PROFIT] ul_peak=+{ul_peak_move:.1f}pts >= {quick_profit_threshold:.1f}pts (ATR-scaled) | "
+                f"booked ~50% at {cur:.2f} | P&L ~Rs{pnl_half:+.0f} | "
+                f"stop->BE ul={t['entry_ul']:.1f} bar={bar_idx}"
+            )
+            logging.info(
+                f"[EXIT DECISION] rule=QUICK_PROFIT priority=2 [CAPITAL METRIC] "
+                f"reason=ul_peak_threshold gain={cur_gain:.2f}pts bars_to_profit={t['bars_held']} "
+                f"threshold={quick_profit_threshold:.2f}pts(ATR={atr_val:.2f})"
+            )
             return ExitDecision(
                 should_exit  = True,
                 reason       = (
-                    f"QUICK_PROFIT | ul_move=+{ul_peak_move:.1f}pts >= {QUICK_PROFIT_UL_PTS}pts | "
-                    f"50% booked at {cur:.1f} | stop->BE ul={t['entry_ul']:.1f}"
+                    f"QUICK_PROFIT | ul_peak=+{ul_peak_move:.1f}pts | "
+                    f"50% booked at {cur:.2f} | stop->BE"
                 ),
                 exit_px      = cur,
                 cur_gain     = cur_gain,
                 peak_gain    = peak_gain,
                 bars_held    = t["bars_held"],
                 exit_score   = 0,
-                exit_bd      = {"QUICK": "50%_booked"},
+                exit_bd      = {"rule": "QUICK_PROFIT", "action": "50%_booked"},
             )
 
-        # 3) WIN HOLD: extend max_hold when clearly winning and momentum/RSI/WR confirm
-        if cur_gain >= WIN_HOLD_PTS:
-            # require 15m trend alignment or RSI/WR strength
-            rsi_ok = math.isfinite(rsi) and ((side == "CALL" and rsi > 55) or (side == "PUT" and rsi < 45))
-            wrv = self._get_wr(row)
-            wr_ok = math.isfinite(wrv) and ((side == "CALL" and wrv <= self.WR_SAFE_CALL) or (side == "PUT" and wrv >= self.WR_SAFE_PUT))
-            st15_ok = (side == "CALL" and st15 in ("UP","BULLISH")) or (side == "PUT" and st15 in ("DOWN","BEARISH"))
-            if (rsi_ok or wr_ok or st15_ok) and not t.get("hold_extended", False):
-                old_max = t.get("max_hold", self.MAX_HOLD)
-                t["max_hold"] = old_max + WIN_HOLD_EXTEND_BARS
-                t["hold_extended"] = True
-                logging.info(f"[WIN HOLD] extended hold gain={cur_gain:.2f}pts old_max={old_max} new_max={t['max_hold']} bar={bar_idx}")
-                logging.info(f"[EXIT DECISION] rule=WIN_HOLD reason=extend_max_hold gain={cur_gain:.2f}pts")
-                # Do not exit this bar; extension applied
-                return ExitDecision(should_exit=False, cur_gain=cur_gain, peak_gain=peak_gain, bars_held=t["bars_held"]) 
-
-        # ── EARLY MARKET REJECTION (v6: detect non-acceptance within 3 bars) ──
-        # If market shows NO acceptance in first 3 bars (peak <= entry+5pts), 
-        # exit to prevent loss accumulation. Winning trades spike immediately.
-        if 2 <= t["bars_held"] <= 3:  # After at least 2 bars, within 3
-            rej_threshold = ep + 5  # entry + 5pts threshold for acceptance
-            if side == "CALL" and peak_gain < 5:  # peak <= entry+5
-                logging.info(f"[EARLY REJECTION] market non-acceptance peak_gain={peak_gain:.2f}pts bars_held={t['bars_held']}")
-                logging.info(f"[EXIT DECISION] rule=EARLY_REJECTION reason=peak<{rej_threshold-ep:.0f}pts gain={cur_gain:.2f}pts")
-                return self._hard_exit(
-                    cur, "EARLY_REJECTION",
-                    f"Market non-acceptance: peak_gain={peak_gain:.1f}pts < 5pts threshold | "
-                    f"bars_held={t['bars_held']} | indicates no market acceptance of setup",
-                    cur_gain, peak_gain, t["bars_held"]
-                )
-            elif side == "PUT" and peak_gain < 5:  # Same logic for PUT
-                logging.info(f"[EARLY REJECTION] market non-acceptance peak_gain={peak_gain:.2f}pts bars_held={t['bars_held']}")
-                logging.info(f"[EXIT DECISION] rule=EARLY_REJECTION reason=peak<{rej_threshold-ep:.0f}pts gain={cur_gain:.2f}pts")
-                return self._hard_exit(
-                    cur, "EARLY_REJECTION",
-                    f"Market non-acceptance: peak_gain={peak_gain:.1f}pts < 5pts threshold | "
-                    f"bars_held={t['bars_held']} | indicates no market acceptance of setup",
-                    cur_gain, peak_gain, t["bars_held"]
-                )
-
-        # ══════════════════════════════════════════════════════════════════════
-        #  TIER 2 — INDICATOR EXITS  (scored)
-        # ══════════════════════════════════════════════════════════════════════
-
-        # ── 5. PARTIAL EXIT — 50% size at PARTIAL_MIN_PTS (v4: sets suppression) ───
-        if not t["half_qty"] and not t["partial_done"] and ul_peak_move >= self.PARTIAL_MIN_PTS:
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 2.5: TIME_QUICK_PROFIT (v9: Urgency exit if capital locked too long)
+        # ────────────────────────────────────────────────────────────────────
+        # Triggers when: bars_held >= TIME_QUICK_PROFIT_MAX and cur_gain >= min_gain
+        # Prevents capital lockup in sideways markets; ensures turnover
+        if (not t.get("half_qty", False) and 
+            t["bars_held"] >= TIME_QUICK_PROFIT_MAX and 
+            cur_gain >= TIME_QUICK_PROFIT_MIN_GAIN):
+            
             t["partial_done"] = True
             t["half_qty"]     = True
-            t["hard_stop"]    = ep            # option-price breakeven
-            # FIX 4: also set underlying breakeven guard
+            t["hard_stop"]    = ep
             t["hard_stop_ul"] = t["entry_ul"]
-            # v4: Mark partial as fired -> suppress scored exits temporarily
-            t["partial_exit_fired"] = True
-            t["scored_exit_suppressed_ct"] = 0
-            partial_px = cur
+            
+            # v9: Capital efficiency - mark when time-exit triggers
+            t["capital_deployed_at_profit"] = t["bars_held"]
+            time_exit_gain_pct = (cur_gain / abs(quick_profit_threshold)) * 100 if quick_profit_threshold != 0 else 0
+            
             logging.info(
-                f"  {CYAN}[PARTIAL EXIT v4] {side} "
-                f"bar={bar_idx} {bar_time} "
-                f"ul_move=+{ul_peak_move:.1f}pts ltp={partial_px:.2f} "
-                f"-> 50% booked | hard_stop->BE px={ep:.2f} ul={t['entry_ul']:.2f} "
-                f"| suppress scored exits until trail/ST_flip confirmed{RESET}"
+                f"[TIME EXIT v9] bars_elapsed={t['bars_held']} >= max={TIME_QUICK_PROFIT_MAX} | "
+                f"gain={cur_gain:.2f}pts >= min={TIME_QUICK_PROFIT_MIN_GAIN}pts | "
+                f"exit_premium={cur:.2f} | Releasing capital"
+            )
+            logging.info(
+                f"[EXIT DECISION] rule=TIME_QUICK_PROFIT priority=2.5 [TIME EXIT v9] "
+                f"reason=capital_urgency bars_elapsed={t['bars_held']} gain={cur_gain:.2f}pts"
             )
             return ExitDecision(
                 should_exit  = True,
                 reason       = (
-                    f"PARTIAL_EXIT | ul_move=+{ul_peak_move:.1f}pts "
-                    f">= {self.PARTIAL_MIN_PTS:.0f}pts | "
-                    f"50% booked at {partial_px:.1f} | "
-                    f"hard_stop->BE px={ep:.1f} ul={t['entry_ul']:.1f} | "
-                    f"trail_remainder | v4_suppress_scored_exits"
+                    f"TIME_EXIT | bars_held={t['bars_held']}(>={TIME_QUICK_PROFIT_MAX}) | "
+                    f"gain={cur_gain:.2f}pts(>={TIME_QUICK_PROFIT_MIN_GAIN}) | "
+                    f"capital release at {cur:.2f}"
                 ),
-                exit_px      = partial_px,
+                exit_px      = cur,
                 cur_gain     = cur_gain,
                 peak_gain    = peak_gain,
                 bars_held    = t["bars_held"],
                 exit_score   = 0,
-                exit_bd      = {"PARTIAL": "50%_v4_suppress"},
+                exit_bd      = {"rule": "TIME_QUICK_PROFIT", "action": "capital_urgency"},
             )
 
-        # ── Compute all indicator exit signals v4 ─────────────────────────────────
-        # v4 Check: Suppress scored exits if partial exit just fired
-        if t.get("partial_exit_fired", False):
-            t["scored_exit_suppressed_ct"] = t.get("scored_exit_suppressed_ct", 0) + 1
-            if t["scored_exit_suppressed_ct"] <= 3:  # suppress for 3 bars max
-                logging.debug(
-                    f"  [SCORED EXIT v4 SUPPRESSED] partial_exit_fired"
-                    f" suppress_ct={t['scored_exit_suppressed_ct']}/3"
-                )
-                return ExitDecision(
-                    should_exit=False, cur_gain=cur_gain,
-                    peak_gain=peak_gain, bars_held=t["bars_held"]
-                )
-            else:
-                # After 3 bars of suppression, allow ST_flip or trail-driven exits
-                t["partial_exit_fired"] = False
-
-        score      = 0
-        bd         : Dict[str, Any] = {}
-        components : List[str]      = []
-        st_pts     = 0
-
-        # ── A) Supertrend flip × 2 bars + 2-bar RSI neutral-cross ──────────────
-        st_against = (side == "CALL" and st in ("DOWN", "BEARISH")) or \
-                     (side == "PUT"  and st in ("UP",   "BULLISH"))
-
-        if st_against:
-            t["st_flip_bars"] += 1
-        else:
-            if cur_gain <= 0 and t["st_flip_bars"] > 0:
-                t["st_flip_bars"] = max(0, t["st_flip_bars"] - 1)
-            else:
-                t["st_flip_bars"] = 0
-
-        # v4: 2-bar RSI confirmation (prev bar + current bar cross 50)
-        prev_rsi = t.get("prev_rsi")
-        rsi_cross_50 = False
-        rsi_valid = math.isfinite(rsi)
-        if rsi_valid:
-            if prev_rsi is not None and math.isfinite(prev_rsi):
-                if side == "CALL" and prev_rsi >= self.RSI_NEUTRAL and rsi < self.RSI_NEUTRAL:
-                    rsi_cross_50 = True
-                if side == "PUT"  and prev_rsi <= self.RSI_NEUTRAL and rsi > self.RSI_NEUTRAL:
-                    rsi_cross_50 = True
-            t["prev_rsi"] = rsi   # only update when valid
-
-        # v4: ST flip logic with 15m bias suppression
-        _15m_aligned = (side == "CALL" and st15 in ("UP", "BULLISH")) or \
-                       (side == "PUT"  and st15 in ("DOWN", "BEARISH"))
-
-        if t["st_flip_bars"] >= 2:
-            # Suppress if 15m aligned, in profit, and ≤2 flip bars
-            if _15m_aligned and cur_gain > 0 and t["st_flip_bars"] <= 2:
-                t["st_suppress_ct"] = t.get("st_suppress_ct", 0) + 1
-                logging.debug(
-                    f"  [ST_FLIP SUPPRESSED] in profit +{cur_gain:.1f} "
-                    f"15m={st15} flip_bars={t['st_flip_bars']} (≤2)"
-                )
-                st_pts = 0
-            elif _15m_aligned and cur_gain > 0 and t["st_flip_bars"] > 2:
-                # 3+ consecutive flips — 15m is lagging; downgrade to FLIP_ONLY
-                st_pts = self.WT_ST_FLIP_ONLY
-                components.append(f"ST_flip×{t['st_flip_bars']}(15m_lag,RSI={rsi:.0f})")
-            elif rsi_cross_50 and t["st_flip_bars"] >= 2:
-                # v4: Require 2-bar ST flip + RSI cross = confirmed
-                st_pts = self.WT_ST_RSI_CONFIRMED
-                components.append(f"ST_flip×{t['st_flip_bars']}+RSI_cross50({rsi:.0f})")
-            else:
-                st_pts = self.WT_ST_FLIP_ONLY
-                components.append(f"ST_flip×{t['st_flip_bars']}(RSI={rsi:.0f})")
-        else:
-            st_pts = 0
-        bd["ST_RSI"] = st_pts; score += st_pts
-
-        # ── B) v4: RSI/W%R gating evaluation (for MOM and PIV) ────────────────
-        # RSI supports exit if RSI confirms weakness (crossed neutral zone)
-        rsi_supports_exit = rsi_cross_50
-
-        # W%R supports exit if it reaches exhaustion levels
-        wr_val = self._get_wr(row)
-        wr_supports_exit = False
-        if math.isfinite(wr_val):
-            if (side == "CALL" and wr_val >= self.WR_EXTREME_CALL) or \
-               (side == "PUT"  and wr_val <= self.WR_EXTREME_PUT):
-                wr_supports_exit = True
-
-        t["rsi_supports_exit"] = rsi_supports_exit
-        t["wr_confirms_exit"] = wr_supports_exit
-
-        # ── C) v5: Losing trade accelerator (loosen gates when in loss) ──────
-        # If cur_gain < 0 and holding 8+ bars, relax RSI/W%R gates to prevent
-        # MAX_HOLD or EOD losses. This converts potential losses to small profits.
-        losing_trade_accelerator = (cur_gain < 0 and t["bars_held"] >= 8)
-        rsi_gate_relaxed = rsi_supports_exit or losing_trade_accelerator
-        wr_gate_relaxed = wr_supports_exit or losing_trade_accelerator
-
-        # ── C) v4: Momentum_ok failure with RSI/W%R gating ──────────────────
-        mom_ok = self._momentum_ok_from_row(row, side)
-        if not mom_ok:
-            t["mom_fail_bars"] = t.get("mom_fail_bars", 0) + 1
-        else:
-            t["mom_fail_bars"] = 0
-
-        mom_pts = 0
-        mom_fail_ct = t["mom_fail_bars"]
-        # v4: Only score momentum if RSI or W%R confirms weakness
-        # v5: OR if in loss after 8 bars (accelerator activates)
-        if mom_fail_ct >= self.MOM_FAIL_BARS and (rsi_gate_relaxed or wr_gate_relaxed):
-            # v4: Dynamic scoring based on consecutive failure count
-            if mom_fail_ct >= 4:
-                mom_pts = self.WT_MOMENTUM_4FAIL
-                gate_tag = "RSI" if rsi_supports_exit else "WR"
-                components.append(f"MOM_fail×{mom_fail_ct}({gate_tag})")
-            elif mom_fail_ct == 3:
-                mom_pts = self.WT_MOMENTUM_3FAIL
-                gate_tag = "RSI" if rsi_supports_exit else "WR"
-                components.append(f"MOM_fail×{mom_fail_ct}({gate_tag})")
-            elif mom_fail_ct == 2:
-                mom_pts = self.WT_MOMENTUM_2FAIL
-                gate_tag = "RSI" if rsi_supports_exit else "WR"
-                components.append(f"MOM_fail×{mom_fail_ct}({gate_tag})")
-
-        bd["MOM"] = mom_pts; score += mom_pts
-
-        # ── D) v4: Pivot rejection with ATR ×0.75 + gating ────────────────────
-        # v5: Use relaxed gates if losing trade accelerator is active
-        piv_pts, piv_tag = self._score_pivot_rejection(
-            row, side, t.get("pivot_reason", ""), h_bar, l_bar, c_bar, atr,
-            rsi_confirms=rsi_gate_relaxed, wr_confirms=wr_gate_relaxed
-        )
-        bd["PIV"] = piv_pts; score += piv_pts
-        if piv_pts > 0:
-            components.append(piv_tag)
-
-        # ── E) v4: Williams %R extreme (15 solo never fires, 25 combined) ─────
-        # v5: Use relaxed gates if losing trade accelerator is active
-        wr_pts = 0
-        if math.isfinite(wr_val) and wr_gate_relaxed:
-            # Check if combined with MOM or PIV (or solo if accelerator active)
-            other_pts = mom_pts + piv_pts
-            if other_pts >= 15 or losing_trade_accelerator:
-                # Combined with other signals
-                wr_pts = self.WT_WR_COMBINED
-                components.append(f"WR={'EXTREME_CALL' if side=='CALL' else 'EXTREME_PUT'}({wr_val:.0f})[combined]")
-            else:
-                # Solo W%R — v4: never contributes to score (exhaustion gate only)
-                logging.debug(
-                    f"  [WR SOLO SUPPRESSED] no MOM/PIV confirmation "
-                    f"WR={wr_val:.0f}"
-                )
-                # Note: wr_pts stays 0, but W%R acts as gate for other signals
-
-        bd["WR"] = wr_pts; score += wr_pts
-
-        # ── F) v4: Reversal_3 (3 bars against + ADX<25) — never fires alone ───
-        _trending = math.isfinite(adx) and adx >= self.ADX_TREND_MIN
-        if math.isfinite(o_bar) and math.isfinite(c_bar):
-            is_rev = (side == "CALL" and c_bar < o_bar) or \
-                     (side == "PUT"  and c_bar > o_bar)
-            t["consec_rev"] = (t["consec_rev"] + 1) if is_rev else 0
-
-        rev_pts = 0
-        if t["consec_rev"] >= self.REVERSAL_MIN and not _trending:
-            rev_pts = self.WT_REVERSAL_3
-            components.append(f"REV×{t['consec_rev']}(ADX={adx:.0f})")
-        elif t["consec_rev"] >= self.REVERSAL_MIN and _trending:
-            logging.debug(
-                f"  [REV3 SUPPRESSED] ADX={adx:.0f}≥{self.ADX_TREND_MIN} "
-                f"— trending, holding through {t['consec_rev']}-bar pullback"
-            )
-
-        bd["REV3"] = rev_pts; score += rev_pts
-
-        # ── Per-bar score logging v4 ──────────────────────────────────────────
-        accel_tag = "[ACCEL]" if losing_trade_accelerator else ""
-        logging.debug(
-            f"  [EXIT SCORE v4] bar={bar_idx} {side} "
-            f"score={score}/{self.EXIT_SCORE_THRESHOLD} "
-            f"ST={st_pts} MOM={mom_pts} PIV={piv_pts} WR={wr_pts} REV3={rev_pts} "
-            f"RSI={rsi:.0f}[gate={rsi_gate_relaxed}] WR={wr_val:.0f}[gate={wr_gate_relaxed}] "
-            f"gain={cur_gain:+.1f} peak=+{peak_gain:.1f} bars_held={t['bars_held']/t.get('max_hold',18):.0%} {accel_tag}"
-        )
-
-        # [TRADE DIAGNOSTICS] — log when accelerator activates on losing trades
-        if losing_trade_accelerator:
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 3: DRAWDOWN_EXIT (protect gains from reversals)
+        # ────────────────────────────────────────────────────────────────────
+        # Only applies if we've captured at least 5 pts gain (meaningful profit)
+        drawdown_amount = peak_gain - cur_gain if peak_gain > 0 else 0
+        
+        if peak_gain >= 5 and drawdown_amount >= DRAWDOWN_THRESHOLD_BASE:
             logging.info(
-                f"[TRADE DIAGNOSTICS][ACCELERATOR ACTIVE] bar={bar_idx} {side} "
-                f"gain={cur_gain:+.1f}pts peak={peak_gain:+.1f}pts bars_held={t['bars_held']} "
-                f"RSI_relaxed={rsi_gate_relaxed} WR_relaxed={wr_gate_relaxed}"
+                f"[DRAWDOWN EXIT] peak={peak_gain:.2f}pts - cur={cur_gain:.2f}pts = "
+                f"drawdown={drawdown_amount:.2f}pts >= {DRAWDOWN_THRESHOLD}pts | "
+                f"bar={bar_idx} held={t['bars_held']}bars | "
+                f"locking in {cur_gain:.2f}pts before further reversal"
             )
-
-        # ── v4 Fire logic: threshold ≥45 OR secondary rule ───────────────────
-        # Secondary rule: ST_flip(20) + any other ≥25 → exit (tighter than 45)
-        secondary_fires = (
-            st_pts == self.WT_ST_FLIP_ONLY and
-            (score - st_pts) >= 25
-        )
-
-        if score >= self.EXIT_SCORE_THRESHOLD or secondary_fires:
-            trigger = (
-                "SEC_RULE_v4"
-                if secondary_fires and score < self.EXIT_SCORE_THRESHOLD
-                else "SCORED_v4"
+            logging.info(
+                f"[EXIT DECISION] rule=DRAWDOWN_EXIT priority=3 "
+                f"reason=drawdown_protection peak={peak_gain:.2f}pts cur={cur_gain:.2f}pts"
             )
-            reason_full = self._build_reason_v4(
-                trigger, score, bd, components,
-                side, rsi, cci, wr_val, st, st15, cur_gain, peak_gain,
-                rsi_supports_exit, wr_supports_exit, mom_fail_ct
-            )
-            return self._indicator_exit(
-                cur, reason_full, score, bd,
+            return self._hard_exit(
+                cur, "DRAWDOWN_EXIT",
+                f"Drawdown protection: peak={peak_gain:.2f}pts -> cur={cur_gain:.2f}pts "
+                f"(drawdown={drawdown_amount:.2f}pts >= {DRAWDOWN_THRESHOLD}pts threshold)",
                 cur_gain, peak_gain, t["bars_held"]
             )
 
-        # ── HOLD ──────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 4: BREAKOUT_HOLD (suppress exits if price sustains R4/S4) - v9: Dynamic sustain
+        # ────────────────────────────────────────────────────────────────────
+        # v9: Dynamic sustain requirement based on ATR (prevents wick triggers in all volatility regimes)
+        # Check if position should be held longer based on breakout levels
+        r4_level = t.get("r4", float("nan"))
+        s4_level = t.get("s4", float("nan"))
+        breakout_hold_triggered = False
+        
+        if side == "CALL" and math.isfinite(r4_level) and underlying >= r4_level:
+            # Sustaining above R4 for CALL — extend hold
+            t["breakout_sustain_bars"] = t.get("breakout_sustain_bars", 0) + 1
+            
+            # v9: Only activate hold after sustain_required bars (dynamic based on ATR)
+            if not t.get("breakout_hold_active", False) and t["breakout_sustain_bars"] >= sustain_required:
+                t["breakout_hold_active"] = True
+                logging.info(
+                    f"[BREAKOUT_HOLD CONFIRMED v9] CALL sustains >= {sustain_required} bars | "
+                    f"UL={underlying:.2f} >= R4={r4_level:.2f} | atr={atr_val:.2f}pts | "
+                    f"bar={bar_idx} extend hold, suppress normal exits"
+                )
+            elif t["breakout_sustain_bars"] < sustain_required:
+                logging.debug(
+                    f"[BREAKOUT HOLD v9] CALL sustain bar {t['breakout_sustain_bars']} (need {sustain_required}) | "
+                    f"UL={underlying:.2f} >= R4={r4_level:.2f} | atr={atr_val:.2f}pts"
+                )
+            breakout_hold_triggered = t["breakout_hold_active"]
+            
+        elif side == "PUT" and math.isfinite(s4_level) and underlying <= s4_level:
+            # Sustaining below S4 for PUT — extend hold
+            t["breakout_sustain_bars"] = t.get("breakout_sustain_bars", 0) + 1
+            
+            # v9: Only activate hold after sustain_required bars (dynamic based on ATR)
+            if not t.get("breakout_hold_active", False) and t["breakout_sustain_bars"] >= sustain_required:
+                t["breakout_hold_active"] = True
+                logging.info(
+                    f"[BREAKOUT_HOLD CONFIRMED v9] PUT sustains >= {sustain_required} bars | "
+                    f"UL={underlying:.2f} <= S4={s4_level:.2f} | atr={atr_val:.2f}pts | "
+                    f"bar={bar_idx} extend hold, suppress normal exits"
+                )
+            elif t["breakout_sustain_bars"] < sustain_required:
+                logging.debug(
+                    f"[BREAKOUT HOLD v9] PUT sustain bar {t['breakout_sustain_bars']} (need {sustain_required}) | "
+                    f"UL={underlying:.2f} <= S4={s4_level:.2f} | atr={atr_val:.2f}pts"
+                )
+            breakout_hold_triggered = t["breakout_hold_active"]
+        else:
+            # Reset if price breaches breakout levels
+            if t.get("breakout_sustain_bars", 0) > 0:
+                logging.debug(
+                    f"[BREAKOUT HOLD v9] price breached threshold (reset sustain counter) | "
+                    f"side={side} ul={underlying:.2f} r4={r4_level:.2f} s4={s4_level:.2f}"
+                )
+                t["breakout_sustain_bars"] = 0
+            if t.get("breakout_hold_active", False):
+                t["breakout_hold_active"] = False
+        
+        if breakout_hold_triggered:
+            logging.info(
+                f"[EXIT DECISION] rule=BREAKOUT_HOLD priority=4 [BREAKOUT_SUSTAIN v9] "
+                f"action=suppress_exits sustain_bars={t.get('breakout_sustain_bars',0)} sustain_required={sustain_required}"
+            )
+            # Don't exit this bar; breakout hold is active
+            return ExitDecision(
+                should_exit=False, cur_gain=cur_gain,
+                peak_gain=peak_gain, bars_held=t["bars_held"]
+            )
+
+        # ── HOLD (no exit triggered) ─────────────────────────────────────────
         return ExitDecision(
             should_exit=False,
             cur_gain=cur_gain,
@@ -1220,6 +1147,46 @@ class PositionManager:
             base -= 2    # tighten slightly on wide CPR
 
         return max(10, base)   # floor at 10 bars
+
+    def _calculate_atr(self, row: Any, period: int = 10) -> float:
+        """
+        v8: Calculate ATR for dynamic threshold scaling.
+        
+        ATR(period) = average of True Ranges over last N bars.
+        True Range = max(high - low, |high - prev_close|, |low - prev_close|)
+        
+        For simplicity in update() context (single bar), uses:
+        - High/Low from current bar
+        - Previous close from position state if available
+        - Falls back to (high-low) if prev_close unavailable
+        
+        Returns: ATR value, or 10.0 (default min) if calc fails
+        """
+        try:
+            h = float(row["high"] if hasattr(row, "__getitem__") else row.high)
+            l = float(row["low"] if hasattr(row, "__getitem__") else row.low)
+            
+            # Try to get previous close from position state
+            prev_c = self._t.get("prev_close") if self._t else None
+            if prev_c is None or not math.isfinite(prev_c):
+                # Fall back to current bar range
+                tr = h - l if (h - l) > 0 else 10.0
+            else:
+                tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            
+            # Update prev_close for next bar
+            if self._t is not None:
+                c = float(row["close"] if hasattr(row, "__getitem__") else row.close)
+                self._t["prev_close"] = c
+                
+                # For full ATR, maintain rolling window (simplified: just current TR for now)
+                # In production, maintain atr_list and compute sma(tr_list, period)
+            
+            return max(tr, 5.0)  # floor at 5 pts to avoid tiny thresholds
+            
+        except Exception as e:
+            logging.debug(f"[ATR CALC] failed: {e}, returning 10.0")
+            return 10.0
 
     def _momentum_ok_from_row(self, row: Any, side: str) -> bool:
         """
