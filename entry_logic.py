@@ -513,6 +513,12 @@ def check_entry_condition(candle, indicators, bias_15m,
     st_bias_3m  = _norm_bias(indicators.get("st_bias_3m",  "NEUTRAL"))
     st_bias_15m = _norm_bias(indicators.get("st_bias_15m", "NEUTRAL"))
 
+    logging.debug(
+        f"[ENTRY SCORING v5 START] regime={regime} base_threshold={threshold} "
+        f"ST_15m={st_bias_15m} ST_3m={st_bias_3m} "
+        f"RSI={_safe_float(candle.get('rsi14')) or 'N/A'}"
+    )
+
     for side in ("CALL", "PUT"):
 
         # ── 5. RSI directional hard filter ────────────────────────────────────
@@ -521,12 +527,12 @@ def check_entry_condition(candle, indicators, bias_15m,
         if _rsi_3m is not None:
             if side == "PUT"  and _rsi_3m > 50:
                 logging.debug(
-                    f"[ENTRY BLOCKED][{side}] RSI_DIRECTIONAL RSI={_rsi_3m:.1f}>50"
+                    f"[DEBUG SIDE][PUT BLOCKED] RSI_DIRECTIONAL: RSI={_rsi_3m:.1f}>50 (no bearish momentum)"
                 )
                 continue
             if side == "CALL" and _rsi_3m < 50:
                 logging.debug(
-                    f"[ENTRY BLOCKED][{side}] RSI_DIRECTIONAL RSI={_rsi_3m:.1f}<50"
+                    f"[DEBUG SIDE][CALL BLOCKED] RSI_DIRECTIONAL: RSI={_rsi_3m:.1f}<50 (no bullish momentum)"
                 )
                 continue
 
@@ -558,6 +564,13 @@ def check_entry_condition(candle, indicators, bias_15m,
             side_threshold, _dt_flag = apply_day_type_to_threshold(
                 side_threshold, day_type_result, side
             )
+
+        logging.debug(
+            f"[{side}] surcharges: base={threshold} "
+            f"{'ctr_3m=+8' if _counter_3m else ''} "
+            f"{'15m_opposing' if (side == 'CALL' and st_bias_15m == 'BEARISH') or (side == 'PUT' and st_bias_15m == 'BULLISH') else ''} "
+            f"-> after_surcharge={side_threshold} {_dt_flag}"
+        )
 
         # ── Hard floors ───────────────────────────────────────────────────────
         if _afternoon_chop:
@@ -594,12 +607,19 @@ def check_entry_condition(candle, indicators, bias_15m,
         }
         total = sum(bd.values())
 
+        # Enhanced logging v5: show indicator availability + scorer breakdown
+        _mom_state = "OK" if indicators.get("momentum_ok_" + side.lower()) else "NO"
+        _cpr_state = indicators.get("cpr_width", "?")
+        _et_state  = indicators.get("entry_type", "?")
+        _rsi_prev  = "AVAIL" if indicators.get("rsi_prev") is not None else "MISS"
+
         logging.debug(
-            f"[SCORE][{side}] {total}/{side_threshold} | "
-            f"ST={bd['trend_alignment']} RSI={bd['rsi_score']} "
-            f"CCI={bd['cci_score']} VWAP={bd['vwap_position']} "
-            f"PIV={bd['pivot_structure']} MOM={bd['momentum_ok']} "
-            f"CPR={bd['cpr_width']} ET={bd['entry_type_bonus']}"
+            f"[SCORE BREAKDOWN v5][{side}] {total}/{side_threshold} | "
+            f"Indicators: MOM={_mom_state} CPR={_cpr_state} ET={_et_state} RSI_prev={_rsi_prev} | "
+            f"ST={bd['trend_alignment']:2d}/20 RSI={bd['rsi_score']:2d}/10 "
+            f"CCI={bd['cci_score']:2d}/15 VWAP={bd['vwap_position']:2d}/10 "
+            f"PIV={bd['pivot_structure']:2d}/15 MOM={bd['momentum_ok']:2d}/15 "
+            f"CPR={bd['cpr_width']:2d}/5 ET={bd['entry_type_bonus']:2d}/5"
         )
 
         if total > best_score:
@@ -611,6 +631,36 @@ def check_entry_condition(candle, indicators, bias_15m,
     result["breakdown"] = best_bd
     result["side"]      = best_side
     result["threshold"] = best_threshold
+
+    # [SIDE CHECK] — Detailed audit log for CALL/PUT symmetric evaluation
+    _rsi_val = f"{_rsi_3m:.1f}" if _rsi_3m is not None else "?"
+    _cci_val = _safe_float(candle.get("cci20") or candle.get("cci"))
+    _cci_str = f"{_cci_val:.0f}" if _cci_val is not None else "?"
+    
+    # Determine what would block each side
+    _call_blocked = (
+        (_rsi_3m is not None and _rsi_3m < 50) or
+        (_rsi_3m is not None and _rsi_3m > 75)
+    )
+    _put_blocked = (
+        (_rsi_3m is not None and _rsi_3m > 50) or
+        (_rsi_3m is not None and _rsi_3m < 30)
+    )
+    
+    logging.info(
+        f"[SIDE CHECK] ST_bias_15m={st_bias_15m} ST_bias_3m={st_bias_3m} "
+        f"RSI={_rsi_val} CCI={_cci_str} "
+        f"CALL_ok={not _call_blocked} PUT_ok={not _put_blocked} "
+        f"chosen_side={best_side if best_score >= best_threshold else 'NONE'} "
+        f"score={best_score}/{best_threshold}"
+    )
+
+    # [DEBUG SIDE DECISION] — comprehensive audit log
+    logging.debug(
+        f"[DEBUG SIDE DECISION] CHOSEN={best_side if best_score >= best_threshold else 'NONE'} "
+        f"best_score={best_score} threshold={best_threshold} "
+        f"RSI={_rsi_3m or 'N/A'} ST_15m={st_bias_15m} ST_3m={st_bias_3m}"
+    )
 
     if best_score >= best_threshold:
         action    = "BUY"      if best_side == "CALL" else "SELL"

@@ -1,4 +1,4 @@
-# ===== execution.py =====
+    # ===== execution.py =====
 import logging
 import pickle
 import pathlib
@@ -277,7 +277,7 @@ def check_exit_condition(df_slice, state):
                 state["stop"] = entry_price
             logging.info(
                 f"{GREEN}[PARTIAL] {side} ltp={current_ltp:.2f} >= pt={pt:.2f} "
-                f"→ stop locked to entry {entry_price:.2f}{RESET}"
+                f"-> stop locked to entry {entry_price:.2f}{RESET}"
             )
 
     # 4. Trailing stop (buffer = 5 option pts)
@@ -287,7 +287,7 @@ def check_exit_condition(df_slice, state):
         if new_stop > state.get("stop", 0):
             state["stop"] = new_stop
             state["trail_updates"] = state.get("trail_updates", 0) + 1
-            logging.info(f"{CYAN}[TRAIL] {side} stop → {new_stop:.2f} ltp={current_ltp:.2f}{RESET}")
+            logging.info(f"{CYAN}[TRAIL] {side} stop to {new_stop:.2f} ltp={current_ltp:.2f}{RESET}")
 
     # 5. Oscillator exhaustion (2-of-3)
     osc_hits = []
@@ -389,7 +389,7 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     means SL is below zero — meaningless.
 
     % approach: SL at 18% below premium, PT at 25%, TG at 45%.
-    Example: entry=150 → SL=123, PT=187.5, TG=217.5
+    Example: entry=150 -> SL=123, PT=187.5, TG=217.5
     """
     if entry_price is None or entry_price <= 0:
         logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
@@ -453,7 +453,7 @@ def update_trailing_stop(current_price, entry_price, current_stop,
 
         if new_stop != current_stop:
             logging.info(
-                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}{RESET}"
+                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} to {new_stop:.2f}{RESET}"
             )
         return new_stop
 
@@ -851,7 +851,7 @@ def process_order(state, df_slice, info, spot_price,
         if mode == "LIVE":
             success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
         else:
-            # REPLAY mode → simulate success, no DB
+            # REPLAY mode -> simulate success, no DB
             success, order_id = True, "REPLAY_ORDER"
 
     if success:
@@ -954,8 +954,8 @@ def update_risk(trade_info, risk_info):
             f"[RISK HALT] Max drawdown breached: {total_pnl:.2f} vs peak {risk_info['peak_equity']:.2f}"
         )
 
-def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY"):
-    global quantity, paper_info, df, spot_price, last_signal_candle_time, risk_info
+def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", spot_price=None):
+    global quantity, paper_info, df, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 120
     ct = dt.now(time_zone)
@@ -966,10 +966,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY"):
             logging.warning(f"[RESET] lingering trade_flag=2 for {leg}")
             paper_info[leg]["trade_flag"] = 0
 
-    # 2. Spot price
+    # 2. Spot price — prefer live candle close; fall back to passed spot_price arg
     if not candles_3m.empty:
         spot_price = candles_3m.iloc[-1]["close"]
         logging.info(f"[PAPER] Spot={spot_price}")
+    elif spot_price is not None:
+        logging.info(f"[PAPER] Spot={spot_price} (from caller — no candles yet)")
 
     # 3. End-of-day force exit
     if ct > end_time:
@@ -1597,7 +1599,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             try:
                 df = tick_db.fetch_candles(interval, use_yesterday=flag, symbol=sym)
                 if df is not None and not df.empty:
-                    logging.debug(f"  fetch_candles(use_yesterday={flag}) → {len(df)} rows")
+                    logging.debug(f"  fetch_candles(use_yesterday={flag}) -> {len(df)} rows")
                     return df
             except Exception as e:
                 logging.debug(f"  fetch_candles(use_yesterday={flag}): {e}")
@@ -1993,10 +1995,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if record:
                 trade_log.append(record)
 
-        # ── Summary ───────────────────────────────────────────────────────────
+        # Summary
         safe_sym  = sym.replace(":", "_")
         date_tag  = date_str or "all"
-        sep       = "─" * 64
+        sep       = "-" * 64
 
         logging.info(f"\n{sep}")
         logging.info(f"  RESULTS: {sym}  ({date_tag})")
@@ -2012,7 +2014,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             logging.info(f"    CALL={call_ct}  PUT={put_ct}  avg_score={avg_sc:.1f}")
             sig_csv = os.path.join(output_dir, f"signals_{safe_sym}_{date_tag}.csv")
             pd.DataFrame(signals_fired).to_csv(sig_csv, index=False)
-            logging.info(f"    → {sig_csv}")
+            logging.info(f"    -> {sig_csv}")
 
         # Trade log shown in all modes (PM tracks exits even in signal_only)
         if trade_log:
@@ -2022,22 +2024,24 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             win_rate = wins / len(trade_log) * 100
             logging.info(f"\n  Trades closed : {len(trade_log)}")
             logging.info(f"  Win / Loss    : {wins} / {losses}  ({win_rate:.1f}%)")
-            logging.info(f"  Total PnL (₹) : {tot_pnl:+.2f}")
+            logging.info(f"  Total PnL (Rs): {tot_pnl:+.2f}")
             logging.info(f"\n  Exit breakdown:")
             for reason, cnt in Counter(t["exit_reason"] for t in trade_log).most_common():
                 logging.info(f"    {reason:22s}: {cnt}")
             logging.info(f"\n  Trade details:")
             for t in trade_log:
                 color = GREEN if t["pnl_points"] >= 0 else RED
+                # Sanitize exit_reason to remove unicode characters
+                reason_safe = t['exit_reason'].replace('→', '->').replace('₹', 'Rs').replace('≥', '>=').replace('≤', '<=')
                 logging.info(
                     f"    {color}{t['side']:4s} entry={t['entry_time']} "
                     f"exit={t['exit_time']} held={t['bars_held']}bars "
-                    f"pnl={t['pnl_points']:+.1f}pts ({t['pnl_value']:+.0f}₹) "
-                    f"[{t['exit_reason']}]{RESET}"
+                    f"pnl={t['pnl_points']:+.1f}pts ({t['pnl_value']:+.0f}Rs) "
+                    f"[{reason_safe}]{RESET}"
                 )
             trd_csv = os.path.join(output_dir, f"trades_{safe_sym}_{date_tag}.csv")
             pd.DataFrame(trade_log).to_csv(trd_csv, index=False)
-            logging.info(f"\n  → {trd_csv}")
+            logging.info(f"\n  -> {trd_csv}")
         else:
             logging.info("  Trades closed : 0")
 
@@ -2046,7 +2050,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             for reason, cnt in blocker_counts.most_common(10):
                 logging.info(f"    {reason:30s}: {cnt} bars")
 
-        logging.info(f"{sep}\n")
+        logging.info("-" * 80 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
