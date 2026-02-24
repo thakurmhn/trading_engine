@@ -1581,7 +1581,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             logging.info(
                 f"  [{table}] {len(df)} rows  "
-                f"({df['time'].iloc[0]} → {df['time'].iloc[-1]})"
+                f"({df['time'].iloc[0]} -> {df['time'].iloc[-1]})"
             )
             return df.reset_index(drop=True)
 
@@ -1671,7 +1671,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                                          .sort_values("time")
                                          .reset_index(drop=True))
                 logging.info(f"[REPLAY] 15m warmup: prepended {len(_prev_15m)} rows "
-                             f"from {_days_found} prev day(s) → total {len(df_15m_all)} 15m rows")
+                             f"from {_days_found} prev day(s) -> total {len(df_15m_all)} 15m rows)")
 
             if _prev_frames_3m:
                 _prev_3m = pd.concat(_prev_frames_3m, ignore_index=True)
@@ -1696,7 +1696,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         # Show available range
         logging.info(
             f"[REPLAY] {sym}: {total_bars} total 3m bars  "
-            f"({df_3m_all.iloc[0][sc3]} → {df_3m_all.iloc[-1][sc3]})"
+            f"({df_3m_all.iloc[0][sc3]} -> {df_3m_all.iloc[-1][sc3]})"
         )
 
         # Auto-reduce warmup if DB has fewer bars than requested
