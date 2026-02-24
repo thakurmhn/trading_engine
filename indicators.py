@@ -131,13 +131,117 @@ def daily_atr(df_daily, period=7):
     return None if pd.isna(val) else float(val)
 
 # ===== Momentum =====
-def momentum_ok(candles, side):
-    if len(candles) < 2:
-        return False, 0
-    last, prev = candles.iloc[-1], candles.iloc[-2]
-    momentum = last.close - prev.close
-    ok = momentum > 0 if side == "CALL" else momentum < 0
-    return ok, momentum
+def momentum_ok(candles: pd.DataFrame, side: str):
+    """
+    Spec-aligned dual-EMA momentum confirmation (v2).
+
+    Replaces the old close-delta check with a proper three-condition gate:
+      CALL (bullish):
+        1. Last 2 closes both above max(EMA9, EMA13)
+        2. EMA9 > EMA13 (fast above slow)
+        3. EMA gap (EMA9 - EMA13) widening vs prior bar
+
+      PUT (bearish):
+        1. Last 2 closes both below min(EMA9, EMA13)
+        2. EMA9 < EMA13 (fast below slow)
+        3. EMA gap magnitude (EMA13 - EMA9) widening vs prior bar
+
+    Returns (bool, float) where float is current EMA gap (positive=bullish bias).
+    Returns (False, 0.0) if < 3 bars, any NaN, or wrong-direction columns.
+
+    Note: Requires candles to have 'ema9' and 'ema13' columns pre-computed
+    (set by orchestration.py:build_indicator_dataframe).
+    Falls back to False if those columns are missing (e.g. early-session).
+    """
+    if candles is None or len(candles) < 3:
+        return False, 0.0
+    if "ema9" not in candles.columns or "ema13" not in candles.columns:
+        # Fallback: old close-delta check for backwards-compat (no EMA columns)
+        last = candles.iloc[-1]
+        prev = candles.iloc[-2]
+        try:
+            delta = float(last["close"]) - float(prev["close"])
+            ok = delta > 0 if side == "CALL" else delta < 0
+            return ok, delta
+        except Exception:
+            return False, 0.0
+    try:
+        last3 = candles.tail(3)
+        e9v  = last3["ema9"].astype(float).values
+        e13v = last3["ema13"].astype(float).values
+        cv   = last3["close"].astype(float).values
+    except Exception:
+        return False, 0.0
+
+    # NaN guard
+    if (any(pd.isna(e9v)) or any(pd.isna(e13v)) or any(pd.isna(cv))):
+        return False, 0.0
+
+    gap_prev = e9v[-2] - e13v[-2]
+    gap_curr = e9v[-1] - e13v[-1]
+
+    if side == "CALL":
+        closes_above = (cv[-2] > e9v[-2] and cv[-2] > e13v[-2] and
+                        cv[-1] > e9v[-1] and cv[-1] > e13v[-1])
+        ema_aligned  = e9v[-1] > e13v[-1]
+        gap_widening = gap_curr > gap_prev
+        ok = closes_above and ema_aligned and gap_widening
+    else:  # PUT
+        closes_below = (cv[-2] < e9v[-2] and cv[-2] < e13v[-2] and
+                        cv[-1] < e9v[-1] and cv[-1] < e13v[-1])
+        ema_aligned  = e9v[-1] < e13v[-1]
+        gap_widening = (-gap_curr) > (-gap_prev)
+        ok = closes_below and ema_aligned and gap_widening
+
+    logging.debug(
+        f"[MOMENTUM_OK][{side}] ok={ok} gap_curr={gap_curr:.2f} gap_prev={gap_prev:.2f} "
+        f"e9={e9v[-1]:.2f} e13={e13v[-1]:.2f} c={cv[-1]:.2f}"
+    )
+    return ok, gap_curr
+
+
+def classify_cpr_width(cpr_levels: dict, close_price: float = None) -> str:
+    """
+    Classify CPR (Central Pivot Range) width as day-type context signal.
+
+    Per Pivot Boss principles:
+      NARROW CPR (<0.30% of price) → high probability trending breakout day
+      NORMAL CPR (0.30–0.80%)     → regular day
+      WIDE CPR   (>0.80%)         → range-bound day, fade extremes
+
+    Absolute fallback (when close_price unavailable):
+      NARROW < 50 pts, NORMAL 50–150 pts, WIDE > 150 pts
+
+    Parameters
+    ──────────
+    cpr_levels  : dict with "tc" (top central pivot) and "bc" (bottom central pivot)
+    close_price : current underlying price for percentage calculation (recommended)
+
+    Returns
+    ───────
+    "NARROW" | "NORMAL" | "WIDE"
+
+    Usage in entry_logic:
+      NARROW → +5 pts (trending breakout bonus per spec)
+      WIDE   →  0 pts (range day — no bonus, scorers already penalise)
+    """
+    try:
+        tc = float(cpr_levels.get("tc", 0))
+        bc = float(cpr_levels.get("bc", 0))
+        width = abs(tc - bc)
+    except Exception:
+        return "NORMAL"
+
+    if close_price and close_price > 0:
+        width_pct = (width / close_price) * 100
+        if width_pct < 0.30: return "NARROW"
+        if width_pct < 0.80: return "NORMAL"
+        return "WIDE"
+
+    # Absolute fallback (NIFTY typical: 25000–26000)
+    if width < 50:   return "NARROW"
+    if width < 150:  return "NORMAL"
+    return "WIDE"
 
 # ===== Indicators =====
 def calculate_ema(df, period=20, column="close"):
@@ -167,7 +271,10 @@ def calculate_cci(df, period=20):
     tp    = (df["high"] + df["low"] + df["close"]) / 3
     ma    = tp.rolling(period, min_periods=min_p).mean()
     md    = (tp - ma).abs().rolling(period, min_periods=min_p).mean()
-    return  (tp - ma) / (0.015 * md.replace(0, np.nan))
+    # FIX: floor md at 0.5 to prevent explosion after flat-bar consolidation.
+    # NIFTY tick=0.05 so 0.5 floor never distorts valid CCI readings.
+    md_safe = md.clip(lower=0.5)
+    return  (tp - ma) / (0.015 * md_safe)
 
 def ema_bias(df, period=20):
     """EMA bias: compares last close vs EMA."""

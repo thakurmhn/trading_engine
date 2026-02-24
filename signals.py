@@ -23,6 +23,7 @@ from indicators import (
     williams_r,
     calculate_cci,
     compute_rsi,
+    classify_cpr_width,
 )
 from entry_logic import check_entry_condition
 
@@ -43,6 +44,17 @@ def _norm_bias(raw):
     if raw in ("BULLISH", "UP"):    return "BULLISH"
     if raw in ("BEARISH", "DOWN"):  return "BEARISH"
     return "NEUTRAL"
+
+
+def _safe_float(val, default=None):
+    """Safely convert value to float, returning default if not possible."""
+    try:
+        if val is None:
+            return default
+        f = float(val)
+        return f if pd.notna(f) else default
+    except (ValueError, TypeError):
+        return default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +522,42 @@ def detect_signal(candles_3m, candles_15m,
 
     pivot_signal = pv_call or pv_put
 
+    # --- Compute missing indicators (v5 fix) ───────────────────────────────
+    # These were being called for candle_strength but not passed to check_entry_condition()
+    # Restores 15-25 pts of scoring capability
+
+    # 1. Momentum_ok for both sides (15 pts each if True)
+    mom_ok_call, _ = momentum_ok(candles_3m, "CALL")
+    mom_ok_put,  _ = momentum_ok(candles_3m, "PUT")
+
+    # 2. CPR width classification (NARROW = +5 pts bonus)
+    cpr_width = classify_cpr_width(cpr_levels, float(last_3m.get("close", 0)))
+
+    # 3. Entry type from pivot reason (PULLBACK/REJECTION = +5 pts bonus)
+    entry_type = "CONTINUATION"  # default
+    if pivot_signal and len(pivot_signal) > 1:
+        reason = pivot_signal[1].upper()
+        if "BREAKOUT" in reason:
+            entry_type = "BREAKOUT"
+        elif "PULLBACK" in reason:
+            entry_type = "PULLBACK"
+        elif "REJECTION" in reason:
+            entry_type = "REJECTION"
+        elif "ACCEPTANCE" in reason:
+            entry_type = "ACCEPTANCE"
+        else:
+            entry_type = "CONTINUATION"
+
+    # 4. RSI previous value (for slope +2 bonus)
+    rsi_prev = None
+    if len(candles_3m) >= 2:
+        try:
+            prev_rsi_val = float(candles_3m.iloc[-2].get("rsi14") or candles_3m.iloc[-2].get("rsi"))
+            if not pd.isna(prev_rsi_val):
+                rsi_prev = prev_rsi_val
+        except Exception:
+            pass
+
     # --- Build indicators dict ---
     def _safe(val):
         try:
@@ -519,6 +567,7 @@ def detect_signal(candles_3m, candles_15m,
             return None
 
     indicators = {
+        # Original indicators
         "atr":                 atr,
         "supertrend_line_3m":  _safe(last_3m.get("supertrend_line")),
         "supertrend_line_15m": _safe(last_15m.get("supertrend_line")) if has_15m else None,
@@ -528,9 +577,20 @@ def detect_signal(candles_3m, candles_15m,
         "cci":                 _safe(last_3m.get("cci20")),
         "candle_15m":          last_15m if has_15m else None,
         "st_bias_3m":          st_bias_3m,
-        "st_bias_15m":         st_bias,        # FIX: was missing — surcharge +7 for 15m conflict now fires
         "vwap":                vwap,
+        
+        # NEW (v5 fix): Missing indicators restored
+        "momentum_ok_call":    mom_ok_call,
+        "momentum_ok_put":     mom_ok_put,
+        "cpr_width":           cpr_width,
+        "entry_type":          entry_type,
+        "rsi_prev":            rsi_prev,
     }
+
+    logging.debug(
+        f"[INDICATORS BUILT] MOM_CALL={mom_ok_call} MOM_PUT={mom_ok_put} "
+        f"CPR={cpr_width} ET={entry_type} RSI_prev={rsi_prev}"
+    )
 
     # --- Scoring engine ---
     lz_signal = check_entry_condition(
@@ -542,9 +602,35 @@ def detect_signal(candles_3m, candles_15m,
         day_type_result=day_type_result,
     )
 
+    # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────
+    _sc  = lz_signal.get("score",     0)  or 0
+    _thr = lz_signal.get("threshold", 50) or 50
+    _bd  = lz_signal.get("breakdown", {})
+    _gap = _thr - _sc
+    logging.info(
+        f"[SIGNAL CHECK] bar={len(candles_3m)} "
+        f"side={lz_signal.get('side','?')} "
+        f"score={_sc}/{_thr} gap={_gap:+.0f} "
+        f"ST15m={st_bias} ST3m={st_bias_3m} "
+        f"atr={atr:.1f} pivot={pivot_signal} "
+        f"breakdown={_bd}"
+    )
+
     if lz_signal["action"] not in ("BUY", "SELL"):
-        signal_blockers["SCORE_LOW"] += 1
-        logging.debug(f"[SIGNAL] Blocked: {lz_signal['reason']}")
+        reason_str = lz_signal.get("reason", "")
+        if "RSI_OVERSOLD" in reason_str or "RSI_OVERBOUGHT" in reason_str:
+            signal_blockers["RSI_EXHAUSTION"] = signal_blockers.get("RSI_EXHAUSTION", 0) + 1
+        else:
+            signal_blockers["SCORE_LOW"] += 1
+
+        # Near-miss (within 15 pts of threshold) → INFO so the trader can see why
+        _log = logging.info if _gap <= 15 else logging.debug
+        _log(
+            f"[SIGNAL BLOCKED] {reason_str} | "
+            f"3m={st_bias_3m} 15m={st_bias} atr={atr:.1f} "
+            f"MOM_CALL={indicators.get('momentum_ok_call')} MOM_PUT={indicators.get('momentum_ok_put')} "
+            f"breakdown={_bd}"
+        )
         return None
 
     side = lz_signal.get("side") or ("CALL" if lz_signal["action"] == "BUY" else "PUT")
@@ -577,10 +663,18 @@ def detect_signal(candles_3m, candles_15m,
     state["source"]       = source
     state["pivot_reason"] = pivot_reason
     state["score"]        = lz_signal.get("score", 0)
+    state["threshold"]    = lz_signal.get("threshold", 50)
+    state["breakdown"]    = lz_signal.get("breakdown", {})  # v6: entry score breakdown
     state["strength"]     = lz_signal.get("strength", "MEDIUM")
     state["zone_type"]    = lz_signal.get("zone_type")
     state["vwap_pos"]     = vwap_pos
     state["vwap"]         = vwap
+    
+    # Add indicator snapshots for side decision audit trail
+    state["st_bias"]      = st_bias_3m      # 3m supertrend bias
+    state["st_bias_15m"]  = st_bias         # 15m supertrend bias
+    state["rsi"]          = _safe_float(last_3m.get("rsi14") or last_3m.get("rsi")) or "?"
+    state["cci"]          = _safe_float(last_3m.get("cci20") or last_3m.get("cci")) or "?"
 
     logging.info(
         f"{GREEN}[SIGNAL FIRED] {side} source={source} "
