@@ -20,6 +20,7 @@ from indicators import (
     resolve_atr,
     daily_atr,
     momentum_ok,
+    classify_cpr_width,
     williams_r,
     calculate_cci,
     compute_rsi,
@@ -51,8 +52,9 @@ def _norm_bias(raw):
 signal_blockers = {
     "ATR":              0,
     "SCORE_LOW":        0,
+    "RSI_EXHAUSTION":   0,   # RSI oversold PUT / overbought CALL entry blocked
     "HTF_LTF_CONFLICT": 0,
-    "NARROW_RANGE":     0,   # replaces LOW_VOLUME — index has no volume
+    "NARROW_RANGE":     0,
     "PARTIAL_CANDLE":   0,
     "NO_SIGNAL":        0,
 }
@@ -317,8 +319,84 @@ def detect_orb_signal(last, atr, orb_high, orb_low, call_ok, put_ok,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITY FUNCTIONS
+# PULLBACK RETEST DETECTION (NEW — spec: enter on retests of breakout levels)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Module-level breakout state tracker.
+# Populated by detect_signal on every confirmed breakout pivot signal.
+# Reset at session start (new import) or when a trade is opened.
+_breakout_state = {
+    "side":  None,   # "CALL" | "PUT" | None
+    "level": None,   # float — breakout pivot level (R3, R4, S3, S4, VWAP etc.)
+    "bar":   -999,   # bar index when breakout fired
+}
+
+
+def reset_breakout_state():
+    """Call at session start or after a position is opened."""
+    _breakout_state["side"]  = None
+    _breakout_state["level"] = None
+    _breakout_state["bar"]   = -999
+
+
+def _record_breakout(side: str, level: float, bar_idx: int):
+    """Store the most recent breakout for pullback detection."""
+    _breakout_state["side"]  = side
+    _breakout_state["level"] = level
+    _breakout_state["bar"]   = bar_idx
+    logging.debug(
+        f"[BREAKOUT_STATE] recorded {side} level={level:.1f} bar={bar_idx}"
+    )
+
+
+def detect_pullback_retest(last_3m, prev_3m, atr, vwap, call_ok, put_ok,
+                           current_bar_idx: int = 0):
+    """
+    Detect a pullback retest entry after a prior breakout.
+
+    Conditions:
+      - A breakout was recorded within the last 10 bars (fresh, not stale)
+      - Price has retraced to within 0.5×ATR of the breakout level
+      - Current close is in the trade direction (rising for CALL, falling for PUT)
+        relative to the prior bar
+
+    Also detects VWAP pullback when a breakout side is known but price has
+    pulled back to VWAP (a common Pivot Boss retest zone).
+
+    Returns tuple (side, reason) or None.
+    Reason format: "PULLBACK_RETEST_R3" | "PULLBACK_VWAP" etc.
+    """
+    bs  = _breakout_state["side"]
+    blv = _breakout_state["level"]
+    bbr = _breakout_state["bar"]
+
+    if bs is None or blv is None:
+        return None
+
+    # Stale breakout gate: ignore if breakout was > 10 bars ago
+    if current_bar_idx - bbr > 10:
+        return None
+
+    close = float(last_3m.close)
+    prev_close = float(prev_3m.close)
+    tol = 0.5 * atr if atr else 5.0
+
+    if bs == "CALL" and call_ok:
+        # Price retested the breakout level from above
+        if (blv - tol) <= close <= (blv + tol) and close > prev_close:
+            # Determine level label from known camarilla names
+            return "CALL", "PULLBACK_RETEST"
+        # VWAP pullback for CALL
+        if vwap and abs(close - vwap) <= tol and close > prev_close:
+            return "CALL", "PULLBACK_VWAP"
+
+    if bs == "PUT" and put_ok:
+        if (blv - tol) <= close <= (blv + tol) and close < prev_close:
+            return "PUT", "PULLBACK_RETEST"
+        if vwap and abs(close - vwap) <= tol and close < prev_close:
+            return "PUT", "PULLBACK_VWAP"
+
+    return None
 def to_scalar(val):
     try:
         if val is None:
@@ -392,8 +470,16 @@ def _make_state(side, reason, candles_3m, atr, last, prev):
 def _best_pivot_for_side(last_3m, prev_3m, rng, atr,
                          cpr_levels, camarilla_levels, traditional_levels,
                          side, st_bias, vwap=None, orb_high=None, orb_low=None,
-                         current_time=None):
-    """Return best pivot signal tuple (side, reason) for the given side, or None."""
+                         current_time=None, current_bar_idx=0):
+    """Return best pivot signal tuple (side, reason) for the given side, or None.
+
+    Priority order: Camarilla → CPR → VWAP → Traditional acceptance →
+                    Pivot acceptance → Traditional rejection → Pivot rejection →
+                    Traditional/Pivot continuation → ORB → Pullback retest
+
+    Pullback retest is last in priority — only fires when no fresh breakout
+    signal exists but a prior breakout level is being retested.
+    """
     call_ok = (side == "CALL")
     put_ok  = (side == "PUT")
     candidates = [
@@ -407,6 +493,7 @@ def _best_pivot_for_side(last_3m, prev_3m, rng, atr,
         detect_traditional_continuation(last_3m, atr, traditional_levels, call_ok, put_ok, st_bias),
         detect_pivot_continuation(last_3m, atr, traditional_levels, call_ok, put_ok, st_bias),
         detect_orb_signal(last_3m, atr, orb_high, orb_low, call_ok, put_ok, current_time),
+        detect_pullback_retest(last_3m, prev_3m, atr, vwap, call_ok, put_ok, current_bar_idx),
     ]
     for res in candidates:
         if res and res[0] == side:
@@ -421,19 +508,22 @@ def detect_signal(candles_3m, candles_15m,
                   cpr_levels, camarilla_levels, traditional_levels,
                   atr=None, include_partial=False,
                   current_time=None,
-                  vwap=None,          # pass VWAP from paper_order / live_order
-                  orb_high=None,      # opening range high
-                  orb_low=None,       # opening range low
-                  day_type_result=None):  # NEW: DayTypeResult for threshold modifier
+                  vwap=None,
+                  orb_high=None,
+                  orb_low=None,
+                  day_type_result=None,
+                  current_bar_idx=0):
     """
-    Unified signal detection with VWAP, ORB, and volume confirmation.
+    Unified signal detection — v4 (Spec-Aligned with Momentum + CPR + Pullback).
 
-    IMPROVEMENTS vs v2:
-      - VWAP signals added as high-value pivot source
-      - ORB breakout support
-      - Volume confirmation (low volume bars skipped)
-      - HTF/LTF anti-conflict gate (won't buy CALL if 15m=DOWN and 3m=DOWN)
-      - Blockers now categorised for better diagnostics
+    New in v4 vs v3:
+      - momentum_ok (dual-EMA + gap widening) computed and scored
+      - CPR width classified and passed to entry_logic for scoring
+      - Pullback retest detection (retests of R3/R4/S3/S4/VWAP after breakout)
+      - Entry type classification (BREAKOUT | PULLBACK | REJECTION | CONTINUATION)
+      - Breakout state tracking (_breakout_state) for pullback detection
+      - current_bar_idx parameter for staleness gating of pullback signals
+      - Full audit log: ST+RSI+CCI+Pivot+Momentum+CPR+EntryType
     """
 
     # --- Partial candle guard ---
@@ -456,7 +546,7 @@ def detect_signal(candles_3m, candles_15m,
     prev_3m = candles_3m.iloc[-2]
     rng     = float(last_3m.high) - float(last_3m.low)
 
-    # --- Range gate (replaces volume gate — NSE index has no volume) ---
+    # --- Range gate ---
     if not range_is_ok(candles_3m):
         signal_blockers["NARROW_RANGE"] += 1
         logging.debug("[SIGNAL] Blocked: narrow range candle")
@@ -473,24 +563,35 @@ def detect_signal(candles_3m, candles_15m,
     st_bias_3m   = _norm_bias(raw_bias_3m)
 
     # --- HTF/LTF conflict gate ---
-    # Don't enter CALL if both 15m and 3m are bearish (avoid fighting trend)
-    # Don't enter PUT if both 15m and 3m are bullish
     if st_bias == "BEARISH" and st_bias_3m == "BEARISH":
-        # Allow PUT entries only
         call_allowed, put_allowed = False, True
     elif st_bias == "BULLISH" and st_bias_3m == "BULLISH":
         call_allowed, put_allowed = True, False
     else:
-        call_allowed, put_allowed = True, True  # Mixed/neutral → allow both
+        call_allowed, put_allowed = True, True
 
-    # Auto-compute VWAP from candles if not passed externally
+    # --- VWAP ---
     if vwap is None:
         vwap = calculate_vwap(candles_3m)
+
+    # --- Momentum (spec: dual-EMA dual-close + gap widening) ---
+    _mom_call_ok, _mom_call_gap = momentum_ok(candles_3m, "CALL")
+    _mom_put_ok,  _mom_put_gap  = momentum_ok(candles_3m, "PUT")
+    logging.debug(
+        f"[MOMENTUM] CALL_ok={_mom_call_ok} gap={_mom_call_gap:.2f} | "
+        f"PUT_ok={_mom_put_ok} gap={_mom_put_gap:.2f}"
+    )
+
+    # --- CPR width classification (day-type context) ---
+    _close_price = float(last_3m.get("close", 0)) if last_3m.get("close") else None
+    _cpr_width   = classify_cpr_width(cpr_levels, _close_price)
+    logging.debug(f"[CPR_WIDTH] {_cpr_width} (TC={cpr_levels.get('tc','?')} BC={cpr_levels.get('bc','?')} px={_close_price})")
 
     logging.debug(
         f"[SIGNAL] 15m={st_bias} 3m={st_bias_3m} atr={atr:.1f} "
         f"tpma={f'{vwap:.1f}' if vwap else 'N/A'} "
-        f"call_ok={call_allowed} put_ok={put_allowed}"
+        f"call_ok={call_allowed} put_ok={put_allowed} "
+        f"cpr_width={_cpr_width}"
     )
 
     # --- Pivot signals for both sides ---
@@ -498,14 +599,14 @@ def detect_signal(candles_3m, candles_15m,
         last_3m, prev_3m, rng, atr,
         cpr_levels, camarilla_levels, traditional_levels,
         "CALL", st_bias, vwap=vwap, orb_high=orb_high, orb_low=orb_low,
-        current_time=current_time,
+        current_time=current_time, current_bar_idx=current_bar_idx,
     ) if call_allowed else None
 
     pv_put  = _best_pivot_for_side(
         last_3m, prev_3m, rng, atr,
         cpr_levels, camarilla_levels, traditional_levels,
         "PUT", st_bias, vwap=vwap, orb_high=orb_high, orb_low=orb_low,
-        current_time=current_time,
+        current_time=current_time, current_bar_idx=current_bar_idx,
     ) if put_allowed else None
 
     pivot_signal = pv_call or pv_put
@@ -518,6 +619,16 @@ def detect_signal(candles_3m, candles_15m,
         except Exception:
             return None
 
+    # RSI prev bar for slope detection
+    _rsi_prev = None
+    if len(candles_3m) >= 2:
+        try:
+            _rsi_prev = _safe(candles_3m.iloc[-2].get("rsi14") or candles_3m.iloc[-2].get("rsi"))
+        except Exception:
+            pass
+
+    # Determine momentum_ok for the tentative side (set after scoring completes)
+    # Pass both so entry_logic can pick the correct one after side is chosen.
     indicators = {
         "atr":                 atr,
         "supertrend_line_3m":  _safe(last_3m.get("supertrend_line")),
@@ -528,9 +639,58 @@ def detect_signal(candles_3m, candles_15m,
         "cci":                 _safe(last_3m.get("cci20")),
         "candle_15m":          last_15m if has_15m else None,
         "st_bias_3m":          st_bias_3m,
-        "st_bias_15m":         st_bias,        # FIX: was missing — surcharge +7 for 15m conflict now fires
+        "st_bias_15m":         st_bias,
         "vwap":                vwap,
+        "rsi_prev":            _rsi_prev,
+        # NEW: momentum_ok per side — entry_logic uses these for scoring
+        "momentum_ok_call":    _mom_call_ok,
+        "momentum_ok_put":     _mom_put_ok,
+        "momentum_gap_call":   _mom_call_gap,
+        "momentum_gap_put":    _mom_put_gap,
+        # NEW: CPR width for day-type bonus scoring
+        "cpr_width":           _cpr_width,
     }
+
+    # --- PA gate ---
+    _pa_put_blocked  = False
+    _pa_call_blocked = False
+    if len(candles_3m) >= 4 and atr:
+        _closes = candles_3m["close"].iloc[-4:].values.astype(float)
+        _tol    = 0.15 * atr
+        _d3, _d2, _d1, _d0 = _closes[-4], _closes[-3], _closes[-2], _closes[-1]
+        _pa_recovering = (_d0 > _d1 + _tol) or ((_d0 > _d1 and _d0 > _d2) and _d0 > _d3 + _tol)
+        _pa_declining  = (_d0 < _d1 - _tol) or ((_d0 < _d1 and _d0 < _d2) and _d0 < _d3 - _tol)
+        _pa_put_blocked  = _pa_recovering
+        _pa_call_blocked = _pa_declining
+        if _pa_put_blocked:
+            logging.info(
+                f"[PA GATE] Recovering — PUT pre-blocked | "
+                f"closes={_d2:.0f}→{_d1:.0f}→{_d0:.0f} tol={_tol:.1f}"
+            )
+        if _pa_call_blocked:
+            logging.info(
+                f"[PA GATE] Declining — CALL pre-blocked | "
+                f"closes={_d2:.0f}→{_d1:.0f}→{_d0:.0f} tol={_tol:.1f}"
+            )
+        if _pa_put_blocked and not _pa_call_blocked:
+            pv_call = _best_pivot_for_side(
+                last_3m, prev_3m, rng, atr,
+                cpr_levels, camarilla_levels, traditional_levels,
+                "CALL", st_bias, vwap=vwap, orb_high=orb_high, orb_low=orb_low,
+                current_time=current_time, current_bar_idx=current_bar_idx,
+            ) if call_allowed else None
+            pivot_signal = pv_call
+        elif _pa_call_blocked and not _pa_put_blocked:
+            pv_put = _best_pivot_for_side(
+                last_3m, prev_3m, rng, atr,
+                cpr_levels, camarilla_levels, traditional_levels,
+                "PUT", st_bias, vwap=vwap, orb_high=orb_high, orb_low=orb_low,
+                current_time=current_time, current_bar_idx=current_bar_idx,
+            ) if put_allowed else None
+            pivot_signal = pv_put
+        elif _pa_put_blocked and _pa_call_blocked:
+            signal_blockers["NO_SIGNAL"] += 1
+            return None
 
     # --- Scoring engine ---
     lz_signal = check_entry_condition(
@@ -543,13 +703,35 @@ def detect_signal(candles_3m, candles_15m,
     )
 
     if lz_signal["action"] not in ("BUY", "SELL"):
-        signal_blockers["SCORE_LOW"] += 1
-        logging.debug(f"[SIGNAL] Blocked: {lz_signal['reason']}")
+        reason_str = lz_signal.get("reason", "")
+        if "RSI_OVERSOLD" in reason_str or "RSI_OVERBOUGHT" in reason_str:
+            signal_blockers["RSI_EXHAUSTION"] += 1
+        else:
+            signal_blockers["SCORE_LOW"] += 1
+        logging.info(
+            f"[SIGNAL BLOCKED] {reason_str} | "
+            f"3m={st_bias_3m} 15m={st_bias} atr={atr:.1f} "
+            f"breakdown={lz_signal.get('breakdown',{})}"
+        )
         return None
 
     side = lz_signal.get("side") or ("CALL" if lz_signal["action"] == "BUY" else "PUT")
 
-    # Final HTF/LTF check on chosen side
+    # PA gate enforcement
+    if side == "PUT" and _pa_put_blocked:
+        signal_blockers["NO_SIGNAL"] += 1
+        logging.info(
+            f"[SIGNAL BLOCKED] PA_GATE — scoring chose PUT but price is recovering "
+            f"(put_blocked=True score={lz_signal.get('score','?')})")
+        return None
+    if side == "CALL" and _pa_call_blocked:
+        signal_blockers["NO_SIGNAL"] += 1
+        logging.info(
+            f"[SIGNAL BLOCKED] PA_GATE — scoring chose CALL but price is declining "
+            f"(call_blocked=True score={lz_signal.get('score','?')})")
+        return None
+
+    # Final HTF/LTF check
     if side == "CALL" and not call_allowed:
         signal_blockers["HTF_LTF_CONFLICT"] += 1
         return None
@@ -557,6 +739,30 @@ def detect_signal(candles_3m, candles_15m,
         signal_blockers["HTF_LTF_CONFLICT"] += 1
         return None
 
+    # --- Entry type classification ---
+    # Determines entry character for log, audit, and scoring bonus.
+    # BREAKOUT    : price broke through a new level (R3/R4/S3/S4/CPR/ORB)
+    # PULLBACK    : retest of a prior breakout level or VWAP
+    # REJECTION   : failed breakout fade (price rejected at key level)
+    # CONTINUATION: inside range but bias-aligned
+    _pivot_reason = (pivot_signal[1] if pivot_signal and pivot_signal[0] == side else "")
+    if "BREAKOUT" in _pivot_reason or "ORB" in _pivot_reason:
+        _entry_type = "BREAKOUT"
+        # Record this breakout level for future pullback detection
+        _close_for_state = float(last_3m.get("close", 0))
+        _record_breakout(side, _close_for_state, current_bar_idx)
+    elif "PULLBACK" in _pivot_reason:
+        _entry_type = "PULLBACK"
+    elif "REJECTION" in _pivot_reason:
+        _entry_type = "REJECTION"
+    else:
+        _entry_type = "CONTINUATION"
+
+    # --- Momentum resolved for chosen side ---
+    _mom_ok   = _mom_call_ok  if side == "CALL" else _mom_put_ok
+    _mom_gap  = _mom_call_gap if side == "CALL" else _mom_put_gap
+
+    # --- Build state ---
     reason = lz_signal["reason"]
     state  = _make_state(side, reason, candles_3m, atr, last_3m, prev_3m)
 
@@ -567,7 +773,7 @@ def detect_signal(candles_3m, candles_15m,
         source       = "LIQUIDITY_ZONE"
         pivot_reason = None
 
-    # VWAP context tag
+    # VWAP context
     if vwap is not None:
         close = float(last_3m.close)
         vwap_pos = "ABOVE_VWAP" if close > vwap else "BELOW_VWAP"
@@ -581,11 +787,27 @@ def detect_signal(candles_3m, candles_15m,
     state["zone_type"]    = lz_signal.get("zone_type")
     state["vwap_pos"]     = vwap_pos
     state["vwap"]         = vwap
+    # NEW fields
+    state["momentum_ok"]  = _mom_ok
+    state["momentum_gap"] = _mom_gap
+    state["cpr_width"]    = _cpr_width
+    state["entry_type"]   = _entry_type
 
+    # Spec-aligned audit log:
+    # "Supertrend alignment + RSI + CCI + Pivot acceptance/rejection + Momentum_ok + CPR + EntryType"
+    _cci_val = _safe(last_3m.get("cci20") or last_3m.get("cci"))
+    _rsi_val = _safe(last_3m.get("rsi14") or last_3m.get("rsi"))
     logging.info(
-        f"{GREEN}[SIGNAL FIRED] {side} source={source} "
+        f"{GREEN}[SIGNAL FIRED] {side} "
         f"score={state['score']} strength={state['strength']} "
-        f"bias15m={st_bias} bias3m={st_bias_3m} "
-        f"pivot={pivot_reason} {vwap_pos} | {reason}{RESET}"
+        f"| ST15m={st_bias} ST3m={st_bias_3m} "
+        f"RSI={f'{_rsi_val:.1f}' if _rsi_val else '?'} "
+        f"CCI={f'{_cci_val:.0f}' if _cci_val else '?'} "
+        f"pivot={pivot_reason or 'NONE'} "
+        f"momentum_ok={_mom_ok}(gap={_mom_gap:.2f}) "
+        f"CPR={_cpr_width} "
+        f"entry_type={_entry_type} "
+        f"{vwap_pos} "
+        f"| {reason}{RESET}"
     )
     return state

@@ -69,7 +69,11 @@ def calculate_cci(df, period=20):
     tp    = (df["high"] + df["low"] + df["close"]) / 3
     ma    = tp.rolling(period, min_periods=min_p).mean()
     md    = (tp - ma).abs().rolling(period, min_periods=min_p).mean()
-    return  (tp - ma) / (0.015 * md.replace(0, np.nan))
+    # FIX: floor md at 0.5 to prevent explosion after flat-bar consolidation.
+    # md.replace(0, np.nan) only caught exact zero; near-zero (0.001) still
+    # caused CCI=66,666. NIFTY tick=0.05 so 0.5 floor never distorts valid CCI.
+    md_safe = md.clip(lower=0.5)
+    return  (tp - ma) / (0.015 * md_safe)
 
 RESET  = "\033[0m"
 GREEN  = "\033[92m"
@@ -378,89 +382,4 @@ def update_candles_and_signals(symbol, spot_price=None, days=5, tick_db=None):
 
     except Exception as e:
         logging.error(f"[UPDATE ERROR] {symbol}: {e}", exc_info=True)
-        return pd.DataFrame(), pd.DataFrame()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FYERS WARMUP — consistent historical candles for indicator seeding
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_fyers_history_warmup(symbol: str, days: int = 5) -> tuple:
-    """
-    Fetch the last `days` trading days of 3m and 15m candles from Fyers
-    Historical API. Called ONCE at startup to seed indicator state.
-
-    Returns (df_3m, df_15m) — both with consistent, exchange-validated OHLCV.
-    Never includes today's partial candles (include_today=False).
-
-    Why Fyers API and not SQLite:
-        SQLite candles come from websocket tick aggregation which can have:
-        - gaps when ticks are missed (network hiccup)
-        - partial candles if bot wasn't running at session start
-        - clock drift between tick timestamps
-        Fyers API returns NSE-validated OHLCV exactly as seen on charts.
-
-    Fallback: if API call fails, returns (pd.DataFrame(), pd.DataFrame()).
-    The caller should handle empty DataFrames and fall back to SQLite.
-    """
-    try:
-        df_3m  = fetch_fyers_history(symbol, resolution="3",  days=days, include_today=False)
-        df_15m = fetch_fyers_history(symbol, resolution="15", days=days, include_today=False)
-
-        if df_3m.empty:
-            logging.warning(f"[WARMUP] No 3m history from Fyers for {symbol}")
-        else:
-            logging.info(
-                f"[WARMUP] {symbol} 3m: {len(df_3m)} bars "
-                f"({df_3m.iloc[0]['trade_date']} → {df_3m.iloc[-1]['trade_date']})"
-            )
-
-        if df_15m.empty:
-            logging.warning(f"[WARMUP] No 15m history from Fyers for {symbol}")
-        else:
-            logging.info(
-                f"[WARMUP] {symbol} 15m: {len(df_15m)} bars "
-                f"({df_15m.iloc[0]['trade_date']} → {df_15m.iloc[-1]['trade_date']})"
-            )
-
-        return df_3m, df_15m
-
-    except Exception as e:
-        logging.error(f"[WARMUP ERROR] {symbol}: {e}", exc_info=True)
-        return pd.DataFrame(), pd.DataFrame()
-
-
-def fetch_fyers_intraday(symbol: str) -> tuple:
-    """
-    Fetch today's completed candles from Fyers Historical API.
-    Used as fallback when WebSocket tick aggregator has no data
-    (e.g., bot started mid-session, WebSocket disconnected).
-
-    Returns (df_3m, df_15m) with today's bars only, excluding
-    the current open/partial candle.
-
-    Fyers rate limit: ~1 call/second. Do not call in the hot loop.
-    Call only on: startup, WebSocket reconnect, staleness detection.
-    """
-    try:
-        df_3m  = fetch_fyers_history(symbol, resolution="3",  days=1, include_today=True)
-        df_15m = fetch_fyers_history(symbol, resolution="15", days=1, include_today=True)
-
-        # Keep only today's candles
-        ist     = pytz.timezone("Asia/Kolkata")
-        today_s = dt.now(ist).strftime("%Y-%m-%d")
-        if not df_3m.empty:
-            df_3m  = df_3m[df_3m["trade_date"] == today_s].reset_index(drop=True)
-        if not df_15m.empty:
-            df_15m = df_15m[df_15m["trade_date"] == today_s].reset_index(drop=True)
-
-        if not df_3m.empty:
-            logging.info(
-                f"[INTRADAY FALLBACK] {symbol} 3m: {len(df_3m)} bars today "
-                f"(last={df_3m.iloc[-1]['ist_slot']})"
-            )
-        return df_3m, df_15m
-
-    except Exception as e:
-        logging.error(f"[INTRADAY FALLBACK ERROR] {symbol}: {e}", exc_info=True)
         return pd.DataFrame(), pd.DataFrame()
