@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Comprehensive Exit Logic v7 Replay Analyzer
+Comprehensive Exit Logic v8 Replay Analyzer (Updated from v7)
 
 Tests position_manager.py exit logic against all available *.db files.
+Tracks dynamic thresholds (ATR-scaled) and capital efficiency metrics.
 Identifies convertible losses (trades that could have been winners).
 Generates detailed CSV report and debug logs.
 """
@@ -16,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 import sys
+import math
 
 # Setup logging
 logging_handler = logging.StreamHandler(sys.stdout)
@@ -30,11 +32,16 @@ WORKSPACE_DIR = r"c:\Users\mohan\trading_engine"
 LOT_SIZE = 130
 RS_PER_PT = 130
 
-# Exit rule thresholds
-LOSS_CUT_PTS = -10
+# v7 Base thresholds (now used as fallback / reference)
+LOSS_CUT_PTS_BASE = -10
 LOSS_CUT_MAX_BARS = 5
-QUICK_PROFIT_UL_PTS = 10
-DRAWDOWN_THRESHOLD = 9
+QUICK_PROFIT_UL_PTS_BASE = 10
+DRAWDOWN_THRESHOLD_BASE = 9
+
+# v8 Dynamic scaling factors
+LOSS_CUT_SCALE = 0.5        # LOSS_CUT scales with 0.5 × ATR(10)
+QUICK_PROFIT_SCALE = 1.0    # QUICK_PROFIT scales with 1.0 × ATR(10)
+BREAKOUT_SUSTAIN_MIN = 3    # Require 3+ bars sustain at R4/S4
 
 class ReplayAnalyzer:
     def __init__(self):
@@ -48,6 +55,8 @@ class ReplayAnalyzer:
             'total_pnl_pts': 0,
             'total_pnl_rs': 0,
             'exit_rule_dist': defaultdict(int),
+            'avg_bars_to_profit': 0.0,
+            'capital_efficiency_score': 0.0,
             'convertible_by_reason': defaultdict(int)
         })
         self.all_trades_df = None
@@ -140,6 +149,9 @@ class ReplayAnalyzer:
                 'pnl_rupees': float(row.get('pnl_value', 0)),
                 'peak_premium': float(row.get('peak_premium', 0)),
                 'exit_reason': str(row.get('exit_reason', '')),
+                # v8: Capital efficiency metrics (from CSV if available, else calculated)
+                'bars_to_profit': int(row.get('bars_held', 0)) if float(row.get('pnl_points', 0)) > 0 else 0,
+                'atr_at_exit': float(row.get('atr_at_exit', 0.0)) if 'atr_at_exit' in row else 0.0,
             }
             
             # Extract first exit reason (before pipe delimiter)
@@ -165,9 +177,9 @@ class ReplayAnalyzer:
             
             if trade_record['result'] == 'LOSS':
                 # Check if quick profit threshold was reached
-                if peak_gain_pts >= QUICK_PROFIT_UL_PTS:
+                if peak_gain_pts >= QUICK_PROFIT_UL_PTS_BASE:
                     is_convertible = True
-                    convertible_reason = f"QUICK_PROFIT_MISSED (peak={peak_gain_pts:.2f}pts>={QUICK_PROFIT_UL_PTS}pts)"
+                    convertible_reason = f"QUICK_PROFIT_MISSED (peak={peak_gain_pts:.2f}pts>={QUICK_PROFIT_UL_PTS_BASE}pts)"
                 
                 # Check if drawdown exit could have helped
                 elif peak_gain_pts >= 5 and (peak_gain_pts - trade_record['pnl_points']) >= DRAWDOWN_THRESHOLD:

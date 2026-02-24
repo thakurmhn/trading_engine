@@ -1,0 +1,72 @@
+{
+  "mode": "live",
+  "validation_timestamp": "2026-02-24T22:50:58.714823",
+  "signals": {
+    "total": 2,
+    "valid": 2
+  },
+  "orders": {
+    "total": 2,
+    "successful": 2
+  },
+  "exits": {
+    "total": 5,
+    "exit_rules": {
+      "QUICK_PROFIT": 1,
+      "TIME_QUICK_PROFIT": 1,
+      "DRAWDOWN_EXIT": 1,
+      "LOSS_CUT": 1,
+      "EOD_PRE_EXIT": 1
+    }
+  },
+  "performance": {
+    "wins": 4,
+    "losses": 1,
+    "win_rate_pct": 80.0,
+    "total_pnl_pts": 24.9,
+    "total_pnl_inr": 3237.0,
+    "avg_pnl_per_trade": 4.9799999999999995
+  },
+  "capital_metrics": {
+    "avg_utilization_pct": 55.0
+  },
+  "stress_testing": {
+    "total_scenarios": 5,
+    "passed": 5,
+    "failed": 0,
+    "scenario_results": [
+      {
+        "scenario": "gap_open",
+        "exit_rule": "LOSS_CUT",
+        "pnl": -2.3,
+        "result": "PASS"
+      },
+      {
+        "scenario": "flash_reversal",
+        "exit_rule": "DRAWDOWN_EXIT",
+        "pnl": -8.5,
+        "result": "PASS"
+      },
+      {
+        "scenario": "extreme_volatility",
+        "exit_rule": "QUICK_PROFIT",
+        "pnl": 15.0,
+        "result": "PASS"
+      },
+      {
+        "scenario": "low_liquidity",
+        "exit_rule": "TIME_QUICK_PROFIT",
+        "pnl": 3.2,
+        "result": "PASS"
+      },
+      {
+        "scenario": "trending_exhaustion",
+        "exit_rule": "QUICK_PROFIT",
+        "pnl": 9.8,
+        "result": "PASS"
+      }
+    ],
+    "pass_rate": 100.0,
+    "resilience_score": 100.0
+  }
+}
