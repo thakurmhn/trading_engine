@@ -32,12 +32,23 @@ CYAN    = "\033[96m"
 # ===== Pivot Calculations =====
 
 def calculate_cpr(prev_high, prev_low, prev_close):
+    """
+    Calculate Central Pivot Range (CPR).
+    
+    CPR is a three-line breakout indicator:
+      - Pivot (P) = (High + Low + Close) / 3
+      - Top Central (TC) = (P + High) / 2      (resistance)
+      - Bottom Central (BC) = (P + Low) / 2    (support)
+    """
     pivot = (prev_high + prev_low + prev_close) / 3
-    bc = (prev_high + prev_low) / 2
-    tc = (pivot - bc) + pivot
+    bc = (pivot + prev_low) / 2      # Midpoint between Pivot and Low (support)
+    tc = (pivot + prev_high) / 2     # Midpoint between Pivot and High (resistance)
+    
+    # Sanity check: if TC and BC are too close, add small buffer
     if round(tc, 2) == round(bc, 2):
         tc = pivot + 0.0005 * pivot
         bc = pivot - 0.0005 * pivot
+    
     return {"pivot": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2)}
 
 def calculate_traditional_pivots(prev_high, prev_low, prev_close):

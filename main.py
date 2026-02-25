@@ -75,40 +75,114 @@ RED    = "\033[91m"
 GRAY   = "\033[90m"
 CYAN   = "\033[96m"
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  STARTUP STATE — Tracks warmup completion per symbol
+# ─────────────────────────────────────────────────────────────────────────────
+# After warmup completes, this dict stores the timestamp of the last warmup bar
+# for each symbol. Used by main_strategy_code() to skip stale warmup candles
+# at startup and only evaluate signals starting from the first live bar.
+warmup_end_times: dict = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP: print daily pivot / ATR levels
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_daily_levels() -> None:
-    """Print CPR, Traditional, Camarilla pivots for each symbol at startup."""
+def print_daily_levels(md: MarketData = None) -> None:
+    """
+    Print CPR, Traditional, Camarilla pivots for each symbol.
+    
+    LIVE/PAPER modes: Uses Fyers Historical API (via market_data)
+    REPLAY mode: Uses local DB candles (for backtesting)
+    """
     logging.info(f"{CYAN}{'─'*70}{RESET}")
     logging.info(f"{CYAN}  NSE OPTIONS BOT — {strategy_name}  |  mode={MODE}{RESET}")
     logging.info(f"{CYAN}{'─'*70}{RESET}")
 
     for sym in symbols:
-        hist_data = tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
-        if hist_data is None or hist_data.empty:
-            logging.warning(f"[DAILY LEVELS] No historical 15m data for {sym}")
+        ph = pl = pc = yesterday_open = None
+        source = "UNKNOWN"
+        
+        # ── Route: LIVE/PAPER/STRATEGY use Fyers API (via market_data) ───────
+        if MODE in ("LIVE", "PAPER", "STRATEGY") and md is not None:
+            prev_ohlc = md.get_prev_day_ohlc(sym)
+            if prev_ohlc:
+                ph = float(prev_ohlc.get("high", 0))
+                pl = float(prev_ohlc.get("low", 0))
+                pc = float(prev_ohlc.get("close", 0))
+                yesterday_open = 0  # Fyers API doesn't always return open in daily aggregate
+                source = "FYERS_API"
+            else:
+                logging.warning(f"[PIVOT CHECK] {sym} No Fyers API data available (LIVE/PAPER mode)")
+                continue
+        
+        # ── Route: REPLAY uses local DB (for backtesting) ────────────────────
+        elif MODE == "REPLAY":
+            hist_data = tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
+            if hist_data is None or hist_data.empty:
+                logging.warning(f"[PIVOT CHECK] {sym} No DB historical 15m data for REPLAY mode")
+                continue
+            
+            # Calculate OHLC correctly from ALL yesterday candles
+            hist_data["_trade_date"] = hist_data["trade_date"].astype(str)
+            yesterday_date = hist_data["_trade_date"].iloc[0]
+            yesterday_candles = hist_data[hist_data["_trade_date"] == yesterday_date]
+            
+            if yesterday_candles.empty:
+                logging.warning(f"[PIVOT CHECK] {sym} No yesterday candles in DB after filtering")
+                continue
+            
+            # Aggregated OHLC from all yesterday candles
+            ph = float(yesterday_candles["high"].max())
+            pl = float(yesterday_candles["low"].min())
+            pc = float(yesterday_candles["close"].iloc[-1])
+            yesterday_open = float(yesterday_candles["open"].iloc[0])
+            source = "LOCAL_DB"
+        else:
+            # This should never happen in normal operation (STRATEGY/LIVE/PAPER/REPLAY covered)
+            logging.error(f"[PIVOT CHECK] {sym} FATAL: No data source available for mode={MODE} (md={md})")
             continue
-
-        prev_day = hist_data.iloc[-1]
-        ph = float(prev_day["high"])
-        pl = float(prev_day["low"])
-        pc = float(prev_day["close"])
-
+        
+        # ── VALIDATION: Check for corrupted OHLC (H=L=C) ─────────────────────
+        if ph is None or pl is None or pc is None:
+            logging.warning(f"[PIVOT CHECK] {sym} Missing OHLC values from {source}")
+            continue
+        
+        if ph == pl and pl == pc:
+            logging.warning(
+                f"[PIVOT CHECK] {sym} CORRUPTED from {source}: H={ph} L={pl} C={pc} (all equal) | Skipping"
+            )
+            continue
+        
+        # ── Sanity checks ──────────────────────────────────────────────────────
+        if ph < pl:
+            logging.warning(f"[PIVOT CHECK] {sym} INVALID from {source}: High({ph}) < Low({pl}) | Swapping")
+            ph, pl = pl, ph
+        if pc < 0 or ph <= 0 or pl <= 0:
+            logging.warning(
+                f"[PIVOT CHECK] {sym} NEGATIVE from {source}: H={ph} L={pl} C={pc} | Skipping"
+            )
+            continue
+        
+        # ── Calculate pivots ──────────────────────────────────────────────────
         cpr  = calculate_cpr(ph, pl, pc)
         trad = calculate_traditional_pivots(ph, pl, pc)
         cam  = calculate_camarilla_pivots(ph, pl, pc)
 
+        # ── Validation log with all details ────────────────────────────────────
+        log_prefix = f"[PIVOT CHECK] {sym} source={source}"
+        if yesterday_open > 0:
+            log_prefix += f" O={yesterday_open:.2f}"
+        
+        logging.info(
+            f"{GREEN}{log_prefix} H={ph:.2f} L={pl:.2f} C={pc:.2f} | "
+            f"CPR: P={cpr['pivot']} TC={cpr['tc']} BC={cpr['bc']} | "
+            f"Trad: P={trad['pivot']} R1={trad['r1']} S1={trad['s1']} R2={trad['r2']} S2={trad['s2']} | "
+            f"Cam: R3={cam['r3']} S3={cam['s3']} R4={cam['r4']} S4={cam['s4']}{RESET}"
+        )
+
         logging.info(
             f"{GREEN}[LEVELS][{sym}] "
-            f"prevDay H={ph} L={pl} C={pc} | "
-            f"CPR: P={cpr['pivot']} TC={cpr['tc']} BC={cpr['bc']} | "
-            f"Trad: P={trad['pivot']} R1={trad['r1']} S1={trad['s1']} "
-            f"R2={trad['r2']} S2={trad['s2']} | "
-            f"Cam: R3={cam['r3']} S3={cam['s3']} R4={cam['r4']} S4={cam['s4']}"
-            f"{RESET}"
+            f"prevDay H={ph:.2f} L={pl:.2f} C={pc:.2f}{RESET}"
         )
 
 
@@ -124,10 +198,14 @@ def do_warmup() -> MarketData:
       1. Create MarketData(fyers, mode="LIVE")
       2. md.warmup(symbols) — fetches Fyers historical candles, builds indicators
       3. Wire market_data into data_feed module so on_tick() routes here
-      4. Log pivot levels for each symbol using prev-day OHLC
+      4. Record the timestamp of the last warmup bar per symbol (for startup guard)
 
+    Note: Pivot level printing is now in print_daily_levels() which is called after warmup.
+    
     Returns the MarketData singleton used throughout the session.
     """
+    global warmup_end_times
+    
     logging.info(f"{GREEN}[WARMUP] Starting pre-market warmup for {symbols}...{RESET}")
 
     md = MarketData(fyers_client=fyers, mode="LIVE")
@@ -136,31 +214,21 @@ def do_warmup() -> MarketData:
     # Wire into data_feed so websocket ticks flow into CandleAggregator
     data_feed.market_data = md
 
-    # Print pivot levels from previous session OHLC (from warmup)
-    for sym in symbols:
-        prev = md.get_prev_day_ohlc(sym)
-        if prev:
-            ph, pl, pc = prev["high"], prev["low"], prev["close"]
-            cpr  = calculate_cpr(ph, pl, pc)
-            trad = calculate_traditional_pivots(ph, pl, pc)
-            cam  = calculate_camarilla_pivots(ph, pl, pc)
-            logging.info(
-                f"{GREEN}[WARMUP][{sym}] prev_day={prev.get('date','?')} "
-                f"H={ph} L={pl} C={pc} | "
-                f"CPR: P={cpr['pivot']} TC={cpr['tc']} BC={cpr['bc']} | "
-                f"Trad: R1={trad['r1']} S1={trad['s1']} | "
-                f"Cam: R3={cam['r3']} S3={cam['s3']}{RESET}"
-            )
-        else:
-            logging.warning(f"[WARMUP] No prev-day OHLC for {sym}")
-
-    # Confirm candle counts
+    # Confirm candle counts and capture last warmup bar timestamp per symbol
     for sym in symbols:
         df_3m, df_15m = md.get_candles(sym)
         logging.info(
             f"{GREEN}[WARMUP CANDLES] {sym} "
             f"3m={len(df_3m)} bars  15m={len(df_15m)} bars{RESET}"
         )
+        
+        # Record timestamp of last warmup bar — used to skip stale candles at startup
+        if df_3m is not None and not df_3m.empty:
+            last_warmup_time = df_3m.iloc[-1].get("time") or df_3m.iloc[-1].get("date", "?")
+            warmup_end_times[sym] = last_warmup_time
+            logging.info(
+                f"{YELLOW}[WARMUP STATE] {sym} last_warmup_bar_time={last_warmup_time}{RESET}"
+            )
 
     logging.info(f"{GREEN}[WARMUP] Complete. Bot ready for market open.{RESET}")
     return md
@@ -174,6 +242,14 @@ async def main_strategy_code(md: MarketData) -> None:
     """
     Async strategy loop — runs every second.
 
+    Startup Guard:
+      - After warmup, warmup_end_times[sym] contains timestamp of the last warmup bar
+      - Strategy skips ALL signal evaluation (entry + exit) while processing warmup candles
+      - Once a NEW bar (different timestamp) arrives, normal evaluation resumes
+      - This prevents false signals on stale historical data from warmup
+      - Log: [STARTUP GUARD] when warmup candle skipped, then [STARTUP GUARD activated]
+        when first live candle detected
+
     Candle detection:
       - md.get_candles(sym) returns indicator-enriched (df_3m, df_15m)
       - A "new candle" fires when len(df_3m) increases vs last iteration
@@ -184,6 +260,7 @@ async def main_strategy_code(md: MarketData) -> None:
 
     Logs emitted per bar:
       [NEW CANDLE]      — candle closed, indicator refresh triggered
+      [STARTUP GUARD]   — warmup candle detected and skipped at startup
       [SIGNAL CHECK]    — score / threshold printed for every new bar
       [SIGNAL FIRED]    — entry condition met, order function called
       [SIGNAL BLOCKED]  — score below threshold or pre-filter failed
@@ -193,6 +270,13 @@ async def main_strategy_code(md: MarketData) -> None:
 
     # Track candle count per symbol to detect new completed candles
     last_candle_count: dict = {sym: 0 for sym in symbols}
+    
+    # Track which symbols have seen their first live candle (past warmup)
+    first_live_candle_seen: dict = {sym: False for sym in symbols}
+
+    logging.info(
+        f"{GREEN}[STARTUP] Warmup end times (guard reference): {warmup_end_times}{RESET}"
+    )
 
     logging.info(
         f"{GREEN}[MAIN] Strategy loop started. "
@@ -269,6 +353,25 @@ async def main_strategy_code(md: MarketData) -> None:
                     )
 
                     last_candle_count[sym] = n3
+                    
+                    # ── STARTUP GUARD: Skip warmup candles at strategy launch
+                    if not first_live_candle_seen[sym]:
+                        last_warmup_time = warmup_end_times.get(sym)
+                        if bar_time == str(last_warmup_time):
+                            logging.info(
+                                f"{YELLOW}[STARTUP GUARD] {sym} Skipping warmup candle "
+                                f"bar={bar_time} (not yet live, awaiting first market candle){RESET}"
+                            )
+                            # Don't call order func for warmup candles
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            # First live candle detected (timestamp differs from warmup end)
+                            first_live_candle_seen[sym] = True
+                            logging.info(
+                                f"{GREEN}[STARTUP GUARD ACTIVE] {sym} First live candle detected "
+                                f"bar={bar_time} — signals evaluation now enabled{RESET}"
+                            )
 
                 if df_3m is None or df_3m.empty:
                     logging.debug(f"[MAIN] No 3m candles for {sym}, skipping entry")
@@ -321,15 +424,19 @@ def _call_order_func(df_3m, df_15m, spot):
 def run() -> None:
     """
     Full startup sequence:
-      1. Print daily pivot/ATR levels (from SQLite yesterday candles)
-      2. Warmup — Fyers historical fetch + indicator build + market_data wire
+      1. Warmup — Fyers historical fetch + indicator build + market_data wire
+      2. Print daily pivot/ATR levels (from Fyers API for LIVE/PAPER, DB for REPLAY)
       3. Connect WebSocket sockets
       4. Start async strategy loop
     """
-    print_daily_levels()
-
     # ── Warmup MUST happen before sockets connect so market_data is ready ────
     md = do_warmup()
+    
+    # ── Print pivot levels AFTER warmup (now market_data is available) -------
+    print_daily_levels(md=md)
+    
+    # ── Sanity check: Ensure pivots were validated before strategy starts ────
+    logging.info(f"{GREEN}[STARTUP] Pivot validation complete. Ready to enter strategy loop.{RESET}")
 
     # ── Connect sockets ──────────────────────────────────────────────────────
     fyers_socket.connect()

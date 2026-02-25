@@ -34,12 +34,38 @@ import pandas as pd
 import pytz
 
 time_zone = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN   = (9, 15)    # HH, MM
+MARKET_CLOSE  = (15, 30)   # HH, MM
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def fmt(val):
     """Format numeric values safely for logs."""
     return f"{val:.2f}" if val is not None and not pd.isna(val) else "NA"
+
+def _is_market_hours(ts_str: str) -> bool:
+    """
+    Check if timestamp (HH:MM:SS format) is within NSE market hours (9:15-15:30).
+    Returns True if within market hours, False if pre/post-market.
+    """
+    try:
+        if ':' not in ts_str:
+            return False
+        parts = ts_str.split(':')
+        h, m = int(parts[0]), int(parts[1])
+        
+        open_h, open_m = MARKET_OPEN
+        close_h, close_m = MARKET_CLOSE
+        
+        # Before 9:15
+        if h < open_h or (h == open_h and m < open_m):
+            return False
+        # After 15:30
+        if h > close_h or (h == close_h and m > close_m):
+            return False
+        return True
+    except (ValueError, IndexError):
+        return True  # If parsing fails, assume valid to be permissive
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -469,8 +495,21 @@ class TickDatabase:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        # ── MARKET HOURS FILTER — strip pre/post-market rows ────────────────
+        # Critical: post-15:30 candles can have HIGH=LOW=CLOSE causing pivot bugs
+        if "ist_slot" in df.columns:
+            original_len = len(df)
+            df = df[df["ist_slot"].apply(_is_market_hours)].copy()
+            filtered_len = len(df)
+            if filtered_len < original_len:
+                logging.info(
+                    f"[TICKDB FETCH] {resolution} {symbol}: "
+                    f"Filtered {original_len - filtered_len} post-market rows "
+                    f"(kept {filtered_len} market hours)"
+                )
+
         # ── Continuity log ────────────────────────────────────────────────────
-        last_slot = df["ist_slot"].iloc[-1] if "ist_slot" in df.columns else "?"
+        last_slot = df["ist_slot"].iloc[-1] if "ist_slot" in df.columns and not df.empty else "?"
         logging.debug(
             f"[TICKDB FETCH] {resolution} symbol={symbol} "
             f"rows={len(df)} last_slot={last_slot} "

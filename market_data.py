@@ -167,6 +167,10 @@ class CandleAggregator:
         """
         if not _is_market_hours(ts):
             return
+        
+        # Log every tick independently of candle closes
+        ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+        logging.info(f"[TICK] {self.symbol} LTP={ltp} time={ts_str}")
 
         slot_3m  = self._slot(ts, 3)
         slot_15m = self._slot(ts, 15)
