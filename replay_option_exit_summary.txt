@@ -1,0 +1,28 @@
+REPLAY OPTION EXIT VALIDATION SUMMARY
+
+Side-by-side comparison:
+ Profile  Trades Win Rate Avg PnL Avg Bars Held Exit Reasons
+baseline       0    0.00%    0.00          0.00          N/A
+  stress       0    0.00%    0.00          0.00          N/A
+
+HF coverage by profile:
+DYNAMIC_TRAILING_STOP: None
+MOMENTUM_EXHAUSTION: None
+VOLATILITY_MEAN_REVERSION: None
+
+Coverage differences:
+Observed only in stress vs baseline: None
+
+Reason-count comparison (extreme-exit focus):
+DYNAMIC_TRAILING_STOP: baseline=0, stress=0
+VOLATILITY_MEAN_REVERSION: baseline=0, stress=0
+
+Risk buffer early-exit check (ticks_held <= 3):
+baseline rb=1.0:0 rb=0.0:0
+stress rb=1.0:0 rb=0.0:0
+
+Stress sample (DYNAMIC_TRAILING_STOP):
+None
+
+Volstress sample (VOLATILITY_MEAN_REVERSION):
+None

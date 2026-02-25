@@ -1,0 +1,31 @@
+REPLAY FUNCTIONALITY CHECK SUMMARY
+
+total_trades: 21
+win_rate: 100.00%
+avg_pnl: 3.03
+avg_bars_held: 1.00
+
+Checklist:
+- PASS: Signal firing detected (entry events present)
+- PASS: Entry prices are option premiums in 200-400 range
+- PASS: Exit prices are option premiums (<1000, >0)
+- PASS: No spot-like prices (25000+) in entry/exit fields
+- PASS: Required audit fields present in ledger
+- PASS: No duplicate entry/exit rows
+- PASS: bars_held is valid (>=1)
+- PASS: exit_reason populated for every trade
+- PASS: PnL matches (exit-entry) within tolerance
+- PASS: HF exits co-exist in orchestration output
+
+Exit reason distribution:
+exit_reason
+MOMENTUM_EXHAUSTION    21
+
+Sample entry row:
+{'profile': 'functionality_check', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325300CE', 'entry_time': Timestamp('2026-01-30 04:22:40.019454'), 'exit_time': Timestamp('2026-01-30 04:22:52.128089'), 'entry_price': 203.35, 'exit_price': 203.75, 'ticks_held': 10, 'bars_held': 1, 'pnl': 0.4, 'exit_reason': 'MOMENTUM_EXHAUSTION', 'risk_buffer': 1.0}
+
+Sample exit row:
+{'profile': 'functionality_check', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325050CE', 'entry_time': Timestamp('2026-01-30 04:23:53.755501'), 'exit_time': Timestamp('2026-01-30 04:24:59.679750'), 'entry_price': 366.0, 'exit_price': 374.6, 'ticks_held': 21, 'bars_held': 1, 'pnl': 8.6, 'exit_reason': 'MOMENTUM_EXHAUSTION', 'risk_buffer': 1.0}
+
+duplicate_rows_detected: 0
+csv_path: C:\Users\mohan\trading_engine\replay_functionality_check.csv

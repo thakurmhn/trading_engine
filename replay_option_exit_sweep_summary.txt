@@ -1,0 +1,251 @@
+OPTION EXIT PARAMETER SWEEP SUMMARY
+
+Table: Param Set | Trades | Win Rate | Avg PnL | Avg Bars Held | Exit Reasons
+                               param_set  trades  win_rate  avg_pnl  avg_bars_held                                        exit_reasons
+  rb1_roc10_tt0p3_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb1_roc10_tt0p3_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb1_roc10_tt0p3_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p3_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb1_roc10_tt0p3_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p3_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb1_roc10_tt0p5_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb1_roc10_tt0p5_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb1_roc10_tt0p5_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p5_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb1_roc10_tt0p5_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p5_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb1_roc10_tt0p7_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb1_roc10_tt0p7_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb1_roc10_tt0p7_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p7_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb1_roc10_tt0p7_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb1_roc10_tt0p7_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p3_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb2_roc10_tt0p3_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p3_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p3_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb2_roc10_tt0p3_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p3_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p5_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb2_roc10_tt0p5_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p5_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p5_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb2_roc10_tt0p5_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p5_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p7_dlo0p12_dhi0p05_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+    rb2_roc10_tt0p7_dlo0p12_dhi0p05_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb2_roc10_tt0p7_dlo0p12_dhi0p05_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p7_dlo0p1_dhi0p03_std1p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+     rb2_roc10_tt0p7_dlo0p1_dhi0p03_std2      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+   rb2_roc10_tt0p7_dlo0p1_dhi0p03_std2p5      50     100.0 3.287000       1.000000                              MOMENTUM_EXHAUSTION:50
+  rb0_roc10_tt0p3_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+    rb0_roc10_tt0p3_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0_roc10_tt0p3_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p3_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+     rb0_roc10_tt0p3_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p3_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0_roc10_tt0p5_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+    rb0_roc10_tt0p5_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0_roc10_tt0p5_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p5_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+     rb0_roc10_tt0p5_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p5_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0_roc10_tt0p7_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+    rb0_roc10_tt0p7_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0_roc10_tt0p7_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p7_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+     rb0_roc10_tt0p7_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc10_tt0p7_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p3_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0p5_roc10_tt0p3_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p3_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p3_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0p5_roc10_tt0p3_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p3_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p5_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0p5_roc10_tt0p5_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p5_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p5_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0p5_roc10_tt0p5_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p5_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p7_dlo0p12_dhi0p05_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+  rb0p5_roc10_tt0p7_dlo0p12_dhi0p05_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+rb0p5_roc10_tt0p7_dlo0p12_dhi0p05_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p7_dlo0p1_dhi0p03_std1p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0p5_roc10_tt0p7_dlo0p1_dhi0p03_std2      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+ rb0p5_roc10_tt0p7_dlo0p1_dhi0p03_std2p5      53     100.0 3.203774       1.000000 MOMENTUM_EXHAUSTION:52; VOLATILITY_MEAN_REVERSION:1
+   rb0_roc8_tt0p3_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb0_roc8_tt0p3_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc8_tt0p3_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p3_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb0_roc8_tt0p3_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p3_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc8_tt0p5_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb0_roc8_tt0p5_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc8_tt0p5_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p5_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb0_roc8_tt0p5_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p5_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc8_tt0p7_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb0_roc8_tt0p7_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc8_tt0p7_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p7_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb0_roc8_tt0p7_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0_roc8_tt0p7_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p3_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0p5_roc8_tt0p3_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p3_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p3_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0p5_roc8_tt0p3_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p3_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p5_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0p5_roc8_tt0p5_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p5_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p5_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0p5_roc8_tt0p5_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p5_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p7_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0p5_roc8_tt0p7_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+ rb0p5_roc8_tt0p7_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p7_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb0p5_roc8_tt0p7_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+  rb0p5_roc8_tt0p7_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p3_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb1_roc8_tt0p3_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p3_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p3_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb1_roc8_tt0p3_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p3_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p5_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb1_roc8_tt0p5_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p5_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p5_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb1_roc8_tt0p5_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p5_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p7_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb1_roc8_tt0p7_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb1_roc8_tt0p7_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p7_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb1_roc8_tt0p7_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb1_roc8_tt0p7_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p3_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb2_roc8_tt0p3_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p3_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p3_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb2_roc8_tt0p3_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p3_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p5_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb2_roc8_tt0p5_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p5_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p5_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb2_roc8_tt0p5_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p5_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p7_dlo0p12_dhi0p05_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+     rb2_roc8_tt0p7_dlo0p12_dhi0p05_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb2_roc8_tt0p7_dlo0p12_dhi0p05_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p7_dlo0p1_dhi0p03_std1p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+      rb2_roc8_tt0p7_dlo0p1_dhi0p03_std2      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+    rb2_roc8_tt0p7_dlo0p1_dhi0p03_std2p5      60     100.0 2.861667       1.000000                              MOMENTUM_EXHAUSTION:60
+   rb0_roc5_tt0p3_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb0_roc5_tt0p3_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0_roc5_tt0p3_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p3_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb0_roc5_tt0p3_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p3_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0_roc5_tt0p5_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb0_roc5_tt0p5_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0_roc5_tt0p5_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p5_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb0_roc5_tt0p5_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p5_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0_roc5_tt0p7_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb0_roc5_tt0p7_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0_roc5_tt0p7_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p7_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb0_roc5_tt0p7_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0_roc5_tt0p7_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p3_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0p5_roc5_tt0p3_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p3_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p3_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0p5_roc5_tt0p3_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p3_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p5_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0p5_roc5_tt0p5_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p5_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p5_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0p5_roc5_tt0p5_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p5_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p7_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb0p5_roc5_tt0p7_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+ rb0p5_roc5_tt0p7_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p7_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb0p5_roc5_tt0p7_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+  rb0p5_roc5_tt0p7_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p3_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb1_roc5_tt0p3_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p3_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p3_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb1_roc5_tt0p3_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p3_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p5_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb1_roc5_tt0p5_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p5_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p5_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb1_roc5_tt0p5_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p5_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p7_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb1_roc5_tt0p7_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb1_roc5_tt0p7_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p7_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb1_roc5_tt0p7_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb1_roc5_tt0p7_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p3_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb2_roc5_tt0p3_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p3_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p3_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb2_roc5_tt0p3_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p3_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p5_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb2_roc5_tt0p5_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p5_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p5_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb2_roc5_tt0p5_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p5_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p7_dlo0p12_dhi0p05_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+     rb2_roc5_tt0p7_dlo0p12_dhi0p05_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+   rb2_roc5_tt0p7_dlo0p12_dhi0p05_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p7_dlo0p1_dhi0p03_std1p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+      rb2_roc5_tt0p7_dlo0p1_dhi0p03_std2      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+    rb2_roc5_tt0p7_dlo0p1_dhi0p03_std2p5      72     100.0 2.566667       1.083333                              MOMENTUM_EXHAUSTION:72
+
+Top 5 by Avg PnL then Win Rate:
+                             param_set  win_rate  avg_pnl  avg_bars_held         hf_coverage
+rb1_roc10_tt0p3_dlo0p12_dhi0p05_std1p5     100.0    3.287            1.0 MOMENTUM_EXHAUSTION
+  rb1_roc10_tt0p3_dlo0p12_dhi0p05_std2     100.0    3.287            1.0 MOMENTUM_EXHAUSTION
+rb1_roc10_tt0p3_dlo0p12_dhi0p05_std2p5     100.0    3.287            1.0 MOMENTUM_EXHAUSTION
+ rb1_roc10_tt0p3_dlo0p1_dhi0p03_std1p5     100.0    3.287            1.0 MOMENTUM_EXHAUSTION
+   rb1_roc10_tt0p3_dlo0p1_dhi0p03_std2     100.0    3.287            1.0 MOMENTUM_EXHAUSTION
+
+Unstable configurations (early_exit_rate > 10% or win_rate < 50%):
+None
+
+Average metrics by risk_buffer:
+             win_rate   avg_pnl  early_exit_rate
+risk_buffer                                     
+0.0             100.0  2.877369              0.0
+0.5             100.0  2.877369              0.0
+1.0             100.0  2.905111              0.0
+2.0             100.0  2.905111              0.0
+
+Average metrics by roc_window_ticks:
+                  win_rate   avg_pnl
+roc_window_ticks                    
+5                    100.0  2.566667
+8                    100.0  2.861667
+10                   100.0  3.245387
+
+Sensitivity highlights:
+Recommended risk_buffer (highest avg_pnl): 1.0
+Recommended roc_window_ticks (highest avg_pnl): 10
+Unstable risk_buffer values by early exits: None

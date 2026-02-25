@@ -34,6 +34,7 @@ from signals import detect_signal, get_opening_range
 from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
 from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
 from position_manager import PositionManager, TradeLogger, make_replay_pm
+from option_exit_manager import OptionExitManager
 from day_type import (make_day_type_classifier, apply_day_type_to_pm,
                       DayType, DayTypeResult)
 
@@ -231,8 +232,45 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     return sel.squeeze(), strike
 
 
+def _get_option_market_snapshot(symbol, fallback_price):
+    """
+    Return (option_price, option_volume) for the option symbol from `df`.
 
-def check_exit_condition(df_slice, state, option_price=None):
+    All exit logic must operate in option-premium space. If option LTP is
+    unavailable, fallback_price is used for continuity.
+    """
+    option_price = None
+    option_volume = 0.0
+
+    if symbol in df.index:
+        try:
+            row = df.loc[symbol]
+            ltp = row.get("ltp", None) if hasattr(row, "get") else row["ltp"]
+            if ltp is not None and not pd.isna(ltp):
+                option_price = float(ltp)
+
+            vol_candidates = [
+                "volume",
+                "vol_traded_today",
+                "vtt",
+                "last_traded_qty",
+            ]
+            for col in vol_candidates:
+                v = row.get(col, None) if hasattr(row, "get") else None
+                if v is not None and not pd.isna(v):
+                    option_volume = float(v)
+                    break
+        except Exception:
+            pass
+
+    if option_price is None:
+        option_price = float(fallback_price) if fallback_price is not None else 0.0
+
+    return option_price, max(0.0, option_volume)
+
+
+
+def check_exit_condition(df_slice, state, option_price=None, option_volume=None, timestamp=None):
     """
     Exit logic for options buying (CALL and PUT are both LONG positions).
     
@@ -257,6 +295,8 @@ def check_exit_condition(df_slice, state, option_price=None):
     - df_slice: spot candle data (for technical analysis, not pricing)
     - state: trade state dict (has SL/PT/TG levels)
     - option_price: current option LTP (from df.loc[symbol, "ltp"]) — REQUIRED for accurate logs
+    - option_volume: current option tick volume (used by HF exits)
+    - timestamp: current tick timestamp for HF time-series
     """
 
     i            = len(df_slice) - 1
@@ -267,6 +307,8 @@ def check_exit_condition(df_slice, state, option_price=None):
     # CRITICAL: Use option_price for all pricing logic and logging
     # Fallback to spot close if option_price not provided (shouldn't happen in production)
     current_ltp  = option_price if option_price is not None else df_slice["close"].iloc[-1]
+    option_volume = option_volume if option_volume is not None else 0.0
+    timestamp = timestamp if timestamp is not None else dt.now(time_zone)
 
     MIN_BARS_FOR_PT_TG = 3   # 3-bar minimum for profit targets
     bars_held = i - entry_candle
@@ -326,6 +368,32 @@ def check_exit_condition(df_slice, state, option_price=None):
             state["stop"] = new_stop
             state["trail_updates"] = state.get("trail_updates", 0) + 1
             logging.info(f"{CYAN}[TRAIL] {side} stop to {new_stop:.2f} ltp={current_ltp:.2f} bars_held={bars_held}{RESET}")
+
+    # 4A. High-frequency option exits (dynamic trail / momentum / mean-reversion)
+    hf_mgr = state.get("hf_exit_manager")
+    if hf_mgr is not None:
+        try:
+            if hf_mgr.check_exit(
+                current_ltp,
+                timestamp,
+                current_volume=option_volume,
+            ):
+                hf_reason = hf_mgr.last_reason or "HF_EXIT"
+                if bars_held >= MIN_BARS_FOR_PT_TG:
+                    logging.info(
+                        f"{YELLOW}[EXIT][HF] {side} {hf_reason} ltp={current_ltp:.2f} "
+                        f"entry={entry_price:.2f} bars_held={bars_held}{RESET}"
+                    )
+                    return True, hf_reason
+                if state.get("hf_deferred_logged", 0) == 0:
+                    logging.info(
+                        f"{YELLOW}[EXIT DEFERRED] HF signal too early ({bars_held} < {MIN_BARS_FOR_PT_TG}): "
+                        f"{hf_reason} ltp={current_ltp:.2f} — defer until bar "
+                        f"{entry_candle + MIN_BARS_FOR_PT_TG}{RESET}"
+                    )
+                    state["hf_deferred_logged"] = 1
+        except Exception as e:
+            logging.warning(f"[HF EXIT] manager error: {e}")
 
     # 5. Oscillator exhaustion (2-of-3) — defer if before bar 3
     osc_hits = []
@@ -917,35 +985,23 @@ def process_order(state, df_slice, info, spot_price,
     buffer = 2.0
     exit_reason = None
 
-    # --- Get option's current price from df (not spot price) ---
-    option_current_price = None
-    if symbol in df.index:
-        try:
-            option_current_price = float(df.loc[symbol, "ltp"])
-        except Exception:
-            pass
-    
-    # Use option price if available; fallback to spot for target check
-    current_option_price = option_current_price if option_current_price else spot_price
+    # --- Get option premium + volume snapshot from df (not spot candles) ---
+    current_option_price, option_volume = _get_option_market_snapshot(symbol, spot_price)
+    timestamp = df_slice.iloc[-1].get("time", dt.now(time_zone)) if not df_slice.empty else dt.now(time_zone)
 
-    # --- Explicit SL/Target checks (using option price, not spot) ---
-    # Note: check_exit_condition handles deferred exits (won't return True if PT/TG hit before bar 3)
-    if side == "CALL":
-        if current_candle["low"] <= state["stop"] + buffer:
-            exit_reason = "SL_HIT"
-        elif current_option_price >= state["pt"] - buffer:
-            # Will be deferred in check_exit_condition if bars_held < 3
-            pass
-    elif side == "PUT":
-        if current_candle["high"] >= state["stop"] - buffer:
-            exit_reason = "SL_HIT"
-        elif current_option_price <= state["pt"] + buffer:
-            # Will be deferred in check_exit_condition if bars_held < 3
-            pass
+    # --- Explicit hard stop check (premium-space, immediate risk protection) ---
+    if state.get("stop") is not None and current_option_price <= (state["stop"] + buffer):
+        exit_reason = "SL_HIT"
 
     # --- Hybrid exit logic ---
     if not exit_reason:
-        triggered, reason = check_exit_condition(df_slice, state, option_price=current_option_price)
+        triggered, reason = check_exit_condition(
+            df_slice,
+            state,
+            option_price=current_option_price,
+            option_volume=option_volume,
+            timestamp=timestamp,
+        )
         if triggered and reason:
             exit_reason = reason
 
@@ -966,14 +1022,14 @@ def process_order(state, df_slice, info, spot_price,
         success, order_id = send_paper_exit_order(symbol, qty, exit_reason)
     else:
         if mode == "LIVE":
-            success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
+            success, order_id = send_live_exit_order(symbol, qty, exit_reason)
         else:
             # REPLAY mode -> simulate success, no DB
             success, order_id = True, "REPLAY_ORDER"
 
     if success:
         # FIX: Use the option's actual traded price (from df), not spot candle close
-        exit_price = option_current_price if option_current_price else current_candle["close"]
+        exit_price = current_option_price if current_option_price else current_candle["close"]
         pnl_points = exit_price - entry if side == "CALL" else entry - exit_price
         pnl_value  = pnl_points * qty
 
@@ -1294,6 +1350,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "peak_candle":    len(candles_3m) - 1,
                         "plateau_count":  0,
                         "partial_booked": False,
+                        "hf_exit_manager": OptionExitManager(
+                            entry_price=entry_price,
+                            side=side,
+                            risk_buffer=1.0,
+                        ),
+                        "hf_deferred_logged": 0,
                     })
 
                     paper_info[leg]["filled_df"].loc[ct] = {
@@ -1522,6 +1584,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     "peak_candle":    len(candles_3m) - 1,
                     "plateau_count":  0,
                     "partial_booked": False,
+                    "hf_exit_manager": OptionExitManager(
+                        entry_price=entry_price,
+                        side=side,
+                        risk_buffer=1.0,
+                    ),
+                    "hf_deferred_logged": 0,
                 })
 
                 live_info[leg]["filled_df"].loc[ct] = {
