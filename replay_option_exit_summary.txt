@@ -2,18 +2,18 @@ REPLAY OPTION EXIT VALIDATION SUMMARY
 
 Side-by-side comparison:
   Profile  Trades Win Rate Avg PnL Avg Bars Held                                                                 Exit Reasons
- baseline       0    0.00%    0.00          0.00                                                                          N/A
+ baseline       5  100.00%    4.49          1.00                                                        MOMENTUM_EXHAUSTION:5
    stress      13  100.00%    5.08          1.00                                                       MOMENTUM_EXHAUSTION:13
 volstress      21  100.00%    4.76          1.00 MOMENTUM_EXHAUSTION:14; DYNAMIC_TRAILING_STOP:6; VOLATILITY_MEAN_REVERSION:1
 
 HF coverage by profile:
 DYNAMIC_TRAILING_STOP: volstress
-MOMENTUM_EXHAUSTION: stress, volstress
+MOMENTUM_EXHAUSTION: baseline, stress, volstress
 VOLATILITY_MEAN_REVERSION: volstress
 
 Coverage differences:
 Observed only in volstress: DYNAMIC_TRAILING_STOP, VOLATILITY_MEAN_REVERSION
-Observed only in stress vs baseline: MOMENTUM_EXHAUSTION
+Observed only in stress vs baseline: None
 
 Reason-count comparison (extreme-exit focus):
 DYNAMIC_TRAILING_STOP: baseline=0, stress=0, volstress=6
@@ -25,7 +25,7 @@ stress rb=1.0:0 rb=0.0:0
 volstress rb=1.0:0 rb=0.0:0
 
 Replay diagnostics:
-baseline slope_block=0.00% adx_block=0.00% osc_block=0.00% hft_override=0.00% weak_loss_cluster=0/0
+baseline slope_block=49.18% adx_block=13.11% osc_block=22.95% hft_override=100.00% weak_loss_cluster=0/0
 stress slope_block=47.14% adx_block=20.26% osc_block=21.59% hft_override=100.00% weak_loss_cluster=0/0
 volstress slope_block=53.30% adx_block=17.26% osc_block=18.53% hft_override=100.00% weak_loss_cluster=0/0
 

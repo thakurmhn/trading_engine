@@ -2,6 +2,7 @@
 import logging
 import pickle
 import pathlib
+import re
 import numpy as np
 import pandas as pd
 import pendulum as dt
@@ -56,6 +57,13 @@ SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
 STARTUP_SUPPRESSION_MINUTES = 5
 RESTART_STATE_VERSION = 1
+DEFAULT_TIME_EXIT_CANDLES = 8
+DEFAULT_OSC_RSI_CALL = 75.0
+DEFAULT_OSC_RSI_PUT = 25.0
+DEFAULT_OSC_CCI_CALL = 130.0
+DEFAULT_OSC_CCI_PUT = -130.0
+DEFAULT_OSC_WR_CALL = -10.0
+DEFAULT_OSC_WR_PUT = -88.0
 
 #===========================================================
 # Initalize filled_df
@@ -400,18 +408,26 @@ def _update_scalp_premium_history(info, side, price, ts):
     if "scalp_hist" not in info or not isinstance(info["scalp_hist"], dict):
         info["scalp_hist"] = {"CALL": [], "PUT": []}
     side_hist = info["scalp_hist"].setdefault(side, [])
-    side_hist.append({"ts": pd.Timestamp(ts), "price": float(price)})
+    ts_obj = pd.Timestamp(ts)
+    if ts_obj.tzinfo is None:
+        ts_obj = ts_obj.tz_localize(time_zone)
+    else:
+        ts_obj = ts_obj.tz_convert(time_zone)
+    side_hist.append({"ts": ts_obj, "price": float(price)})
     if len(side_hist) > SCALP_HISTORY_MAXLEN:
+        trimmed = len(side_hist) - SCALP_HISTORY_MAXLEN
         del side_hist[: len(side_hist) - SCALP_HISTORY_MAXLEN]
+        logging.debug(f"[SCALP HIST] side={side} trimmed={trimmed} maxlen={SCALP_HISTORY_MAXLEN}")
 
 
 def _rsi_series(series, period=8):
     """Lightweight RSI for premium momentum checks."""
-    diff = series.diff()
-    gain = diff.clip(lower=0).rolling(period).mean()
-    loss = (-diff.clip(upper=0)).rolling(period).mean()
+    s = pd.Series(series, dtype="float64")
+    diff = s.diff()
+    gain = diff.clip(lower=0).rolling(period, min_periods=period).mean()
+    loss = (-diff.clip(upper=0)).rolling(period, min_periods=period).mean()
     rs = gain / loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + rs.astype(float)))
+    return (100 - (100 / (1 + rs))).astype(float)
 
 
 def _detect_scalp_momentum_signal(info, spot_px, ts):
@@ -468,10 +484,10 @@ def _detect_scalp_momentum_signal(info, spot_px, ts):
         if side == "CALL":
             ema_ok = gap_now > gap_thr and gap_slope > 0
             osc_ok = rsi_prev <= 60 and rsi_now > 60
-            score = gap_now
+            score = abs(gap_now)
         else:
             ema_ok = gap_now < -gap_thr and gap_slope < 0
-            osc_ok = rsi_prev >= 40 and rsi_now < 40
+            osc_ok = rsi_prev >= 60 and rsi_now < 60
             score = abs(gap_now)
 
         if expansion and (ema_ok or atr_spike or osc_ok):
@@ -502,8 +518,13 @@ def _can_enter_scalp(info, burst_key, now_ts):
     """Gate scalp re-entry by cool-down and burst uniqueness."""
     cooldown_until = info.get("scalp_cooldown_until")
     if cooldown_until and now_ts < cooldown_until:
+        logging.info(
+            f"[SCALP ENTRY BLOCKED][COOLDOWN] now={now_ts} "
+            f"cooldown_until={cooldown_until} burst_key={burst_key}"
+        )
         return False, "COOLDOWN"
     if info.get("scalp_last_burst_key") == burst_key:
+        logging.info(f"[SCALP ENTRY BLOCKED][DUPLICATE_BURST] now={now_ts} burst_key={burst_key}")
         return False, "DUPLICATE_BURST"
     return True, "OK"
 
@@ -588,6 +609,13 @@ def _supertrend_alignment_gate(candles_3m, candles_15m, timestamp, symbol):
         f"ST3m_line={details['ST3m_line']} ST15m_line={details['ST15m_line']} "
         f"alignment_status={details['alignment_status']}"
     )
+    if not aligned:
+        logging.info(
+            "[ENTRY BLOCKED][ST_ALIGNMENT] "
+            f"timestamp={details['timestamp']} symbol={details['symbol']} "
+            f"ST3m_bias={details['ST3m_bias']} ST15m_bias={details['ST15m_bias']} "
+            "reason=Supertrend conflict, entry suppressed."
+        )
 
     return aligned, allowed_side, details
 
@@ -598,6 +626,10 @@ def _trend_entry_quality_gate(
     timestamp,
     symbol,
     adx_min=25.0,
+    rsi_min=35.0,
+    rsi_max=65.0,
+    cci_min=-120.0,
+    cci_max=120.0,
 ):
     """Hard quality gate for trend entries.
 
@@ -624,6 +656,11 @@ def _trend_entry_quality_gate(
     st_details["cci20"] = cci_val
 
     if not aligned:
+        logging.info(
+            "[ENTRY BLOCKED][ST_CONFLICT] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            "reason=Supertrend conflict, entry suppressed."
+        )
         return False, allowed_side, "Supertrend conflict, entry suppressed.", st_details
 
     slope_ok_3m = (
@@ -635,15 +672,32 @@ def _trend_entry_quality_gate(
         or (st_details["ST15m_bias"] == "BEARISH" and str(st_details["ST15m_slope"]).upper() == "DOWN")
     )
     if not (slope_ok_3m and slope_ok_15m):
+        logging.info(
+            "[ENTRY BLOCKED][SLOPE_MISMATCH] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            "reason=Slope mismatch, entry suppressed."
+        )
         return False, allowed_side, "Slope mismatch, entry suppressed.", st_details
 
     if not np.isfinite(adx_val) or adx_val <= float(adx_min):
+        logging.info(
+            "[ENTRY BLOCKED][WEAK_ADX] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            f"ADX={adx_val} adx_min={adx_min} reason=Weak trend strength, entry suppressed."
+        )
         return False, allowed_side, "Weak trend strength, entry suppressed.", st_details
 
     if (
-        (np.isfinite(rsi_val) and (rsi_val < 35.0 or rsi_val > 65.0))
-        or (np.isfinite(cci_val) and (cci_val < -120.0 or cci_val > 120.0))
+        (np.isfinite(rsi_val) and (rsi_val < float(rsi_min) or rsi_val > float(rsi_max)))
+        or (np.isfinite(cci_val) and (cci_val < float(cci_min) or cci_val > float(cci_max)))
     ):
+        logging.info(
+            "[ENTRY BLOCKED][OSC_EXTREME] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            f"RSI={rsi_val} CCI={cci_val} "
+            f"rsi_range=[{rsi_min},{rsi_max}] cci_range=[{cci_min},{cci_max}] "
+            "reason=Oscillator extreme, entry suppressed."
+        )
         return False, allowed_side, "Oscillator extreme, entry suppressed.", st_details
 
     return True, allowed_side, "OK", st_details
@@ -671,6 +725,13 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     timestamp = timestamp if timestamp is not None else dt.now(time_zone)
 
     min_bars_for_pt_tg = 3
+    time_exit_candles = int(state.get("time_exit_candles", 8))
+    osc_rsi_call = float(state.get("osc_rsi_call", 75.0))
+    osc_rsi_put = float(state.get("osc_rsi_put", 25.0))
+    osc_cci_call = float(state.get("osc_cci_call", 130.0))
+    osc_cci_put = float(state.get("osc_cci_put", -130.0))
+    osc_wr_call = float(state.get("osc_wr_call", -10.0))
+    osc_wr_put = float(state.get("osc_wr_put", -88.0))
     bars_held = i - entry_candle
     stop = state.get("stop")
     pt = state.get("pt")
@@ -748,9 +809,17 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         premium_move = float(current_ltp - entry_price)
         if premium_move >= scalp_pt:
             audit("SCALP_PT_HIT", "SCALP_PT_HIT", f"premium_move>={scalp_pt:.2f}", premium_move=premium_move)
+            logging.info(
+                f"{GREEN}[EXIT][SCALP_PT_HIT] {side} premium_move={premium_move:.2f} "
+                f"target={scalp_pt:.2f} ltp={current_ltp:.2f}{RESET}"
+            )
             return True, "SCALP_PT_HIT"
         if premium_move <= -scalp_sl:
             audit("SCALP_SL_HIT", "SCALP_SL_HIT", f"premium_move<=-{scalp_sl:.2f}", premium_move=premium_move)
+            logging.info(
+                f"{RED}[EXIT][SCALP_SL_HIT] {side} premium_move={premium_move:.2f} "
+                f"stop=-{scalp_sl:.2f} ltp={current_ltp:.2f}{RESET}"
+            )
             return True, "SCALP_SL_HIT"
         return False, None
 
@@ -798,6 +867,7 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     if pt_hit and bars_held >= min_bars_for_pt_tg:
         audit("PT", "PT_HIT", f"ltp>={pt:.2f}")
         state["partial_booked"] = True
+        state["pt_deferred_logged"] = 0
         if (state.get("stop") or 0) < entry_price:
             state["stop"] = entry_price
         logging.info(
@@ -822,9 +892,9 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         cci_s = calculate_cci(df_slice) if "cci20" not in df_slice.columns else df_slice["cci20"]
         cci = float(cci_s.iloc[-1]) if not cci_s.empty else None
         if cci and not pd.isna(cci):
-            if side == "CALL" and cci > 130:
+            if side == "CALL" and cci > osc_cci_call:
                 osc_hits.append(f"CCI={cci:.0f}")
-            if side == "PUT" and cci < -130:
+            if side == "PUT" and cci < osc_cci_put:
                 osc_hits.append(f"CCI={cci:.0f}")
     except Exception:
         pass
@@ -833,9 +903,9 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         rsi_col = df_slice["rsi14"] if "rsi14" in df_slice.columns else pd.Series(dtype=float)
         rsi = float(rsi_col.iloc[-1]) if not rsi_col.empty else None
         if rsi and not pd.isna(rsi):
-            if side == "CALL" and rsi > 75:
+            if side == "CALL" and rsi > osc_rsi_call:
                 osc_hits.append(f"RSI={rsi:.0f}")
-            if side == "PUT" and rsi < 25:
+            if side == "PUT" and rsi < osc_rsi_put:
                 osc_hits.append(f"RSI={rsi:.0f}")
     except Exception:
         pass
@@ -843,12 +913,40 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     try:
         wr = williams_r(df_slice)
         if wr and not pd.isna(wr):
-            if side == "CALL" and wr > -10:
+            if side == "CALL" and wr > osc_wr_call:
                 osc_hits.append(f"WR={wr:.0f}")
-            if side == "PUT" and wr < -88:
+            if side == "PUT" and wr < osc_wr_put:
                 osc_hits.append(f"WR={wr:.0f}")
     except Exception:
         pass
+
+    # Contextual structure exits keyed by source/pivot context.
+    ctx_text = (
+        f"{str(state.get('source', '')).upper()}|"
+        f"{str(state.get('pivot', '')).upper()}|"
+        f"{str(state.get('regime_context', '')).upper()}"
+    )
+    if bars_held >= min_bars_for_pt_tg:
+        if "CPR" in ctx_text and len(df_slice) >= 2:
+            prev_close = float(df_slice["close"].iloc[-2])
+            if side == "CALL" and current_ltp < prev_close:
+                audit("CPR", "CPR_CONTEXT_EXIT", "close<prev_close")
+                logging.info(f"{YELLOW}[EXIT][CPR] CALL context breakdown bars_held={bars_held}{RESET}")
+                return True, "CPR_CONTEXT_EXIT"
+            if side == "PUT" and current_ltp > prev_close:
+                audit("CPR", "CPR_CONTEXT_EXIT", "close>prev_close")
+                logging.info(f"{YELLOW}[EXIT][CPR] PUT context breakdown bars_held={bars_held}{RESET}")
+                return True, "CPR_CONTEXT_EXIT"
+        if "CAMARILLA" in ctx_text and len(df_slice) >= 2:
+            prev_open = float(df_slice["open"].iloc[-2])
+            if side == "CALL" and current_ltp < prev_open:
+                audit("CAMARILLA", "CAM_CONTEXT_EXIT", "close<prev_open")
+                logging.info(f"{YELLOW}[EXIT][CAMARILLA] CALL context breakdown bars_held={bars_held}{RESET}")
+                return True, "CAM_CONTEXT_EXIT"
+            if side == "PUT" and current_ltp > prev_open:
+                audit("CAMARILLA", "CAM_CONTEXT_EXIT", "close>prev_open")
+                logging.info(f"{YELLOW}[EXIT][CAMARILLA] PUT context breakdown bars_held={bars_held}{RESET}")
+                return True, "CAM_CONTEXT_EXIT"
 
     if len(osc_hits) >= 2 and bars_held >= min_bars_for_pt_tg:
         if OSCILLATOR_EXIT_MODE == "HARD":
@@ -897,6 +995,10 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         state["prev_gap"] = ema_gap
         state["peak_momentum"] = max(peak_momentum, abs(momentum))
         state["plateau_count"] = 0
+        logging.debug(
+            f"[EMA PLATEAU RESET] symbol={symbol} option_type={side} "
+            f"ema_gap={ema_gap:.4f} peak_momentum={state['peak_momentum']:.4f}"
+        )
         return False, None
 
     state["plateau_count"] = state.get("plateau_count", 0) + 1
@@ -907,8 +1009,8 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         logging.info(f"{YELLOW}[EXIT][MOMENTUM] {side} plateau+drop+osc{RESET}")
         return True, "MOMENTUM_EXIT"
 
-    if i - entry_candle >= 8 and state.get("trail_updates", 0) == 0:
-        audit("ATR", "TIME_EXIT", "no_trail_for_8_candles")
+    if i - entry_candle >= time_exit_candles and state.get("trail_updates", 0) == 0:
+        audit("ATR", "TIME_EXIT", f"no_trail_for_{time_exit_candles}_candles")
         logging.info(f"{YELLOW}[EXIT][TIME] {side} {i-entry_candle} candles no trail{RESET}")
         return True, "TIME_EXIT"
 
@@ -916,7 +1018,8 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
 
 
 def build_dynamic_levels(entry_price, atr, side, entry_candle,
-                         rr_ratio=2.0, profit_loss_point=5, candles_df=None):
+                         rr_ratio=2.0, profit_loss_point=5, candles_df=None,
+                         trail_start_frac=0.5):
     """
     Build SL/PT/TG/trail for OPTIONS BUYING (long call or long put).
     
@@ -941,11 +1044,11 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     """
     if entry_price is None or entry_price <= 0:
         logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
-        return None, None, None, None, None
+        return {"valid": False}
 
     if atr is None or pd.isna(atr):
         logging.warning("[LEVELS] ATR unavailable")
-        return None, None, None, None, None
+        return {"valid": False}
 
     # ════════ VOLATILITY REGIME CLASSIFICATION ════════
     if atr <= 60:
@@ -974,13 +1077,13 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         step_pct = 0.035
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
-        return None, None, None, None, None
+        return {"valid": False}
 
     # ════════ CALCULATE LEVELS ════════
     stop           = round(entry_price * (1 - sl_pct),  2)
     partial_target = round(entry_price * (1 + pt_pct),  2)
     full_target    = round(entry_price * (1 + tg_pct),  2)
-    trail_start    = round(entry_price * pt_pct * 0.5,  2)
+    trail_start    = round(entry_price * pt_pct * float(trail_start_frac), 2)
     trail_step     = round(max(entry_price * step_pct, 1.5), 2)
     
     # ════════ AUDIT LOG WITH PERCENTAGES ════════
@@ -989,13 +1092,23 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         f"SL={stop:.2f}({-sl_pct*100:5.1f}%) "
         f"PT={partial_target:.2f}({pt_pct*100:+5.1f}%) "
         f"TG={full_target:.2f}({tg_pct*100:+5.1f}%) "
-        f"| Trail={trail_step:.2f}({step_pct*100:.1f}%) ATR={atr:.1f}{RESET}"
+        f"| TrailStart={trail_start:.2f} TrailStep={trail_step:.2f} "
+        f"ATR={atr:.1f} trail_start_frac={trail_start_frac:.2f}{RESET}"
     )
-    
-    return stop, partial_target, full_target, trail_start, trail_step
+
+    return {
+        "valid": True,
+        "stop": stop,
+        "pt": partial_target,
+        "tg": full_target,
+        "trail_start": trail_start,
+        "trail_step": trail_step,
+        "regime": regime,
+    }
 
 def update_trailing_stop(current_price, entry_price, current_stop,
-                         trail_start_pnl, trail_step_points, buffer_points=12):
+                         trail_start_pnl, trail_step_points, buffer_points=12,
+                         atr=None, side="CALL", state=None):
     """
     Update trailing stop once partial target booked.
     Adjustments for live market:
@@ -1003,7 +1116,19 @@ def update_trailing_stop(current_price, entry_price, current_stop,
     - Ratchets stop upward/downward depending on side
     """
 
+    _ = trail_start_pnl
     pnl = current_price - entry_price
+    if buffer_points is None:
+        if atr is None or pd.isna(atr):
+            buffer_points = 12.0
+        elif atr <= 60:
+            buffer_points = 8.0
+        elif atr <= 100:
+            buffer_points = 10.0
+        elif atr <= 150:
+            buffer_points = 12.0
+        else:
+            buffer_points = 14.0
 
     # Only trail if price has moved enough in favor
     if abs(pnl) >= buffer_points and trail_step_points > 0:
@@ -1012,8 +1137,11 @@ def update_trailing_stop(current_price, entry_price, current_stop,
 
         if new_stop != current_stop:
             logging.info(
-                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} to {new_stop:.2f}{RESET}"
+                f"{YELLOW}[TRAIL UPDATE] side={side} stop_from={current_stop:.2f} "
+                f"stop_to={new_stop:.2f} pnl={pnl:.2f} buffer={buffer_points:.2f}{RESET}"
             )
+            if isinstance(state, dict):
+                state["stop"] = new_stop
         return new_stop
 
     return current_stop
@@ -1809,6 +1937,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
+        adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
     )
     if not quality_ok:
         tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
@@ -1820,6 +1949,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
             f"[ENTRY BLOCKED][{tag}] "
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
+            f"allowed_side={allowed_side} "
             f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
             f"reason={gate_reason}"
         )
@@ -1906,14 +2036,19 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         return
 
                     # FIX: pass candles_df so build_dynamic_levels can resolve entry candle
-                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                    levels = build_dynamic_levels(
                         entry_price, atr, side,
                         entry_candle=len(candles_3m) - 1,
                         candles_df=candles_3m
                     )
-                    if stop is None:
+                    if not levels.get("valid", False):
                         logging.warning(f"[ENTRY SKIP] {side} levels failed (ATR extreme?)")
                         return
+                    stop = levels["stop"]
+                    pt = levels["pt"]
+                    tg = levels["tg"]
+                    trail_start = levels["trail_start"]
+                    trail_step = levels["trail_step"]
 
                     if atr is None or pd.isna(atr):
                         regime_context = "ATR_UNKNOWN"
@@ -2197,6 +2332,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
+        adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
     )
     if not quality_ok:
         tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
@@ -2208,6 +2344,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             f"[ENTRY BLOCKED][{tag}] "
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
+            f"allowed_side={allowed_side} "
             f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
             f"reason={gate_reason}"
         )
@@ -2293,14 +2430,19 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     return
 
                 # FIX: pass candles_df
-                stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                levels = build_dynamic_levels(
                     entry_price, atr, side,
                     entry_candle=len(candles_3m) - 1,
                     candles_df=candles_3m
                 )
-                if stop is None:
+                if not levels.get("valid", False):
                     logging.warning(f"[ENTRY SKIP] {side} levels failed")
                     return
+                stop = levels["stop"]
+                pt = levels["pt"]
+                tg = levels["tg"]
+                trail_start = levels["trail_start"]
+                trail_step = levels["trail_step"]
 
                 if atr is None or pd.isna(atr):
                     regime_context = "ATR_UNKNOWN"
@@ -2564,6 +2706,32 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if isinstance(_val, str) and _val:
                 _db_path = _val
                 break
+
+    def _db_date_from_path(path_str):
+        if not path_str:
+            return None
+        m = re.search(r"ticks_(\d{4}-\d{2}-\d{2})\.db$", str(path_str))
+        return m.group(1) if m else None
+
+    if _db_path and date_str:
+        db_date = _db_date_from_path(_db_path)
+        if db_date and db_date != date_str:
+            db_dir = str(pathlib.Path(_db_path).parent)
+            suggested = os.path.join(db_dir, f"ticks_{date_str}.db")
+            if not os.path.exists(suggested):
+                fallback = os.path.join(r"C:\SQLite\ticks", f"ticks_{date_str}.db")
+                suggested = fallback if os.path.exists(fallback) else suggested
+            logging.error(
+                f"[REPLAY ERROR] DB file date ({db_date}) does not match replay date ({date_str})"
+            )
+            if os.path.exists(suggested):
+                logging.error(f"[REPLAY ERROR] Suggested DB path: {suggested}")
+            else:
+                logging.error(
+                    f"[REPLAY ERROR] Suggested DB path not found: {suggested}"
+                )
+            return
+
     if _db_path:
         logging.info(f"[REPLAY] DB path: {_db_path}")
     else:
@@ -2942,6 +3110,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 candles_15m=slice_15m,
                 timestamp=bar_time,
                 symbol=sym,
+                adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
             )
             if not quality_ok:
                 blocker_key = (
@@ -2959,6 +3128,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"reason={gate_reason} "
                     f"timestamp={bar_time} symbol={sym} "
                     f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
+                    f"allowed_side={allowed_side} "
                     f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')}"
                 )
                 continue
