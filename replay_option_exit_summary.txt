@@ -1,28 +1,31 @@
 REPLAY OPTION EXIT VALIDATION SUMMARY
 
 Side-by-side comparison:
- Profile  Trades Win Rate Avg PnL Avg Bars Held Exit Reasons
-baseline       0    0.00%    0.00          0.00          N/A
-  stress       0    0.00%    0.00          0.00          N/A
+  Profile  Trades Win Rate Avg PnL Avg Bars Held                                                                 Exit Reasons
+ baseline       4  100.00%    2.48          1.75                                             MOMENTUM_EXHAUSTION:3; TIMEOUT:1
+   stress      30  100.00%    4.04          1.00 MOMENTUM_EXHAUSTION:28; DYNAMIC_TRAILING_STOP:1; VOLATILITY_MEAN_REVERSION:1
+volstress      40  100.00%    4.30          1.02 MOMENTUM_EXHAUSTION:31; DYNAMIC_TRAILING_STOP:6; VOLATILITY_MEAN_REVERSION:3
 
 HF coverage by profile:
-DYNAMIC_TRAILING_STOP: None
-MOMENTUM_EXHAUSTION: None
-VOLATILITY_MEAN_REVERSION: None
+DYNAMIC_TRAILING_STOP: stress, volstress
+MOMENTUM_EXHAUSTION: baseline, stress, volstress
+VOLATILITY_MEAN_REVERSION: stress, volstress
 
 Coverage differences:
-Observed only in stress vs baseline: None
+Observed only in volstress: None
+Observed only in stress vs baseline: DYNAMIC_TRAILING_STOP, VOLATILITY_MEAN_REVERSION
 
 Reason-count comparison (extreme-exit focus):
-DYNAMIC_TRAILING_STOP: baseline=0, stress=0
-VOLATILITY_MEAN_REVERSION: baseline=0, stress=0
+DYNAMIC_TRAILING_STOP: baseline=0, stress=1, volstress=6
+VOLATILITY_MEAN_REVERSION: baseline=0, stress=1, volstress=3
 
 Risk buffer early-exit check (ticks_held <= 3):
 baseline rb=1.0:0 rb=0.0:0
 stress rb=1.0:0 rb=0.0:0
+volstress rb=1.0:0 rb=0.0:0
 
 Stress sample (DYNAMIC_TRAILING_STOP):
-None
+{'profile': 'stress', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325400CE', 'entry_time': Timestamp('2026-01-30 04:23:58.936114'), 'exit_time': Timestamp('2026-01-30 04:24:53.622101'), 'entry_price': 159.05, 'exit_price': 164.2, 'ticks_held': 22, 'bars_held': 1, 'pnl': 5.15, 'exit_reason': 'DYNAMIC_TRAILING_STOP', 'exit_type': 'HFT', 'risk_buffer': 0.5}
 
 Volstress sample (VOLATILITY_MEAN_REVERSION):
-None
+{'profile': 'volstress', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325000CE', 'entry_time': Timestamp('2026-01-30 04:23:49.697875'), 'exit_time': Timestamp('2026-01-30 04:25:00.843780'), 'entry_price': 404.35, 'exit_price': 412.65, 'ticks_held': 27, 'bars_held': 1, 'pnl': 8.3, 'exit_reason': 'VOLATILITY_MEAN_REVERSION', 'exit_type': 'HFT', 'risk_buffer': 0.5}

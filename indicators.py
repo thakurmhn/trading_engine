@@ -319,70 +319,34 @@ def cci_bias(df, period=20, threshold=60):
         return "NEUTRAL"
 
 
-def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
+def supertrend(df, atr_val=None, period=14, multiplier=3, slope_lookback=5):
+    """Supertrend wrapper that delegates to orchestration canonical engine.
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series, pd.Series]
+        (line_series, bias_series, slope_series)
     """
-    Compute Supertrend bias and slope.
-    - df: DataFrame with 'high','low','close'
-    - atr_val: optional float ATR override (from resolve_atr)
-    - period: ATR period if computing internally
-    - multiplier: Supertrend multiplier
-    - slope_lookback: number of candles to measure slope
-    Returns tuple: (bias, slope)
-    """
+    try:
+        # Local import avoids module-level circular import.
+        from orchestration import supertrend as _core_supertrend
 
-    if df is None or df.empty:
-        logging.warning("[SUPERTREND] No candles provided")
-        return "NEUTRAL", "FLAT"
-
-    # --- ATR resolution ---
-    if atr_val is None or pd.isna(atr_val):
-        high_low   = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift()).abs()
-        low_close  = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr_series = tr.rolling(period).mean().dropna()
-        if atr_series.empty:
-            logging.warning("[SUPERTREND] ATR unavailable (internal calc)")
-            return "NEUTRAL", "FLAT"
-        atr_val = float(atr_series.iloc[-1])
-        logging.debug(f"[SUPERTREND] ATR calculated={atr_val:.2f}")
-    else:
-        try:
-            atr_val = float(atr_val)
-            logging.debug(f"[SUPERTREND] ATR override={atr_val:.2f}")
-        except Exception:
-            logging.error("[SUPERTREND] Invalid ATR override")
-            return "NEUTRAL", "FLAT"
-
-    # --- Supertrend bands ---
-    hl2 = (df['high'] + df['low']) / 2
-    upperband = hl2 + (multiplier * atr_val)
-    lowerband = hl2 - (multiplier * atr_val)
-
-    # --- Bias decision ---
-    last = df.iloc[-1]
-    if last.close > upperband.iloc[-1]:
-        bias = "BULLISH"
-    elif last.close < lowerband.iloc[-1]:
-        bias = "BEARISH"
-    else:
-        bias = "NEUTRAL"
-
-    # --- Slope detection ---
-    if len(hl2) >= slope_lookback:
-        slope_val = hl2.iloc[-1] - hl2.iloc[-slope_lookback]
-        threshold = 0.2 * atr_val  # avoid noise
-        if abs(slope_val) <= threshold:
-            slope = "FLAT"
-        elif slope_val > 0:
-            slope = "UP"
-        else:
-            slope = "DOWN"
-    else:
-        slope = "FLAT"
-
-    logging.info(f"[SUPERTREND] Bias={bias} Slope={slope} (ATR={atr_val:.2f})")
-    return bias, slope
+        line_s, bias_s, slope_s = _core_supertrend(
+            df=df,
+            atr_period=period,
+            multiplier=multiplier,
+            atr_val=atr_val,
+            slope_lookback=slope_lookback,
+        )
+        return line_s, bias_s, slope_s
+    except Exception as e:
+        logging.error(f"[SUPERTREND WRAPPER ERROR] {e}")
+        idx = df.index if isinstance(df, pd.DataFrame) else pd.Index([])
+        return (
+            pd.Series(index=idx, dtype=float),
+            pd.Series(["NEUTRAL"] * len(idx), index=idx, dtype=object),
+            pd.Series(["FLAT"] * len(idx), index=idx, dtype=object),
+        )
 
 def calculate_adx(df, period=14):
     """

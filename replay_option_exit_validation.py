@@ -50,6 +50,8 @@ HF_REASONS = [
     "VOLATILITY_MEAN_REVERSION",
 ]
 
+EXIT_TYPES = ["HFT", "SL", "SCALP", "PT", "TG", "MIN_BAR", "ATR", "CPR", "CAMARILLA"]
+
 
 SWEEP_RISK_BUFFER = [0.0, 0.5, 1.0, 2.0]
 SWEEP_ROC_WINDOW = [5, 8, 10]
@@ -63,6 +65,30 @@ def _has_ticks_table(cur: sqlite3.Cursor) -> bool:
         row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     return "ticks" in tables
+
+
+def _map_exit_type(exit_reason: str) -> str:
+    """Map concrete reason to normalized audit exit type."""
+    reason = (exit_reason or "").upper()
+    if reason in {"DYNAMIC_TRAILING_STOP", "MOMENTUM_EXHAUSTION", "VOLATILITY_MEAN_REVERSION", "HF_EXIT"}:
+        return "HFT"
+    if reason == "SL_HIT":
+        return "SL"
+    if reason in {"SCALP_PT_HIT", "SCALP_SL_HIT"}:
+        return "SCALP"
+    if reason == "PT_HIT":
+        return "PT"
+    if reason in {"TARGET_HIT", "TG_HIT"}:
+        return "TG"
+    if reason in {"DEFERRED", "MIN_BAR"}:
+        return "MIN_BAR"
+    if reason in {"OSC_EXHAUSTION", "MOMENTUM_EXIT", "TIME_EXIT"}:
+        return "ATR"
+    if "CPR" in reason:
+        return "CPR"
+    if "CAMARILLA" in reason:
+        return "CAMARILLA"
+    return "ATR"
 
 
 def _fetch_option_symbols(cur: sqlite3.Cursor, cfg: ReplayConfig) -> list[str]:
@@ -165,6 +191,7 @@ def _replay_symbol(
                     "bars_held": bars_held,
                     "pnl": round(pnl, 2),
                     "exit_reason": exit_reason,
+                    "exit_type": _map_exit_type(exit_reason),
                     "risk_buffer": risk_buffer,
                 }
             )
@@ -213,6 +240,11 @@ def _print_summary(df: pd.DataFrame, profile_name: str) -> None:
 
     print("\n=== EXIT REASONS ===")
     print(df["exit_reason"].value_counts().to_string())
+    if "exit_type" in df.columns:
+        print("\n=== EXIT TYPES ===")
+        print(df["exit_type"].value_counts().to_string())
+        observed_types = [x for x in EXIT_TYPES if x in set(df["exit_type"])]
+        print("exit_type_coverage:", ", ".join(observed_types) if observed_types else "None")
     print("\n=== WIN/LOSS BREAKDOWN ===")
     print(df.assign(outcome=df["pnl"].apply(lambda x: "WIN" if x > 0 else ("LOSS" if x < 0 else "FLAT")))
           .groupby(["exit_reason", "outcome"]).size().to_string())
