@@ -2,6 +2,7 @@
 import logging
 import pickle
 import pathlib
+import numpy as np
 import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
@@ -53,6 +54,8 @@ SCALP_PT_POINTS = 7.0
 SCALP_SL_POINTS = 4.0
 SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
+STARTUP_SUPPRESSION_MINUTES = 5
+RESTART_STATE_VERSION = 1
 
 #===========================================================
 # Initalize filled_df
@@ -133,6 +136,7 @@ def store(data, account_type_):
         # Save back to pickle
         with open(filename, "wb") as f:
             pickle.dump(ledger, f, protocol=pickle.HIGHEST_PROTOCOL)
+        _save_restart_state(data, account_type_)
 
     except Exception as e:
         logging.error(f"Failed to store state: {e}")
@@ -181,6 +185,122 @@ def load_ledger(account_type_):
     except Exception as e:
         logging.warning(f"Ledger load failed: {e}")
         return []
+
+
+def _restart_state_file(account_type_: str) -> str:
+    return f"restart-state-{account_type_.lower()}.pickle"
+
+
+def _parse_ts(value):
+    if value is None:
+        return None
+    pendulum_dt = getattr(dt, "DateTime", None)
+    if isinstance(value, datetime) or (pendulum_dt is not None and isinstance(value, pendulum_dt)):
+        return value
+    try:
+        return pd.Timestamp(value).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _save_restart_state(info: dict, account_type_: str) -> None:
+    """Persist minimal restart state (cooldowns + open positions)."""
+    try:
+        payload = {
+            "version": RESTART_STATE_VERSION,
+            "saved_at": dt.now(time_zone),
+            "last_exit_time": info.get("last_exit_time"),
+            "scalp_cooldown_until": info.get("scalp_cooldown_until"),
+            "startup_suppression_until": info.get("startup_suppression_until"),
+            "active_positions": [],
+        }
+        for leg in ("call_buy", "put_buy"):
+            st = info.get(leg, {}) if isinstance(info, dict) else {}
+            if st.get("is_open", False) or st.get("trade_flag", 0) == 1:
+                payload["active_positions"].append(
+                    {
+                        "leg": leg,
+                        "symbol": st.get("option_name"),
+                        "option_type": st.get("side"),
+                        "position_side": st.get("position_side", "LONG"),
+                        "position_id": st.get("position_id"),
+                        "entry_time": st.get("entry_time"),
+                    }
+                )
+        with open(_restart_state_file(account_type_), "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        logging.debug(f"[RESTART STATE] save failed: {e}")
+
+
+def _load_restart_state(account_type_: str) -> dict:
+    try:
+        with open(_restart_state_file(account_type_), "rb") as f:
+            payload = pickle.load(f)
+        if isinstance(payload, dict):
+            logging.info(
+                f"[RESTART STATE] loaded account={account_type_} "
+                f"saved_at={payload.get('saved_at')} active_positions={len(payload.get('active_positions', []))}"
+            )
+            return payload
+        return {}
+    except Exception:
+        return {}
+
+
+def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> dict:
+    """Ensure restart-safe fields and restore cooldown/open-trade context."""
+    now = dt.now(time_zone)
+    info.setdefault("last_exit_time", None)
+    info.setdefault("scalp_cooldown_until", None)
+    info.setdefault("scalp_last_burst_key", None)
+    info.setdefault("scalp_hist", {"CALL": [], "PUT": []})
+
+    persisted = _load_restart_state(account_type_)
+    last_exit = _parse_ts(info.get("last_exit_time")) or _parse_ts(persisted.get("last_exit_time"))
+    scalp_cd = _parse_ts(info.get("scalp_cooldown_until")) or _parse_ts(persisted.get("scalp_cooldown_until"))
+    startup_until = _parse_ts(info.get("startup_suppression_until"))
+    if startup_until is None:
+        startup_until = now + timedelta(minutes=STARTUP_SUPPRESSION_MINUTES)
+    persisted_startup = _parse_ts(persisted.get("startup_suppression_until"))
+    if persisted_startup is not None and persisted_startup > startup_until:
+        startup_until = persisted_startup
+
+    info["last_exit_time"] = last_exit
+    info["scalp_cooldown_until"] = scalp_cd
+    info["startup_suppression_until"] = startup_until
+    info.setdefault("startup_suppression_logged_at", None)
+
+    for leg in ("call_buy", "put_buy"):
+        st = info.get(leg, {})
+        if not isinstance(st, dict):
+            continue
+        st.setdefault("position_side", "LONG")
+        st.setdefault("lifecycle_state", "EXIT")
+        st.setdefault("scalp_mode", False)
+        is_open = bool(st.get("is_open", False) or st.get("trade_flag", 0) == 1)
+        if is_open:
+            st["is_open"] = True
+            st["trade_flag"] = 1
+            st["lifecycle_state"] = "OPEN" if st.get("lifecycle_state") != "HOLD" else "HOLD"
+            if not st.get("_restored_audit_logged", False):
+                restored_id = st.get("position_id", "UNKNOWN")
+                logging.info(
+                    "[ENTRY][STATE_RESTORED] "
+                    f"timestamp={now} symbol={st.get('option_name', 'N/A')} "
+                    f"option_type={st.get('side', 'N/A')} position_side={st.get('position_side', 'LONG')} "
+                    f"position_id={restored_id} lifecycle={st.get('lifecycle_state')} "
+                    f"regime={st.get('regime_context', 'RESTORED')}"
+                )
+                logging.info(f"[ENTRY][STATE_RESTORED] {restored_id} restored at startup.")
+                st["_restored_audit_logged"] = True
+
+    logging.info(
+        f"[RESTART STATE] mode={mode_label} startup_suppression_until={info['startup_suppression_until']} "
+        f"last_exit_time={info.get('last_exit_time')} scalp_cooldown_until={info.get('scalp_cooldown_until')}"
+    )
+    _save_restart_state(info, account_type_)
+    return info
 
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
@@ -388,6 +508,26 @@ def _can_enter_scalp(info, burst_key, now_ts):
     return True, "OK"
 
 
+def _is_startup_suppression_active(info, now_ts, mode_label):
+    """Block fresh entries during post-restart suppression window."""
+    suppress_until = _parse_ts(info.get("startup_suppression_until"))
+    if suppress_until is None:
+        return False
+    if now_ts >= suppress_until:
+        return False
+
+    last_logged = _parse_ts(info.get("startup_suppression_logged_at"))
+    if last_logged is None or (now_ts - last_logged).total_seconds() >= 30:
+        remaining = (suppress_until - now_ts).total_seconds()
+        logging.info(
+            f"[ENTRY BLOCKED][STARTUP_SUPPRESSION] mode={mode_label} "
+            f"until={suppress_until} remaining_s={remaining:.0f} "
+            "reason=Startup suppression active, entry ignored."
+        )
+        info["startup_suppression_logged_at"] = now_ts
+    return True
+
+
 def _long_position_side(option_type):
     """All option trades are long-premium positions regardless of option type."""
     _ = option_type
@@ -452,6 +592,63 @@ def _supertrend_alignment_gate(candles_3m, candles_15m, timestamp, symbol):
     return aligned, allowed_side, details
 
 
+def _trend_entry_quality_gate(
+    candles_3m,
+    candles_15m,
+    timestamp,
+    symbol,
+    adx_min=25.0,
+):
+    """Hard quality gate for trend entries.
+
+    Conditions:
+    1) Supertrend bias alignment (3m/15m) and slope agreement with bias.
+    2) ADX must be > adx_min.
+    3) Oscillators must not be in extremes:
+       RSI in [35, 65], CCI in [-120, 120].
+    """
+    aligned, allowed_side, st_details = _supertrend_alignment_gate(
+        candles_3m=candles_3m,
+        candles_15m=candles_15m,
+        timestamp=timestamp,
+        symbol=symbol,
+    )
+
+    # Extract indicator snapshot up front so every block reason log has values.
+    last_3m = candles_3m.iloc[-1] if candles_3m is not None and not candles_3m.empty else None
+    adx_val = float(last_3m.get("adx14")) if last_3m is not None and pd.notna(last_3m.get("adx14")) else float("nan")
+    rsi_val = float(last_3m.get("rsi14")) if last_3m is not None and pd.notna(last_3m.get("rsi14")) else float("nan")
+    cci_val = float(last_3m.get("cci20")) if last_3m is not None and pd.notna(last_3m.get("cci20")) else float("nan")
+    st_details["adx14"] = adx_val
+    st_details["rsi14"] = rsi_val
+    st_details["cci20"] = cci_val
+
+    if not aligned:
+        return False, allowed_side, "Supertrend conflict, entry suppressed.", st_details
+
+    slope_ok_3m = (
+        (st_details["ST3m_bias"] == "BULLISH" and str(st_details["ST3m_slope"]).upper() == "UP")
+        or (st_details["ST3m_bias"] == "BEARISH" and str(st_details["ST3m_slope"]).upper() == "DOWN")
+    )
+    slope_ok_15m = (
+        (st_details["ST15m_bias"] == "BULLISH" and str(st_details["ST15m_slope"]).upper() == "UP")
+        or (st_details["ST15m_bias"] == "BEARISH" and str(st_details["ST15m_slope"]).upper() == "DOWN")
+    )
+    if not (slope_ok_3m and slope_ok_15m):
+        return False, allowed_side, "Slope mismatch, entry suppressed.", st_details
+
+    if not np.isfinite(adx_val) or adx_val <= float(adx_min):
+        return False, allowed_side, "Weak trend strength, entry suppressed.", st_details
+
+    if (
+        (np.isfinite(rsi_val) and (rsi_val < 35.0 or rsi_val > 65.0))
+        or (np.isfinite(cci_val) and (cci_val < -120.0 or cci_val > 120.0))
+    ):
+        return False, allowed_side, "Oscillator extreme, entry suppressed.", st_details
+
+    return True, allowed_side, "OK", st_details
+
+
 def check_exit_condition(df_slice, state, option_price=None, option_volume=None, timestamp=None):
     """Evaluate exits with strict precedence and structured audit logs.
 
@@ -514,12 +711,25 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         try:
             if hf_mgr.check_exit(current_ltp, timestamp, current_volume=option_volume):
                 hf_reason = hf_mgr.last_reason or "HF_EXIT"
-                audit("HFT", hf_reason, f"hf_condition={hf_reason}")
-                logging.info(
-                    f"{YELLOW}[EXIT][HF] {side} {hf_reason} ltp={current_ltp:.2f} "
-                    f"entry={entry_price:.2f} bars_held={bars_held}{RESET}"
-                )
-                return True, hf_reason
+                if hf_reason == "MOMENTUM_EXHAUSTION" and bars_held < 2:
+                    logging.info(
+                        "[EXIT SUPPRESSED] "
+                        f"symbol={symbol} option_type={side} position_side={position_side} "
+                        f"reason=Premature exit suppressed, minimum hold enforced. bars_held={bars_held}"
+                    )
+                elif bars_held <= 0 and hf_reason not in {"SL_HIT", "PT_HIT"}:
+                    logging.info(
+                        "[EXIT SUPPRESSED] "
+                        f"symbol={symbol} option_type={side} position_side={position_side} "
+                        f"reason=Premature exit suppressed, minimum hold enforced. bars_held={bars_held}"
+                    )
+                else:
+                    audit("HFT", hf_reason, f"hf_condition={hf_reason}")
+                    logging.info(
+                        f"{YELLOW}[EXIT][HF] {side} {hf_reason} ltp={current_ltp:.2f} "
+                        f"entry={entry_price:.2f} bars_held={bars_held}{RESET}"
+                    )
+                    return True, hf_reason
         except Exception as e:
             logging.warning(f"[HF EXIT] manager error: {e}")
 
@@ -548,8 +758,22 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     tg_hit = tg is not None and current_ltp >= tg
     pt_hit = pt is not None and current_ltp >= pt and not state.get("partial_booked", False)
 
+    if bars_held <= 0 and not pt_hit:
+        logging.info(
+            "[EXIT SUPPRESSED] "
+            f"symbol={symbol} option_type={side} position_side={position_side} "
+            "reason=Premature exit suppressed, minimum hold enforced."
+        )
+        return False, None
+
     # 4) Min-bar maturity gate
     if bars_held < min_bars_for_pt_tg and (tg_hit or pt_hit):
+        if bars_held <= 0 and pt_hit:
+            audit("PT", "PT_HIT", f"ltp>={pt:.2f}")
+            state["partial_booked"] = True
+            if (state.get("stop") or 0) < entry_price:
+                state["stop"] = entry_price
+            return True, "PT_HIT"
         audit("MIN_BAR", "DEFERRED", f"bars_held<{min_bars_for_pt_tg}")
         if tg_hit:
             logging.info(
@@ -905,6 +1129,7 @@ if account_type == 'PAPER':
             'scalp_last_burst_key': None,
             'scalp_hist': {'CALL': [], 'PUT': []},
         }
+    paper_info = _hydrate_runtime_state(paper_info, account_type, "PAPER")
 
 else:
     try:
@@ -1008,6 +1233,7 @@ else:
             'scalp_last_burst_key': None,
             'scalp_hist': {'CALL': [], 'PUT': []},
         }
+    live_info = _hydrate_runtime_state(live_info, account_type, "LIVE")
 
 
 # ===== Broker order functions =====
@@ -1482,6 +1708,10 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
             logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s < {COOLDOWN_SECONDS}s")
             return
 
+    if _is_startup_suppression_active(paper_info, ct, "PAPER"):
+        store(paper_info, account_type)
+        return
+
     atr, _ = resolve_atr(candles_3m)
 
     # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
@@ -1563,7 +1793,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"reason={scalp_sig['reason']} position_id={position_id}"
                     )
                     logging.info(
-                        "[ENTRY AUDIT] "
+                        "[ENTRY][NEW] "
                         f"timestamp={ct} symbol={opt_name} option_type={scalp_side} "
                         f"position_side={paper_info[scalp_leg].get('position_side', 'LONG')} "
                         f"position_id={position_id} "
@@ -1574,18 +1804,24 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     return
 
     # 6. Signal evaluation
-    aligned, allowed_side, st_details = _supertrend_alignment_gate(
+    quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
         candles_3m=candles_3m,
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
     )
-    if not aligned:
+    if not quality_ok:
+        tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
+            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else (
+                "WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME"
+            )
+        )
         logging.info(
-            "[ENTRY BLOCKED][ST_CONFLICT] "
+            f"[ENTRY BLOCKED][{tag}] "
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
-            "reason=Supertrend conflict, entry suppressed."
+            f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
+            f"reason={gate_reason}"
         )
         _save_trades_paper()
         store(paper_info, account_type)
@@ -1754,7 +1990,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"score={signal.get('score','?')} source={source}{RESET}"
                     )
                     logging.info(
-                        "[ENTRY AUDIT] "
+                        "[ENTRY][NEW] "
                         f"timestamp={ct} symbol={opt_name} option_type={side} "
                         f"position_side={paper_info[leg].get('position_side', 'LONG')} "
                         f"position_id={position_id} "
@@ -1858,6 +2094,10 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s")
             return
 
+    if _is_startup_suppression_active(live_info, ct, "LIVE"):
+        store(live_info, account_type)
+        return
+
     atr, _ = resolve_atr(candles_3m)
 
     # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
@@ -1941,7 +2181,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                             f"reason={scalp_sig['reason']} position_id={position_id}"
                         )
                         logging.info(
-                            "[ENTRY AUDIT] "
+                            "[ENTRY][NEW] "
                             f"timestamp={ct} symbol={opt_name} option_type={scalp_side} "
                             f"position_side={live_info[scalp_leg].get('position_side', 'LONG')} "
                             f"position_id={position_id} "
@@ -1952,18 +2192,24 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         return
 
     # 6. Signal evaluation
-    aligned, allowed_side, st_details = _supertrend_alignment_gate(
+    quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
         candles_3m=candles_3m,
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
     )
-    if not aligned:
+    if not quality_ok:
+        tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
+            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else (
+                "WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME"
+            )
+        )
         logging.info(
-            "[ENTRY BLOCKED][ST_CONFLICT] "
+            f"[ENTRY BLOCKED][{tag}] "
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
-            "reason=Supertrend conflict, entry suppressed."
+            f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
+            f"reason={gate_reason}"
         )
         _save_trades_live()
         store(live_info, account_type)
@@ -2135,7 +2381,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     f"ATR={atr:.1f} score={signal.get('score','?')} source={source}{RESET}"
                 )
                 logging.info(
-                    "[ENTRY AUDIT] "
+                    "[ENTRY][NEW] "
                     f"timestamp={ct} symbol={opt_name} option_type={side} "
                     f"position_side={live_info[leg].get('position_side', 'LONG')} "
                     f"position_id={position_id} "
@@ -2691,19 +2937,29 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
             cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
 
-            aligned, allowed_side, st_details = _supertrend_alignment_gate(
+            quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
                 candles_3m=slice_3m,
                 candles_15m=slice_15m,
                 timestamp=bar_time,
                 symbol=sym,
             )
-            if not aligned:
-                blocker_counts["ST_CONFLICT"] = blocker_counts.get("ST_CONFLICT", 0) + 1
+            if not quality_ok:
+                blocker_key = (
+                    "ST_CONFLICT"
+                    if "Supertrend conflict" in gate_reason
+                    else (
+                        "SLOPE_MISMATCH"
+                        if "Slope mismatch" in gate_reason
+                        else ("WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME")
+                    )
+                )
+                blocker_counts[blocker_key] = blocker_counts.get(blocker_key, 0) + 1
                 logging.info(
                     "[SIGNAL BLOCKED] "
-                    f"reason=Supertrend conflict, entry suppressed. "
+                    f"reason={gate_reason} "
                     f"timestamp={bar_time} symbol={sym} "
-                    f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']}"
+                    f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
+                    f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')}"
                 )
                 continue
 

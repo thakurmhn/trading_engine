@@ -244,6 +244,7 @@ class MomentumScalpExitTests(unittest.TestCase):
         state = _base_state(
             hf_exit_manager=FakeHFManager(True, "DYNAMIC_TRAILING_STOP"),
             stop=180.0,
+            entry_candle=1,  # bars_held=2, so premature-exit gate does not suppress HFT
         )
 
         triggered, reason = fn(
