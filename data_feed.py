@@ -115,10 +115,10 @@ def onmessage(ticks: dict) -> None:
     # 2. Timestamp in IST
     ts = datetime.now(IST)
 
-    # 3. Audit log — every tick
-    logging.debug(
-        f"{GRAY}[TICK] symbol={sym} spot={ltp:.2f} "
-        f"time={ts.strftime('%H:%M:%S.%f')[:-3]}{RESET}"
+    # 3. Audit log — every tick (INFO level for production visibility)
+    ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+    logging.info(
+        f"[TICK] {sym} LTP={ltp:.2f} time={ts_str}"
     )
 
     # 4. Persist raw tick to SQLite
