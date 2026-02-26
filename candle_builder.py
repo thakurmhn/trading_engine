@@ -69,9 +69,10 @@ def build_3min_candle(df_ticks, symbol):
         ohlcv["cci20"] = calculate_cci(ohlcv)
 
         atr, _ = resolve_atr(ohlcv, daily_atr=None)
-        bias, slope = supertrend(ohlcv, atr_val=atr)
-        ohlcv.loc[ohlcv.index[-1], "supertrend_bias"] = bias
-        ohlcv.loc[ohlcv.index[-1], "supertrend_slope"] = slope
+        line_s, bias_s, slope_s = supertrend(ohlcv, atr_val=atr)
+        ohlcv["supertrend_line"] = line_s
+        ohlcv["supertrend_bias"] = bias_s
+        ohlcv["supertrend_slope"] = slope_s
 
         logging.info(f"[CANDLE BUILDER] Built {len(ohlcv)} 3m candles for {symbol}")
         return ohlcv
@@ -202,9 +203,10 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
         df_15m["cci20"] = calculate_cci(df_15m)
 
         atr, _ = resolve_atr(df_15m, daily_atr=None)
-        bias, slope = supertrend(df_15m, atr_val=atr)
-        df_15m.loc[df_15m.index[-1], "supertrend_bias"] = bias
-        df_15m.loc[df_15m.index[-1], "supertrend_slope"] = slope
+        line_s, bias_s, slope_s = supertrend(df_15m, atr_val=atr)
+        df_15m["supertrend_line"] = line_s
+        df_15m["supertrend_bias"] = bias_s
+        df_15m["supertrend_slope"] = slope_s
 
         return df_15m
 
@@ -243,9 +245,10 @@ def get_today_15m_candles(hist_data):
         df_15m["cci20"] = calculate_cci(df_15m)
 
         atr, _ = resolve_atr(df_15m, daily_atr=None)
-        bias, slope = supertrend(df_15m, atr_val=atr)
-        df_15m.loc[df_15m.index[-1], "supertrend_bias"] = bias
-        df_15m.loc[df_15m.index[-1], "supertrend_slope"] = slope
+        line_s, bias_s, slope_s = supertrend(df_15m, atr_val=atr)
+        df_15m["supertrend_line"] = line_s
+        df_15m["supertrend_bias"] = bias_s
+        df_15m["supertrend_slope"] = slope_s
 
         return df_15m
 

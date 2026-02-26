@@ -116,18 +116,38 @@ def calculate_typical_price_ma(df: pd.DataFrame, period: int = 20) -> pd.Series:
 # ─────────────────────────────────────────────────────────────────────────────
 # SUPERTREND — with bias reconciliation (v2 fix retained)
 # ─────────────────────────────────────────────────────────────────────────────
-def supertrend(df, atr_period=14, multiplier=3):
+def supertrend(df, atr_period=14, multiplier=3, atr_val=None, slope_lookback=5):
     """
     Supertrend with correct bias reconciliation.
     Returns (line_series, bias_series, slope_series).
     """
+    if df is None or df.empty:
+        idx = df.index if isinstance(df, pd.DataFrame) else pd.Index([])
+        return (
+            pd.Series(index=idx, dtype=float),
+            pd.Series(index=idx, dtype=object),
+            pd.Series(index=idx, dtype=object),
+        )
+
     df = df.copy()
 
     df['H-L'] = df['high'] - df['low']
     df['H-C'] = abs(df['high'] - df['close'].shift())
     df['L-C'] = abs(df['low']  - df['close'].shift())
     df['TR']  = df[['H-L', 'H-C', 'L-C']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(atr_period).mean()
+    if atr_val is None or (isinstance(atr_val, float) and pd.isna(atr_val)):
+        df['ATR'] = df['TR'].rolling(atr_period).mean()
+    else:
+        try:
+            if np.isscalar(atr_val):
+                df['ATR'] = float(atr_val)
+            else:
+                atr_series = pd.Series(atr_val, index=df.index, dtype=float)
+                df['ATR'] = atr_series.reindex(df.index).ffill()
+            logging.debug("[SUPERTREND] Using ATR override")
+        except Exception:
+            logging.warning("[SUPERTREND] Invalid ATR override, falling back to rolling ATR")
+            df['ATR'] = df['TR'].rolling(atr_period).mean()
 
     hl2 = (df['high'] + df['low']) / 2
     df['upperband'] = hl2 + multiplier * df['ATR']
@@ -136,7 +156,8 @@ def supertrend(df, atr_period=14, multiplier=3):
     df['final_upperband'] = df['upperband'].copy()
     df['final_lowerband'] = df['lowerband'].copy()
 
-    for i in range(atr_period, len(df)):
+    start_idx = max(1, atr_period)
+    for i in range(start_idx, len(df)):
         prev_ub    = df['final_upperband'].iloc[i - 1]
         prev_lb    = df['final_lowerband'].iloc[i - 1]
         prev_close = df['close'].iloc[i - 1]
@@ -155,7 +176,7 @@ def supertrend(df, atr_period=14, multiplier=3):
     bias  = pd.Series(index=df.index, dtype=object)
     slope = pd.Series(index=df.index, dtype=object)
 
-    for i in range(atr_period, len(df)):
+    for i in range(start_idx, len(df)):
         close_i = df['close'].iloc[i]
         prev_ub = df['final_upperband'].iloc[i - 1]
         prev_lb = df['final_lowerband'].iloc[i - 1]
@@ -169,8 +190,8 @@ def supertrend(df, atr_period=14, multiplier=3):
             line.iloc[i] = curr_ub
             bias.iloc[i] = "DOWN"
         else:
-            prev_bias = bias.iloc[i - 1] if i > atr_period else "NEUTRAL"
-            prev_line = line.iloc[i - 1] if i > atr_period else float('nan')
+            prev_bias = bias.iloc[i - 1] if i > start_idx else "NEUTRAL"
+            prev_line = line.iloc[i - 1] if i > start_idx else float('nan')
             if prev_bias == "UP":
                 line.iloc[i] = curr_lb
                 bias.iloc[i] = "UP"
@@ -181,21 +202,23 @@ def supertrend(df, atr_period=14, multiplier=3):
                 line.iloc[i] = prev_line
                 bias.iloc[i] = "NEUTRAL"
 
-        if i > atr_period:
-            pl = line.iloc[i - 1]
-            cl = line.iloc[i]
-            if pd.isna(pl) or pd.isna(cl):
-                slope.iloc[i] = slope.iloc[i - 1]
-            elif cl > pl:
+        if i >= (start_idx + max(1, slope_lookback)):
+            prev_line = line.iloc[i - max(1, slope_lookback)]
+            curr_line = line.iloc[i]
+            if pd.isna(prev_line) or pd.isna(curr_line):
+                slope.iloc[i] = slope.iloc[i - 1] if i > 0 else "FLAT"
+            elif curr_line > prev_line:
                 slope.iloc[i] = "UP"
-            elif cl < pl:
+            elif curr_line < prev_line:
                 slope.iloc[i] = "DOWN"
             else:
-                slope.iloc[i] = slope.iloc[i - 1]
+                slope.iloc[i] = "FLAT"
+        else:
+            slope.iloc[i] = "FLAT"
 
     # Reconcile bias against line position (v2 fix)
     corrected = 0
-    for i in range(atr_period, len(df)):
+    for i in range(start_idx, len(df)):
         cl = line.iloc[i]
         cc = df['close'].iloc[i]
         if pd.isna(cl):
@@ -208,9 +231,13 @@ def supertrend(df, atr_period=14, multiplier=3):
             corrected += 1
 
     if corrected > 0:
+        logging.info(f"[SUPERTREND] Bias corrected {corrected} rows")
+
+    if len(df) > 0:
+        last_atr = df['ATR'].iloc[-1] if "ATR" in df.columns else float("nan")
         logging.debug(
-            f"[SUPERTREND] Reconciled {corrected} rows where bias "
-            f"didn't match line position"
+            f"[SUPERTREND] bias={bias.iloc[-1]} slope={slope.iloc[-1]} "
+            f"atr={last_atr:.2f} corrected={corrected}"
         )
 
     return line, bias, slope
