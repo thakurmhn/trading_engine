@@ -40,6 +40,7 @@ from position_manager import make_replay_pm
 from option_exit_manager import OptionExitManager
 from day_type import (make_day_type_classifier, apply_day_type_to_pm,
                       DayType, DayTypeResult)
+from compression_detector import CompressionState
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -77,6 +78,8 @@ except NameError:
 #===================================================================
 
 today_str = datetime.now().strftime("%Y-%m-%d")
+
+_compression_state = CompressionState()   # for paper_order / live_order
 
 def map_status_code(code):
     status_map = {
@@ -2250,6 +2253,25 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     trad = trad_pre
     cam = cam_pre
 
+    # ── Compression breakout entry ────────────────────────────────────────────
+    if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 3:
+        _compression_state.update(hist_yesterday_15m)
+
+    if _compression_state.has_entry:
+        comp_sig = _compression_state.entry_signal
+        leg = "call_buy" if comp_sig["side"] == "CALL" else "put_buy"
+        if paper_info[leg]["trade_flag"] == 0 and not risk_info.get("halt_trading", False):
+            if paper_info.get("trade_count", 0) < paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info(
+                    f"[ENTRY DISPATCH] COMPRESSION_BREAKOUT {comp_sig['side']} "
+                    f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f} | "
+                    f"{comp_sig['reason']}"
+                )
+        _compression_state.consume_entry()
+        _save_trades_paper()
+        store(paper_info, account_type)
+        return
+
     signal = detect_signal(
         candles_3m=candles_3m,
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
@@ -2666,6 +2688,25 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     cpr = cpr_pre
     trad = trad_pre
     cam = cam_pre
+
+    # ── Compression breakout entry ────────────────────────────────────────────
+    if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 3:
+        _compression_state.update(hist_yesterday_15m)
+
+    if _compression_state.has_entry:
+        comp_sig = _compression_state.entry_signal
+        leg = "call_buy" if comp_sig["side"] == "CALL" else "put_buy"
+        if live_info[leg]["trade_flag"] == 0 and not risk_info.get("halt_trading", False):
+            if live_info.get("trade_count", 0) < live_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info(
+                    f"[ENTRY DISPATCH] COMPRESSION_BREAKOUT {comp_sig['side']} "
+                    f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f} | "
+                    f"{comp_sig['reason']}"
+                )
+        _compression_state.consume_entry()
+        _save_trades_live()
+        store(live_info, account_type)
+        return
 
     signal = detect_signal(
         candles_3m=candles_3m,
@@ -3280,6 +3321,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         _dtc      = None   # populated on first bar below
         _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
 
+        # ── Compression state — fresh per symbol/session ───────────────────────
+        _comp_state = CompressionState()
+
         # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
         class _FakeTime:
             __slots__ = ("hour", "minute")
@@ -3348,10 +3392,18 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     _dtc.lock_classification()
                     _day_type.log()
 
+            # ── Compression state update (15m aligned) ───────────────────────────
+            if not slice_15m.empty and len(slice_15m) >= 3:
+                _comp_state.update(slice_15m)
+
             # ── POSITION MONITOR — runs every bar when a trade is open ─────────
             # Works in both signal_only=True AND False modes.
             # While pm.is_open(): detect_signal is bypassed — no repeated orders.
             if pm.is_open():
+                # Discard any pending compression entry — can't act while in a trade
+                if _comp_state.has_entry:
+                    _comp_state.consume_entry()
+
                 # Enrich 3m row with 15m bias so ST_FLIP_2 can check HTF alignment
                 last_row_enriched = last_row.copy()
                 if not slice_15m.empty:
@@ -3395,6 +3447,32 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             # ── ENTRY EVALUATION — only runs when no position is open ──────────
             atr, _ = resolve_atr(slice_3m)
+
+            # ── Compression breakout entry — bypasses scoring gate ────────────
+            if _comp_state.has_entry:
+                comp_sig = _comp_state.entry_signal
+                entry_premium = round(bar_close * 0.006, 1)
+                logging.info(
+                    f"  {GREEN}[ENTRY DISPATCH] bar={i} {bar_time} | COMPRESSION_BREAKOUT "
+                    f"{comp_sig['side']} "
+                    f"strength={comp_sig['compression_zone']['compression_strength']:.1f}x "
+                    f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f}{RESET}"
+                )
+                apply_day_type_to_pm(pm, _day_type)
+                pm.open(i, bar_time, bar_close, entry_premium, comp_sig)
+                signals_fired.append({
+                    "bar":         i,
+                    "time":        bar_time,
+                    "side":        comp_sig["side"],
+                    "score":       comp_sig["score"],
+                    "reason":      comp_sig["reason"],
+                    "source":      comp_sig["source"],
+                    "pivot":       "",
+                    "underlying":  bar_close,
+                    "est_premium": entry_premium,
+                })
+                _comp_state.consume_entry()
+                continue
 
             # TPMA (stored as "vwap" by build_indicator_dataframe)
             tpma = (float(slice_3m["vwap"].iloc[-1])
