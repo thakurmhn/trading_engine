@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
-    MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE, symbols
+    MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE, symbols,
+    TREND_ENTRY_ADX_MIN,
 )
 from setup import (
     df, fyers, ticker, option_chain, spot_price,
@@ -27,8 +28,8 @@ from indicators import (
     daily_atr,
     williams_r,
     calculate_cci,
-    momentum_ok
-    
+    momentum_ok,
+    classify_cpr_width,
 )
 
 from signals import detect_signal, get_opening_range
@@ -291,6 +292,7 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
             st["is_open"] = True
             st["trade_flag"] = 1
             st["lifecycle_state"] = "OPEN" if st.get("lifecycle_state") != "HOLD" else "HOLD"
+            st["_restored_from_restart"] = True
             if not st.get("_restored_audit_logged", False):
                 restored_id = st.get("position_id", "UNKNOWN")
                 logging.info(
@@ -309,6 +311,112 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
     )
     _save_restart_state(info, account_type_)
     return info
+
+
+def _validate_restored_positions_on_startup(
+    info,
+    candles_3m,
+    candles_15m,
+    spot_px,
+    account_type_,
+    mode_label,
+    symbol,
+):
+    """Validate restored open trades against current gates and close stale ones.
+
+    Restored positions are checked exactly once after restart when live candle
+    context is available. Trades conflicting with current bias/quality gates are
+    exited immediately (minimum-hold safeguards are not applied here).
+    """
+    if info.get("_restored_validation_done", False):
+        return
+    if candles_3m is None or candles_3m.empty:
+        return
+
+    now_ts = pd.Timestamp(candles_3m.iloc[-1].get("time", dt.now(time_zone)))
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize(time_zone)
+    else:
+        now_ts = now_ts.tz_convert(time_zone)
+
+    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr_pre = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cam_pre = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+    quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
+        candles_3m=candles_3m,
+        candles_15m=candles_15m if candles_15m is not None else pd.DataFrame(),
+        timestamp=now_ts,
+        symbol=symbol,
+        adx_min=float(TREND_ENTRY_ADX_MIN),
+        cpr_levels=cpr_pre,
+        camarilla_levels=cam_pre,
+    )
+
+    for leg, side in (("call_buy", "CALL"), ("put_buy", "PUT")):
+        st = info.get(leg, {}) if isinstance(info, dict) else {}
+        if not isinstance(st, dict):
+            continue
+        if not st.get("_restored_from_restart", False):
+            continue
+        if not bool(st.get("is_open", False) or st.get("trade_flag", 0) == 1):
+            st["_restored_from_restart"] = False
+            continue
+
+        side_matches = (allowed_side == side)
+        stale = (not quality_ok) or (not side_matches)
+        position_id = st.get("position_id", "UNKNOWN")
+        option_symbol = st.get("option_name", "N/A")
+
+        if stale:
+            qty = st.get("quantity", 0)
+            exit_price, _ = _get_option_market_snapshot(option_symbol, spot_px)
+            if mode_label.upper() == "LIVE":
+                success, _ = send_live_exit_order(option_symbol, qty, "STALE_RESTORE_CLEANUP")
+            else:
+                success, _ = send_paper_exit_order(option_symbol, qty, "STALE_RESTORE_CLEANUP")
+
+            if success:
+                cleanup_trade_exit(
+                    info,
+                    leg,
+                    side,
+                    option_symbol,
+                    qty,
+                    exit_price,
+                    mode_label.upper(),
+                    "STALE_RESTORE_CLEANUP",
+                )
+                info["last_exit_time"] = now_ts
+                logging.info(
+                    "[STATE RESTORED][STALE ENTRY CLOSED] "
+                    f"timestamp={now_ts} mode={mode_label} symbol={option_symbol} "
+                    f"option_type={side} position_side={st.get('position_side', 'LONG')} "
+                    f"position_id={position_id} allowed_side={allowed_side} "
+                    f"ST3m_bias={st_details.get('ST3m_bias')} ST15m_bias={st_details.get('ST15m_bias')} "
+                    f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
+                    f"reason={gate_reason}"
+                )
+            else:
+                logging.warning(
+                    "[STATE RESTORED][STALE ENTRY CLOSE FAILED] "
+                    f"timestamp={now_ts} mode={mode_label} symbol={option_symbol} "
+                    f"position_id={position_id} reason=exit_order_failed"
+                )
+        else:
+            logging.info(
+                "[STATE RESTORED][VALID ENTRY CONTINUED] "
+                f"timestamp={now_ts} mode={mode_label} symbol={option_symbol} "
+                f"option_type={side} position_side={st.get('position_side', 'LONG')} "
+                f"position_id={position_id} allowed_side={allowed_side} "
+                f"ST3m_bias={st_details.get('ST3m_bias')} ST15m_bias={st_details.get('ST15m_bias')} "
+                f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')}"
+            )
+
+        st["_restored_from_restart"] = False
+
+    info["_restored_validation_done"] = True
+    store(info, account_type_)
 
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
@@ -549,6 +657,75 @@ def _is_startup_suppression_active(info, now_ts, mode_label):
     return True
 
 
+def _opening_s4_breakdown_context(candles_3m, cpr_levels, camarilla_levels, atr, timestamp):
+    """Structured context for opening S4/R4 breakout exception handling."""
+    ctx = {
+        "close": float("nan"),
+        "rsi14": float("nan"),
+        "s4": float("nan"),
+        "r4": float("nan"),
+        "atr": float("nan"),
+        "threshold_s4_down": float("nan"),
+        "threshold_r4_up": float("nan"),
+        "cpr_width": "NORMAL",
+        "compressed_cam": False,
+        "close_below_s4": False,
+        "close_above_r4": False,
+        "opening_window": False,
+        "opening_s4_breakdown": False,
+        "opening_r4_breakout": False,
+    }
+    if candles_3m is None or candles_3m.empty:
+        return ctx
+
+    last = candles_3m.iloc[-1]
+    close = float(last.get("close")) if pd.notna(last.get("close")) else float("nan")
+    rsi = float(last.get("rsi14")) if pd.notna(last.get("rsi14")) else float("nan")
+    s4 = float(camarilla_levels.get("s4")) if camarilla_levels and pd.notna(camarilla_levels.get("s4")) else float("nan")
+    r4 = float(camarilla_levels.get("r4")) if camarilla_levels and pd.notna(camarilla_levels.get("r4")) else float("nan")
+    atr_val = float(atr) if atr is not None and pd.notna(atr) else float("nan")
+    threshold_down = s4 - (0.01 * atr_val) if np.isfinite(s4) and np.isfinite(atr_val) else float("nan")
+    threshold_up = r4 + (0.01 * atr_val) if np.isfinite(r4) and np.isfinite(atr_val) else float("nan")
+    close_below_s4 = bool(np.isfinite(close) and np.isfinite(threshold_down) and close < threshold_down)
+    close_above_r4 = bool(np.isfinite(close) and np.isfinite(threshold_up) and close > threshold_up)
+
+    _cpr_classifier = globals().get("classify_cpr_width")
+    if callable(_cpr_classifier):
+        cpr_width = _cpr_classifier(cpr_levels or {}, close_price=close if np.isfinite(close) else None)
+    else:
+        cpr_width = "NORMAL"
+    r3 = float(camarilla_levels.get("r3")) if camarilla_levels and pd.notna(camarilla_levels.get("r3")) else float("nan")
+    r4 = float(camarilla_levels.get("r4")) if camarilla_levels and pd.notna(camarilla_levels.get("r4")) else float("nan")
+    s3 = float(camarilla_levels.get("s3")) if camarilla_levels and pd.notna(camarilla_levels.get("s3")) else float("nan")
+    cam_span = min(abs(r4 - r3), abs(s3 - s4)) if np.isfinite(r3) and np.isfinite(r4) and np.isfinite(s3) and np.isfinite(s4) else float("nan")
+    compressed_cam = bool(np.isfinite(cam_span) and np.isfinite(atr_val) and cam_span <= max(0.20 * atr_val, 5.0))
+
+    ts = pd.Timestamp(timestamp)
+    opening_window = bool(ts.hour == 9 and ts.minute <= 18)
+    opening_s4_breakdown = bool(opening_window and close_below_s4 and cpr_width == "NARROW" and compressed_cam)
+    opening_r4_breakout = bool(opening_window and close_above_r4 and cpr_width == "NARROW" and compressed_cam)
+
+    ctx.update(
+        {
+            "close": close,
+            "rsi14": rsi,
+            "s4": s4,
+            "r4": r4,
+            "atr": atr_val,
+            "threshold_s4_down": threshold_down,
+            "threshold_r4_up": threshold_up,
+            "cpr_width": cpr_width,
+            "compressed_cam": compressed_cam,
+            "close_below_s4": close_below_s4,
+            "close_above_r4": close_above_r4,
+            "opening_window": opening_window,
+            "opening_s4_breakdown": opening_s4_breakdown,
+            "opening_r4_breakout": opening_r4_breakout,
+        }
+    )
+    return ctx
+
+
 def _long_position_side(option_type):
     """All option trades are long-premium positions regardless of option type."""
     _ = option_type
@@ -611,10 +788,10 @@ def _supertrend_alignment_gate(candles_3m, candles_15m, timestamp, symbol):
     )
     if not aligned:
         logging.info(
-            "[ENTRY BLOCKED][ST_ALIGNMENT] "
+            "[ENTRY BLOCKED][ST_CONFLICT] "
             f"timestamp={details['timestamp']} symbol={details['symbol']} "
             f"ST3m_bias={details['ST3m_bias']} ST15m_bias={details['ST15m_bias']} "
-            "reason=Supertrend conflict, entry suppressed."
+            "reason=Supertrend bias conflict, entry suppressed."
         )
 
     return aligned, allowed_side, details
@@ -625,20 +802,30 @@ def _trend_entry_quality_gate(
     candles_15m,
     timestamp,
     symbol,
-    adx_min=25.0,
+    adx_min=18.0,
     rsi_min=35.0,
     rsi_max=65.0,
     cci_min=-120.0,
     cci_max=120.0,
+    cpr_levels=None,
+    camarilla_levels=None,
 ):
     """Hard quality gate for trend entries.
 
     Conditions:
-    1) Supertrend bias alignment (3m/15m) and slope agreement with bias.
-    2) ADX must be > adx_min.
-    3) Oscillators must not be in extremes:
+    1) Supertrend bias alignment: 3m and 15m must both be BULLISH (CALL) or BEARISH (PUT).
+    2) 3m Supertrend slope must confirm bias direction (UP for BULLISH, DOWN for BEARISH).
+       15m slope is not checked.
+    3) ADX must be > adx_min.
+    4) Oscillators must not be in extremes:
        RSI in [35, 65], CCI in [-120, 120].
     """
+    logging.info(
+        "[ENTRY CONFIG] "
+        f"timestamp={timestamp} symbol={symbol} "
+        f"adx_min={adx_min} rsi_range=[{rsi_min},{rsi_max}] "
+        f"cci_range=[{cci_min},{cci_max}]"
+    )
     aligned, allowed_side, st_details = _supertrend_alignment_gate(
         candles_3m=candles_3m,
         candles_15m=candles_15m,
@@ -655,6 +842,65 @@ def _trend_entry_quality_gate(
     st_details["rsi14"] = rsi_val
     st_details["cci20"] = cci_val
 
+    close_val = float(last_3m.get("close")) if last_3m is not None and pd.notna(last_3m.get("close")) else float("nan")
+    atr_val = float(last_3m.get("atr14")) if last_3m is not None and pd.notna(last_3m.get("atr14")) else float("nan")
+    if not np.isfinite(atr_val):
+        try:
+            atr_val, _ = resolve_atr(candles_3m)
+            atr_val = float(atr_val) if atr_val is not None and pd.notna(atr_val) else float("nan")
+        except Exception:
+            atr_val = float("nan")
+    s4_val = float(camarilla_levels.get("s4")) if camarilla_levels and pd.notna(camarilla_levels.get("s4")) else float("nan")
+    r4_val = float(camarilla_levels.get("r4")) if camarilla_levels and pd.notna(camarilla_levels.get("r4")) else float("nan")
+    s4_thr = s4_val - (0.01 * atr_val) if np.isfinite(s4_val) and np.isfinite(atr_val) else float("nan")
+    r4_thr = r4_val + (0.01 * atr_val) if np.isfinite(r4_val) and np.isfinite(atr_val) else float("nan")
+    close_below_s4 = bool(np.isfinite(close_val) and np.isfinite(s4_thr) and close_val < s4_thr)
+    close_above_r4 = bool(np.isfinite(close_val) and np.isfinite(r4_thr) and close_val > r4_thr)
+    _cpr_classifier = globals().get("classify_cpr_width")
+    if callable(_cpr_classifier):
+        cpr_width = _cpr_classifier(cpr_levels or {}, close_price=close_val if np.isfinite(close_val) else None)
+    else:
+        cpr_width = "NORMAL"
+    r3_val = float(camarilla_levels.get("r3")) if camarilla_levels and pd.notna(camarilla_levels.get("r3")) else float("nan")
+    s3_val = float(camarilla_levels.get("s3")) if camarilla_levels and pd.notna(camarilla_levels.get("s3")) else float("nan")
+    cam_span = min(abs(r4_val - r3_val), abs(s3_val - s4_val)) if np.isfinite(r3_val) and np.isfinite(r4_val) and np.isfinite(s3_val) and np.isfinite(s4_val) else float("nan")
+    compressed_cam = bool(np.isfinite(cam_span) and np.isfinite(atr_val) and cam_span <= max(0.20 * atr_val, 5.0))
+    osc_override_put = bool(
+        allowed_side == "PUT"
+        and np.isfinite(rsi_val)
+        and rsi_val < 30.0
+        and close_below_s4
+        and cpr_width == "NARROW"
+        and compressed_cam
+    )
+    osc_override_call = bool(
+        allowed_side == "CALL"
+        and np.isfinite(rsi_val)
+        and rsi_val > 70.0
+        and close_above_r4
+        and cpr_width == "NARROW"
+        and compressed_cam
+    )
+    osc_override = bool(osc_override_put or osc_override_call)
+    st_details["s4"] = s4_val
+    st_details["r4"] = r4_val
+    st_details["s4_threshold"] = s4_thr
+    st_details["r4_threshold"] = r4_thr
+    st_details["close"] = close_val
+    st_details["cpr_width"] = cpr_width
+    st_details["compressed_cam"] = compressed_cam
+    st_details["close_below_s4"] = close_below_s4
+    st_details["close_above_r4"] = close_above_r4
+    st_details["osc_override_s4"] = osc_override
+    logging.info(
+        "[ENTRY DIAG][S4_R4_BREAK] "
+        f"timestamp={timestamp} symbol={symbol} close={close_val} s4={s4_val} r4={r4_val} "
+        f"atr={atr_val} s4_threshold={s4_thr} r4_threshold={r4_thr} "
+        f"put_ok={allowed_side == 'PUT'} call_ok={allowed_side == 'CALL'} "
+        f"close_below_s4={close_below_s4} close_above_r4={close_above_r4} "
+        f"cpr_width={cpr_width} compressed_cam={compressed_cam}"
+    )
+
     if not aligned:
         logging.info(
             "[ENTRY BLOCKED][ST_CONFLICT] "
@@ -667,17 +913,21 @@ def _trend_entry_quality_gate(
         (st_details["ST3m_bias"] == "BULLISH" and str(st_details["ST3m_slope"]).upper() == "UP")
         or (st_details["ST3m_bias"] == "BEARISH" and str(st_details["ST3m_slope"]).upper() == "DOWN")
     )
-    slope_ok_15m = (
-        (st_details["ST15m_bias"] == "BULLISH" and str(st_details["ST15m_slope"]).upper() == "UP")
-        or (st_details["ST15m_bias"] == "BEARISH" and str(st_details["ST15m_slope"]).upper() == "DOWN")
-    )
-    if not (slope_ok_3m and slope_ok_15m):
+    if not slope_ok_3m:
         logging.info(
-            "[ENTRY BLOCKED][SLOPE_MISMATCH] "
+            "[ENTRY BLOCKED][ST_SLOPE_CONFLICT] "
             f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            "reason=Slope mismatch, entry suppressed."
+            f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']} "
+            "reason=3m slope does not confirm bias direction, entry suppressed."
         )
-        return False, allowed_side, "Slope mismatch, entry suppressed.", st_details
+        return False, allowed_side, "3m slope does not confirm bias direction, entry suppressed.", st_details
+    logging.info(
+        "[ENTRY ALLOWED][ST_BIAS_OK] "
+        f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+        f"ST15m_bias={st_details['ST15m_bias']} ST3m_bias={st_details['ST3m_bias']} "
+        f"ST3m_slope={st_details['ST3m_slope']} "
+        "reason=15m/3m biases aligned and 3m slope confirmed."
+    )
 
     if not np.isfinite(adx_val) or adx_val <= float(adx_min):
         logging.info(
@@ -691,6 +941,15 @@ def _trend_entry_quality_gate(
         (np.isfinite(rsi_val) and (rsi_val < float(rsi_min) or rsi_val > float(rsi_max)))
         or (np.isfinite(cci_val) and (cci_val < float(cci_min) or cci_val > float(cci_max)))
     ):
+        if osc_override:
+            logging.info(
+                "[ENTRY ALLOWED][OSC_OVERRIDE_PIVOT_BREAK] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"close={close_val} s4={s4_val} r4={r4_val} "
+                f"s4_threshold={s4_thr} r4_threshold={r4_thr} atr={atr_val} "
+                f"RSI={rsi_val} CCI={cci_val} cpr_width={cpr_width} compressed_cam={compressed_cam}"
+            )
+            return True, allowed_side, "OK", st_details
         logging.info(
             "[ENTRY BLOCKED][OSC_EXTREME] "
             f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
@@ -1829,18 +2088,36 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         logging.info("[ENTRY BLOCKED][RISK] Halt active")
         return
 
+    pre_atr, _ = resolve_atr(candles_3m)
+    pivot_src_pre = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr_pre = calculate_cpr(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    trad_pre = calculate_traditional_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    cam_pre = calculate_camarilla_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    breakdown_ctx = _opening_s4_breakdown_context(candles_3m, cpr_pre, cam_pre, pre_atr, ct)
+
     # Cooldown
     if paper_info.get("last_exit_time"):
         elapsed = (ct - paper_info["last_exit_time"]).total_seconds()
         if elapsed < COOLDOWN_SECONDS:
-            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s < {COOLDOWN_SECONDS}s")
-            return
+            if breakdown_ctx.get("opening_s4_breakdown", False) or breakdown_ctx.get("opening_r4_breakout", False):
+                tag = "OPENING_S4_BREAKDOWN" if breakdown_ctx.get("opening_s4_breakdown", False) else "OPENING_R4_BREAKOUT"
+                logging.info(
+                    f"[ENTRY COOLDOWN BYPASS][{tag}] elapsed={elapsed:.0f}s "
+                    f"close={breakdown_ctx.get('close')} s4={breakdown_ctx.get('s4')} "
+                    f"r4={breakdown_ctx.get('r4')} "
+                    f"s4_threshold={breakdown_ctx.get('threshold_s4_down')} "
+                    f"r4_threshold={breakdown_ctx.get('threshold_r4_up')} "
+                    f"cpr_width={breakdown_ctx.get('cpr_width')}"
+                )
+            else:
+                logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s < {COOLDOWN_SECONDS}s")
+                return
 
     if _is_startup_suppression_active(paper_info, ct, "PAPER"):
         store(paper_info, account_type)
         return
 
-    atr, _ = resolve_atr(candles_3m)
+    atr = pre_atr
 
     # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
     scalp_cd_until = paper_info.get("scalp_cooldown_until")
@@ -1937,7 +2214,9 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
-        adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
+        adx_min=float(TREND_ENTRY_ADX_MIN),
+        cpr_levels=cpr_pre,
+        camarilla_levels=cam_pre,
     )
     if not quality_ok:
         tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
@@ -1950,6 +2229,9 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
             f"allowed_side={allowed_side} "
+            f"close={st_details.get('close')} s4={st_details.get('s4')} r4={st_details.get('r4')} "
+            f"s4_threshold={st_details.get('s4_threshold')} r4_threshold={st_details.get('r4_threshold')} "
+            f"put_ok={allowed_side == 'PUT'} call_ok={allowed_side == 'CALL'} "
             f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
             f"reason={gate_reason}"
         )
@@ -1964,10 +2246,9 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     orb_h, orb_l = get_opening_range(candles_3m)
 
     # FIX: pivots from previous completed candle (iloc[-2]), not current (iloc[-1])
-    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
-    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
-    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
-    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cpr = cpr_pre
+    trad = trad_pre
+    cam = cam_pre
 
     signal = detect_signal(
         candles_3m=candles_3m,
@@ -2223,17 +2504,35 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     if risk_info.get("halt_trading", False):
         return
 
+    pre_atr, _ = resolve_atr(candles_3m)
+    pivot_src_pre = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr_pre = calculate_cpr(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    trad_pre = calculate_traditional_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    cam_pre = calculate_camarilla_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+    breakdown_ctx = _opening_s4_breakdown_context(candles_3m, cpr_pre, cam_pre, pre_atr, ct)
+
     if live_info.get("last_exit_time"):
         elapsed = (ct - live_info["last_exit_time"]).total_seconds()
         if elapsed < COOLDOWN_SECONDS:
-            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s")
-            return
+            if breakdown_ctx.get("opening_s4_breakdown", False) or breakdown_ctx.get("opening_r4_breakout", False):
+                tag = "OPENING_S4_BREAKDOWN" if breakdown_ctx.get("opening_s4_breakdown", False) else "OPENING_R4_BREAKOUT"
+                logging.info(
+                    f"[ENTRY COOLDOWN BYPASS][{tag}] elapsed={elapsed:.0f}s "
+                    f"close={breakdown_ctx.get('close')} s4={breakdown_ctx.get('s4')} "
+                    f"r4={breakdown_ctx.get('r4')} "
+                    f"s4_threshold={breakdown_ctx.get('threshold_s4_down')} "
+                    f"r4_threshold={breakdown_ctx.get('threshold_r4_up')} "
+                    f"cpr_width={breakdown_ctx.get('cpr_width')}"
+                )
+            else:
+                logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s")
+                return
 
     if _is_startup_suppression_active(live_info, ct, "LIVE"):
         store(live_info, account_type)
         return
 
-    atr, _ = resolve_atr(candles_3m)
+    atr = pre_atr
 
     # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
     scalp_cd_until = live_info.get("scalp_cooldown_until")
@@ -2332,7 +2631,9 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
         timestamp=ct,
         symbol=ticker,
-        adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
+        adx_min=float(TREND_ENTRY_ADX_MIN),
+        cpr_levels=cpr_pre,
+        camarilla_levels=cam_pre,
     )
     if not quality_ok:
         tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
@@ -2345,6 +2646,9 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             f"timestamp={st_details['timestamp']} symbol={st_details['symbol']} "
             f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
             f"allowed_side={allowed_side} "
+            f"close={st_details.get('close')} s4={st_details.get('s4')} r4={st_details.get('r4')} "
+            f"s4_threshold={st_details.get('s4_threshold')} r4_threshold={st_details.get('r4_threshold')} "
+            f"put_ok={allowed_side == 'PUT'} call_ok={allowed_side == 'CALL'} "
             f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')} "
             f"reason={gate_reason}"
         )
@@ -2359,10 +2663,9 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     orb_h, orb_l = get_opening_range(candles_3m)
 
     # FIX: pivots from previous completed candle
-    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
-    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
-    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
-    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cpr = cpr_pre
+    trad = trad_pre
+    cam = cam_pre
 
     signal = detect_signal(
         candles_3m=candles_3m,
@@ -3110,7 +3413,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 candles_15m=slice_15m,
                 timestamp=bar_time,
                 symbol=sym,
-                adx_min=float(globals().get("TREND_ENTRY_ADX_MIN", 25.0)),
+                adx_min=float(TREND_ENTRY_ADX_MIN),
+                cpr_levels=cpr,
+                camarilla_levels=cam,
             )
             if not quality_ok:
                 blocker_key = (
@@ -3129,6 +3434,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"timestamp={bar_time} symbol={sym} "
                     f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
                     f"allowed_side={allowed_side} "
+                    f"close={st_details.get('close')} s4={st_details.get('s4')} r4={st_details.get('r4')} "
+                    f"s4_threshold={st_details.get('s4_threshold')} r4_threshold={st_details.get('r4_threshold')} "
+                    f"put_ok={allowed_side == 'PUT'} call_ok={allowed_side == 'CALL'} "
                     f"ADX={st_details.get('adx14')} RSI={st_details.get('rsi14')} CCI={st_details.get('cci20')}"
                 )
                 continue
