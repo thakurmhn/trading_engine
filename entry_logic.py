@@ -1,6 +1,9 @@
 # ===== entry_logic.py (v5 — FULL SPEC IMPLEMENTATION) =====
+# ===== entry_logic.py (v5 — FULL SPEC IMPLEMENTATION + P5 Extension) =====
 """
-v5 implements the complete scoring framework from the system specification:
+v5 implements the complete scoring framework from the system specification,
+including Priority 5 opening bias extensions.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DIMENSION             WEIGHT   NOTES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -12,8 +15,10 @@ pivot_structure         15    Acceptance=15, Rejection/Breakout=10, Continuation
 momentum_ok             15    dual-EMA dual-close + gap widening (bool from indicators)
 cpr_width                5    Narrow CPR = +5 (trending breakout day bonus)
 entry_type_bonus         5    Pullback or Rejection entry_type = +5
+open_bias_score          5    CALL + (OPEN_LOW or GAP_UP); PUT + (OPEN_HIGH or GAP_DOWN)
+                         -3   OPEN_CLOSE_EQUAL or BALANCE_OPEN (marginal-entry suppressor)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-THEORETICAL MAX: 95 pts (Acceptance path); 90 pts (Rejection path)
+THEORETICAL MAX: 100 pts (Acceptance path + aligned open bias)
 Base threshold NORMAL: 50 pts   HIGH volatility: 60 pts
 
 Changes vs v4:
@@ -48,21 +53,28 @@ Changes vs v4:
    • Set by detect_signal() after pivot type classification
    • PULLBACK or REJECTION → +5; BREAKOUT/CONTINUATION → 0
 
-6. MANDATORY PRE-FILTERS (unchanged from v4):
+6. OPENING BIAS EXTENSION (P5):
+   • Tags: [OPEN_HIGH], [OPEN_LOW], [OPEN_ABOVE_CLOSE], [OPEN_BELOW_CLOSE],
+            [OPEN_CLOSE_EQUAL], [GAP_UP], [GAP_DOWN], [BALANCE_OPEN]
+   • Alignment bonus: +5 pts (CALL + OPEN_LOW/GAP_UP; PUT + OPEN_HIGH/GAP_DOWN)
+   • Dampener: -3 pts (OPEN_CLOSE_EQUAL or BALANCE_OPEN when no alignment bonus)
+   • Alignment overrides dampener; no change to WEIGHTS sum (remains 105)
+
+7. MANDATORY PRE-FILTERS (unchanged from v4):
    • ATR regime gate (LOW → blocked)
    • RSI exhaustion guard (RSI<30 PUT / RSI>75 CALL)
    • Time-of-day: PRE_OPEN, OPENING_NOISE, LUNCH_CHOP, EOD_BLOCK
    • Early session RSI guard (pre-10:15)
    • RSI directional hard filter: PUT blocked RSI>50, CALL blocked RSI<50
 
-7. DYNAMIC THRESHOLDS (unchanged from v4):
+8. DYNAMIC THRESHOLDS (unchanged from v4):
    • Afternoon 12:20-14:00: floor = base+25 = 75
    • Late session 14:00+: hard minimum 65
    • Counter-3m surcharge: +8 pts + hard floor 70
    • Counter-HTF surcharge: +3~7 pts + hard floor 65
    • Day type modifiers (TRENDING-8, RANGE+8, etc.)
 
-Empirically validated: all 8 Feb 16/17 test trades pass with zero regressions.
+Empirically validated: all Feb 16–26 replay trades pass with zero regressions.
 """
 
 import logging
@@ -91,6 +103,7 @@ WEIGHTS = {
     "momentum_ok":       15,   # dual-EMA dual-close + gap widening (boolean)
     "cpr_width":         15,   # Narrow=15, Normal=0, Wide=-5 (day-type predictor)
     "adx_strength":      15,   # ADX quartile: <18=0, 18-25=5, 25-35=10, 35+=15
+    "open_bias_score":    5,   # P5-B: OPEN_LOW=+5 CALL, OPEN_HIGH=+5 PUT (aligned only)
 }
 
 # ── ATR regime thresholds ──────────────────────────────────────────────────────
@@ -440,6 +453,53 @@ def _score_adx(indicators):
     return pts
 
 
+def _score_open_bias(indicators, side):
+    """Comprehensive opening bias score (P5-E) — range -3..+5.
+
+    +5 pts (alignment bonus, highest priority):
+      CALL + (OPEN_LOW  or GAP_UP)   — bullish open confirmation
+      PUT  + (OPEN_HIGH or GAP_DOWN) — bearish open confirmation
+
+    -3 pts (neutral dampener, applied only when no alignment):
+      OPEN_CLOSE_EQUAL or BALANCE_OPEN — suppress marginal counter-trend entries
+
+    Priority: alignment (+5) always overrides neutral dampener (-3).
+
+    Reads from indicators dict:
+      open_bias    : "OPEN_HIGH" | "OPEN_LOW" | "NONE"       (P5-A)
+      gap_tag      : "GAP_UP"   | "GAP_DOWN"  | "NO_GAP"     (P5-C)
+      vs_close_tag : "OPEN_ABOVE_CLOSE" | "OPEN_BELOW_CLOSE" | "OPEN_CLOSE_EQUAL"  (P5-B)
+      balance_tag  : "BALANCE_OPEN" | "OUTSIDE_BALANCE"      (P5-D)
+    Keys absent from indicators default to non-dampening values (no penalty).
+    """
+    w         = WEIGHTS["open_bias_score"]   # 5
+    open_bias = indicators.get("open_bias",    "NONE")
+    gap_tag   = indicators.get("gap_tag",      "NO_GAP")
+    vs_close  = indicators.get("vs_close_tag", None)
+    balance   = indicators.get("balance_tag",  None)
+
+    # ── alignment bonus ───────────────────────────────────────────────────────
+    if side == "CALL" and (open_bias == "OPEN_LOW" or gap_tag == "GAP_UP"):
+        logging.debug(
+            f"[OPEN_BIAS_SCORE] CALL aligned: open_bias={open_bias} gap={gap_tag} → +{w} pts"
+        )
+        return w
+    if side == "PUT" and (open_bias == "OPEN_HIGH" or gap_tag == "GAP_DOWN"):
+        logging.debug(
+            f"[OPEN_BIAS_SCORE] PUT aligned: open_bias={open_bias} gap={gap_tag} → +{w} pts"
+        )
+        return w
+
+    # ── neutral dampener (only when no alignment) ─────────────────────────────
+    if vs_close == "OPEN_CLOSE_EQUAL" or balance == "BALANCE_OPEN":
+        logging.debug(
+            f"[OPEN_BIAS_SCORE] Neutral suppressor: vs_close={vs_close} balance={balance} → -3 pts"
+        )
+        return -3
+
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -642,6 +702,7 @@ def check_entry_condition(candle, indicators, bias_15m,
             "momentum_ok":      _score_momentum_ok(indicators, side),
             "cpr_width":        _score_cpr_width(indicators),
             "adx_strength":     _score_adx(indicators),
+            "open_bias_score":  _score_open_bias(indicators, side),
         }
         total = sum(bd.values())
 
@@ -746,6 +807,9 @@ def check_entry_condition(candle, indicators, bias_15m,
         if pivot_signal and pivot_signal[0] == best_side:
             _piv_s = f" pivot={pivot_signal[1]}"
 
+        _ob_val  = indicators.get("open_bias", "NONE")
+        _ob_pts  = best_bd.get("open_bias_score", 0)
+        _ob_s    = f" OB={_ob_val}({_ob_pts:+d})" if _ob_val != "NONE" else ""
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
             f"{surcharge_note} {regime} {strength}"
@@ -754,7 +818,7 @@ def check_entry_condition(candle, indicators, bias_15m,
             f" VWAP={best_bd.get('vwap_position',0)}/5"
             f" PIV={best_bd.get('pivot_structure',0)}/15"
             f" {_mom_s} {_cpr_s} {_adx_s}"
-            f"{_piv_s}{RESET}"
+            f"{_ob_s}{_piv_s}{RESET}"
         )
     else:
         result["reason"] = (

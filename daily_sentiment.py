@@ -292,6 +292,362 @@ def _predict_opening_gap(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# P5-A  OPEN=HIGH / OPEN=LOW BIAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_open_position(
+    today_open: float,
+    today_high: float,
+    today_low: float,
+    tolerance: float = 0.5,
+) -> tuple:
+    """Detect Open=High or Open=Low intraday condition at market open.
+
+    Open=High (today_open ≥ today_high − tolerance):
+        Price opened at or very near the session high → sellers in control
+        from tick-one → bearish.  bear_pts += 3, tag = ``OPEN_HIGH``.
+
+    Open=Low (today_open ≤ today_low + tolerance):
+        Price opened at or very near the session low → buyers in control
+        from tick-one → bullish.  bull_pts += 3, tag = ``OPEN_LOW``.
+
+    Both conditions are mutually exclusive (checked in priority order).
+
+    Parameters
+    ----------
+    today_open  : Opening price of the first intraday candle.
+    today_high  : High of that candle (typically 3m ORB high).
+    today_low   : Low of that candle (typically 3m ORB low).
+    tolerance   : Price tolerance in index points (default 0.5 for NIFTY50).
+
+    Returns
+    -------
+    (bull_pts, bear_pts, open_bias_tag, reasons)
+    """
+    bull_pts, bear_pts = 0, 0
+    open_bias_tag = "NONE"
+    reasons: list = []
+
+    if today_open is None or today_high is None or today_low is None:
+        reasons.append("Open position data unavailable — skipped")
+        return bull_pts, bear_pts, open_bias_tag, reasons
+
+    if today_open >= today_high - tolerance:
+        bear_pts += 3
+        open_bias_tag = "OPEN_HIGH"
+        reasons.append(
+            f"OPEN_HIGH: open={today_open:.2f}≈high={today_high:.2f} "
+            f"→ bearish price rejection from opening high"
+        )
+    elif today_open <= today_low + tolerance:
+        bull_pts += 3
+        open_bias_tag = "OPEN_LOW"
+        reasons.append(
+            f"OPEN_LOW: open={today_open:.2f}≈low={today_low:.2f} "
+            f"→ bullish price rejection from opening low"
+        )
+    else:
+        reasons.append(
+            f"OPEN_NEUTRAL: open={today_open:.2f} "
+            f"high={today_high:.2f} low={today_low:.2f} → no strong open bias"
+        )
+
+    logging.info(
+        f"{CYAN}[OPEN_POSITION] tag={open_bias_tag} "
+        f"open={today_open:.2f} high={today_high:.2f} low={today_low:.2f} "
+        f"tol={tolerance:.2f} bull={bull_pts} bear={bear_pts}{RESET}"
+    )
+    return bull_pts, bear_pts, open_bias_tag, reasons
+
+
+def get_open_position_bias(
+    today_open: float,
+    today_high: float,
+    today_low: float,
+    tolerance: float = 0.5,
+) -> dict:
+    """Compute intraday open=high / open=low bias from the first session candle.
+
+    Call once after the first 3m candle of the session is complete
+    (i.e. at ~09:18 IST for NIFTY50 3m bars).  Pass the result into
+    ``check_entry_condition()`` via ``indicators["open_bias"]``.
+
+    Returns
+    -------
+    dict with keys:
+        open_bias       : "OPEN_HIGH" | "OPEN_LOW" | "NONE"
+        bull_pts        : int
+        bear_pts        : int
+        preferred_side  : "PUT" | "CALL" | None
+        reasons         : list[str]
+    """
+    bull_pts, bear_pts, open_bias_tag, reasons = _score_open_position(
+        today_open, today_high, today_low, tolerance
+    )
+    preferred_side = (
+        "PUT"  if open_bias_tag == "OPEN_HIGH" else
+        "CALL" if open_bias_tag == "OPEN_LOW"  else
+        None
+    )
+    return {
+        "open_bias":      open_bias_tag,
+        "bull_pts":       bull_pts,
+        "bear_pts":       bear_pts,
+        "preferred_side": preferred_side,
+        "reasons":        reasons,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P5-B  OPEN vs PREVIOUS CLOSE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_open_vs_prev_close(
+    today_open: float,
+    prev_close: float,
+    tolerance: float = 0.5,
+) -> tuple:
+    """Compare today's open to the previous session close.
+
+    Returns (bull_pts, bear_pts, vs_close_tag, reasons).
+    """
+    bull_pts, bear_pts = 0, 0
+    reasons: list = []
+
+    if today_open is None or prev_close is None:
+        reasons.append("Open vs prev-close data unavailable — skipped")
+        return bull_pts, bear_pts, "OPEN_CLOSE_EQUAL", reasons
+
+    diff = today_open - prev_close
+    if abs(diff) <= tolerance:
+        vs_close_tag = "OPEN_CLOSE_EQUAL"
+        reasons.append(
+            f"OPEN_CLOSE_EQUAL: open={today_open:.2f} prev_close={prev_close:.2f} "
+            f"diff={diff:+.2f} ≤ tol={tolerance:.2f} → neutral"
+        )
+    elif diff > 0:
+        bull_pts += 2
+        vs_close_tag = "OPEN_ABOVE_CLOSE"
+        reasons.append(
+            f"OPEN_ABOVE_CLOSE: open={today_open:.2f} > prev_close={prev_close:.2f} "
+            f"diff={diff:+.2f} → bullish open"
+        )
+    else:
+        bear_pts += 2
+        vs_close_tag = "OPEN_BELOW_CLOSE"
+        reasons.append(
+            f"OPEN_BELOW_CLOSE: open={today_open:.2f} < prev_close={prev_close:.2f} "
+            f"diff={diff:+.2f} → bearish open"
+        )
+
+    logging.info(
+        f"{CYAN}[{vs_close_tag}] open={today_open:.2f} prev_close={prev_close:.2f} "
+        f"diff={diff:+.2f} bull={bull_pts} bear={bear_pts}{RESET}"
+    )
+    return bull_pts, bear_pts, vs_close_tag, reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P5-C  GAP vs PREVIOUS HIGH / LOW
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_gap(
+    today_open: float,
+    prev_high: float,
+    prev_low: float,
+) -> tuple:
+    """Detect true gap-up / gap-down vs the previous session range.
+
+    Returns (bull_pts, bear_pts, gap_tag, reasons).
+    """
+    bull_pts, bear_pts = 0, 0
+    reasons: list = []
+
+    if today_open is None or prev_high is None or prev_low is None:
+        reasons.append("Gap data unavailable — skipped")
+        return bull_pts, bear_pts, "NO_GAP", reasons
+
+    if today_open > prev_high:
+        bull_pts += 3
+        gap_tag = "GAP_UP"
+        reasons.append(
+            f"GAP_UP: open={today_open:.2f} > prev_high={prev_high:.2f} "
+            f"→ bullish gap continuation"
+        )
+    elif today_open < prev_low:
+        bear_pts += 3
+        gap_tag = "GAP_DOWN"
+        reasons.append(
+            f"GAP_DOWN: open={today_open:.2f} < prev_low={prev_low:.2f} "
+            f"→ bearish gap continuation"
+        )
+    else:
+        gap_tag = "NO_GAP"
+        reasons.append(
+            f"NO_GAP: open={today_open:.2f} within prev range "
+            f"[{prev_low:.2f}–{prev_high:.2f}]"
+        )
+
+    logging.info(
+        f"{CYAN}[{gap_tag}] open={today_open:.2f} "
+        f"prev_high={prev_high:.2f} prev_low={prev_low:.2f} "
+        f"bull={bull_pts} bear={bear_pts}{RESET}"
+    )
+    return bull_pts, bear_pts, gap_tag, reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P5-D  OPEN vs CPR BALANCE ZONE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_balance_zone_open(
+    today_open: float,
+    cpr_bc: float,
+    cpr_tc: float,
+) -> tuple:
+    """Detect if today's open is inside the CPR balance zone (BC–TC).
+
+    Inside CPR → BALANCE_OPEN → range day expected, neutral bias.
+    Outside CPR → OUTSIDE_BALANCE → trending bias.
+    Both return 0 pts; the tag is used for dampening in entry_logic.
+
+    Returns (bull_pts, bear_pts, balance_tag, reasons).
+    """
+    bull_pts, bear_pts = 0, 0
+    reasons: list = []
+
+    if today_open is None or cpr_bc is None or cpr_tc is None:
+        reasons.append("Balance zone data unavailable — skipped")
+        return bull_pts, bear_pts, "OUTSIDE_BALANCE", reasons
+
+    zone_low  = min(cpr_bc, cpr_tc)
+    zone_high = max(cpr_bc, cpr_tc)
+
+    if zone_low <= today_open <= zone_high:
+        balance_tag = "BALANCE_OPEN"
+        reasons.append(
+            f"BALANCE_OPEN: open={today_open:.2f} inside CPR zone "
+            f"[{zone_low:.2f}–{zone_high:.2f}] → indecisive/range day"
+        )
+    else:
+        balance_tag = "OUTSIDE_BALANCE"
+        reasons.append(
+            f"OUTSIDE_BALANCE: open={today_open:.2f} outside CPR zone "
+            f"[{zone_low:.2f}–{zone_high:.2f}] → trending bias"
+        )
+
+    logging.info(
+        f"{CYAN}[{balance_tag}] open={today_open:.2f} "
+        f"bc={cpr_bc:.2f} tc={cpr_tc:.2f}{RESET}"
+    )
+    return bull_pts, bear_pts, balance_tag, reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P5  COMPREHENSIVE OPENING BIAS AGGREGATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_opening_bias(
+    today_open: float,
+    today_high: float,
+    today_low: float,
+    prev_close: float,
+    prev_high: float,
+    prev_low: float,
+    cpr_bc: float,
+    cpr_tc: float,
+    tolerance: float = 0.5,
+) -> dict:
+    """Comprehensive opening bias detection combining all P5 scorers.
+
+    Aggregates P5-A (open position), P5-B (vs prev close), P5-C (gap),
+    P5-D (balance zone open).
+
+    Call once after the first intraday candle is complete.  The returned
+    tags should be unpacked into the ``indicators`` dict before calling
+    ``check_entry_condition()``:
+
+        opening = get_opening_bias(...)
+        indicators.update({
+            "open_bias":    opening["open_pos_tag"],
+            "gap_tag":      opening["gap_tag"],
+            "vs_close_tag": opening["vs_close_tag"],
+            "balance_tag":  opening["balance_tag"],
+        })
+
+    Returns
+    -------
+    dict with keys:
+        open_pos_tag    : "OPEN_HIGH" | "OPEN_LOW" | "NONE"
+        vs_close_tag    : "OPEN_ABOVE_CLOSE" | "OPEN_BELOW_CLOSE" | "OPEN_CLOSE_EQUAL"
+        gap_tag         : "GAP_UP" | "GAP_DOWN" | "NO_GAP"
+        balance_tag     : "BALANCE_OPEN" | "OUTSIDE_BALANCE"
+        bull_pts        : int  (sum from P5-A + P5-B + P5-C)
+        bear_pts        : int
+        preferred_side  : "CALL" | "PUT" | None
+        tags            : list[str]  (all four tag values)
+        reasons         : list[str]
+    """
+    all_reasons: list = []
+    bull_pts = bear_pts = 0
+
+    # P5-A
+    a_bull, a_bear, open_pos_tag, a_reasons = _score_open_position(
+        today_open, today_high, today_low, tolerance
+    )
+    bull_pts += a_bull
+    bear_pts += a_bear
+    all_reasons.extend(a_reasons)
+
+    # P5-B
+    b_bull, b_bear, vs_close_tag, b_reasons = _score_open_vs_prev_close(
+        today_open, prev_close, tolerance
+    )
+    bull_pts += b_bull
+    bear_pts += b_bear
+    all_reasons.extend(b_reasons)
+
+    # P5-C
+    c_bull, c_bear, gap_tag, c_reasons = _score_gap(
+        today_open, prev_high, prev_low
+    )
+    bull_pts += c_bull
+    bear_pts += c_bear
+    all_reasons.extend(c_reasons)
+
+    # P5-D  (0 pts — used only for dampening in entry_logic)
+    _, _, balance_tag, d_reasons = _score_balance_zone_open(
+        today_open, cpr_bc, cpr_tc
+    )
+    all_reasons.extend(d_reasons)
+
+    if bull_pts > bear_pts:
+        preferred_side = "CALL"
+    elif bear_pts > bull_pts:
+        preferred_side = "PUT"
+    else:
+        preferred_side = None
+
+    logging.info(
+        f"{CYAN}[OPENING_BIAS] pos={open_pos_tag} vs_close={vs_close_tag} "
+        f"gap={gap_tag} balance={balance_tag} "
+        f"bull={bull_pts} bear={bear_pts} preferred={preferred_side}{RESET}"
+    )
+
+    return {
+        "open_pos_tag":   open_pos_tag,
+        "vs_close_tag":   vs_close_tag,
+        "gap_tag":        gap_tag,
+        "balance_tag":    balance_tag,
+        "bull_pts":       bull_pts,
+        "bear_pts":       bear_pts,
+        "preferred_side": preferred_side,
+        "tags":           [open_pos_tag, vs_close_tag, gap_tag, balance_tag],
+        "reasons":        all_reasons,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -479,4 +835,12 @@ def get_daily_sentiment_from_candles(
     )
 
 
-__all__ = ["get_daily_sentiment", "get_daily_sentiment_from_candles"]
+__all__ = [
+    "get_daily_sentiment",
+    "get_daily_sentiment_from_candles",
+    "get_open_position_bias",
+    "get_opening_bias",
+    "_score_open_vs_prev_close",
+    "_score_gap",
+    "_score_balance_zone_open",
+]

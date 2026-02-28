@@ -4,6 +4,9 @@ Called at the end of each live/paper/replay session to produce:
   • A structured CSV of all trades parsed from the session log.
   • A summary dict  (total trades, win %, net P&L, CALL vs PUT split).
   • A PNG equity-curve  (cumulative P&L over trade sequence).
+  • A JSON export of trades and session summary.
+  • A text report with full session diagnostics.
+  • A comparison report (baseline vs fixed) for head-to-head analysis.
 
 Usage
 -----
@@ -23,16 +26,30 @@ Usage
     artifacts = generate_dashboard(log_path="options_trade_engine_2024-01-15.log",
                                    output_dir="reports/")
 
+    # Full log-parser pipeline (new format + legacy EXIT AUDIT):
+    from dashboard import generate_full_report, compare_sessions
+    generate_full_report(log_path="options_trade_engine_2026-02-24.log",
+                         output_dir="reports/")
+    compare_sessions(baseline_paths=["baseline.log"],
+                     fixed_paths=["fixed.log"],
+                     output_dir="reports/")
+
 Log-parsing targets
 -------------------
-[ENTRY DISPATCH] lines  — emitted by st_pullback_cci.place_st_pullback_entry()
-[EXIT AUDIT]    lines  — emitted by execution.check_exit_condition() and
-                          execution.cleanup_trade_exit()
+[TRADE OPEN][REPLAY|PAPER|LIVE]  — new-format entry fill
+[TRADE EXIT]                     — new-format exit fill (WIN/LOSS + P&L)
+[ENTRY BLOCKED][subtype]         — gate suppression
+[ENTRY OK]                       — entry passed all gates
+[SIGNAL FIRED]                   — signal generated (pre-gate)
+[EXIT AUDIT]                     — legacy detailed exit record
+[ENTRY DISPATCH]                 — emitted by st_pullback_cci (legacy)
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import json
 import logging
 import re
 import sys
@@ -601,3 +618,380 @@ def generate_dashboard(
         "chart":   chart_path,
         "summary": summary,
     }
+
+
+# ── JSON export ────────────────────────────────────────────────────────────────
+
+def save_report_json(
+    trades: list | pd.DataFrame,
+    summary: dict,
+    output_path: str | Path,
+) -> Path:
+    """Save trades list and session summary to a JSON file.
+
+    Parameters
+    ----------
+    trades      : List of trade dicts or a DataFrame with trades.
+    summary     : Session summary dict (from compute_summary or SessionSummary.to_dict).
+    output_path : Destination .json file path.
+
+    Returns
+    -------
+    Path to the saved JSON file.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(trades, pd.DataFrame):
+        trade_list = trades.where(trades.notna(), other=None).to_dict(orient="records")
+    else:
+        trade_list = list(trades)
+
+    payload = {
+        "generated_at": datetime.now().isoformat(),
+        "summary":      summary,
+        "trades":       trade_list,
+    }
+
+    with output_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+    logger.info(f"[DASHBOARD] JSON report saved → {output_path}")
+    return output_path
+
+
+# ── Full log-parser report ─────────────────────────────────────────────────────
+
+def generate_full_report(
+    log_path: str | Path,
+    output_dir: str | Path = "reports",
+) -> dict:
+    """Parse a log file using LogParser (new format + legacy) and emit artifacts.
+
+    Produces:
+      trades_{date}.csv
+      trades_{date}.json
+      equity_curve_{date}.png
+      dashboard_report_{date}.txt
+
+    Returns
+    -------
+    dict with keys: csv, json, chart, text, summary
+    """
+    from log_parser import LogParser
+
+    log_path = Path(log_path)
+    parser   = LogParser(log_path)
+    session  = parser.parse()
+
+    out_dir  = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag      = session.date_tag or datetime.now().strftime("%Y-%m-%d")
+
+    trades_df = pd.DataFrame(session.trades) if session.trades else pd.DataFrame()
+    summary   = session.to_dict()
+
+    csv_path   = save_report_csv(trades_df, out_dir / f"trades_{tag}.csv") if not trades_df.empty else None
+    json_path  = save_report_json(trades_df, summary, out_dir / f"trades_{tag}.json")
+    chart_path = plot_equity_curve(trades_df, output_path=out_dir / f"equity_curve_{tag}.png")
+    text_path  = _write_text_report(session, out_dir / f"dashboard_report_{tag}.txt")
+
+    logger.info(
+        f"[DASHBOARD] Full report: trades={session.total_trades} "
+        f"win={session.win_rate_pct}% net={session.net_pnl_pts:+.2f}pts "
+        f"blocked={session.total_blocked}"
+    )
+
+    return {
+        "csv":     csv_path,
+        "json":    json_path,
+        "chart":   chart_path,
+        "text":    text_path,
+        "summary": summary,
+    }
+
+
+def _write_text_report(session, output_path: Path) -> Path:
+    """Write a human-readable text report for a SessionSummary."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sep  = "=" * 60
+    sep2 = "-" * 60
+
+    lines = [
+        sep,
+        f"  TRADING ENGINE SESSION REPORT — {session.date_tag}",
+        f"  Log  : {session.log_path}",
+        f"  Type : {session.session_type}",
+        sep,
+        "",
+        "  TRADE SUMMARY",
+        sep2,
+        f"  Total trades   : {session.total_trades}",
+        f"  Winners        : {session.winners}",
+        f"  Losers         : {session.losers}",
+        f"  Breakeven      : {session.breakeven}",
+        f"  Win rate       : {session.win_rate_pct:.1f}%",
+        f"  Net P&L (pts)  : {session.net_pnl_pts:+.2f}",
+        f"  Net P&L (Rs)   : {session.net_pnl_rs:+,.0f}",
+        f"  CALL trades    : {session.call_trades}",
+        f"  PUT  trades    : {session.put_trades}",
+        "",
+        "  SIGNAL PIPELINE",
+        sep2,
+        f"  Signals fired  : {session.signals_fired}",
+        f"  Entry OK       : {session.entry_ok_count}",
+        f"  Total blocked  : {session.total_blocked}",
+    ]
+
+    if session.blocked_counts:
+        lines.append("")
+        lines.append("  BLOCKED BREAKDOWN")
+        lines.append(sep2)
+        for reason, cnt in sorted(session.blocked_counts.items(),
+                                  key=lambda x: -x[1]):
+            lines.append(f"  {reason:<30}: {cnt:>5}")
+
+    if session.exit_reason_counts:
+        lines.append("")
+        lines.append("  EXIT REASONS")
+        lines.append(sep2)
+        for reason, cnt in sorted(session.exit_reason_counts.items(),
+                                  key=lambda x: -x[1]):
+            lines.append(f"  {reason:<30}: {cnt:>5}")
+
+    if session.tag_counts:
+        lines.append("")
+        lines.append("  P1-P5 TAGS FIRED")
+        lines.append(sep2)
+        for tag, cnt in sorted(session.tag_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  [{tag}]{'':>5}: {cnt}")
+
+    # P5-F: Opening Scenario section (all P5 tags + alignment breakdown)
+    obs = session.open_bias_stats
+    if obs["open_bias_tag"] != "NONE" or session.total_trades:
+        lines.append("")
+        lines.append("  OPEN BIAS ALIGNMENT (P5)")
+        lines.append(sep2)
+        lines.append(f"  Open position bias : {obs['open_bias_tag']}")
+        lines.append(f"  Open vs prev close : {obs.get('vs_close_tag', 'N/A')}")
+        lines.append(f"  Gap scenario       : {obs.get('gap_tag', 'N/A')}")
+        lines.append(f"  Balance zone open  : {obs.get('balance_tag', 'N/A')}")
+        lines.append("")
+        lines.append(
+            f"  Aligned trades     : {obs['aligned_count']:>4}  ({obs['pct_aligned']:.1f}%)   "
+            f"P&L: {obs['aligned_pnl']:+.2f} pts"
+        )
+        lines.append(
+            f"  Misaligned trades  : {obs['misaligned_count']:>4}              "
+            f"P&L: {obs['misaligned_pnl']:+.2f} pts"
+        )
+        lines.append(f"  Neutral trades     : {obs['neutral_count']:>4}")
+        if obs.get("is_gap_day"):
+            lines.append(
+                f"  Gap day P&L        : {obs['gap_day_pnl']:+.2f} pts  "
+                f"({obs['gap_tag']})"
+            )
+        if obs.get("is_balance_day"):
+            lines.append(
+                f"  Balance day P&L    : {obs['balance_day_pnl']:+.2f} pts  "
+                f"({obs['balance_tag']})"
+            )
+
+    lines += ["", sep, ""]
+
+    text = "\n".join(lines)
+    output_path.write_text(text, encoding="utf-8")
+    logger.info(f"[DASHBOARD] Text report saved → {output_path}")
+    return output_path
+
+
+# ── Comparison report (baseline vs fixed) ─────────────────────────────────────
+
+def compare_sessions(
+    baseline_paths: List[str | Path],
+    fixed_paths: List[str | Path],
+    output_dir: str | Path = "reports",
+) -> dict:
+    """Compare baseline vs fixed log files and write a comparison report.
+
+    Parameters
+    ----------
+    baseline_paths : List of log file paths representing the pre-fix baseline.
+    fixed_paths    : List of log file paths with P1–P4 fixes active.
+    output_dir     : Directory for the comparison report.
+
+    Returns
+    -------
+    dict with keys: text, baseline_summary, fixed_summary
+    """
+    from log_parser import parse_multiple, SessionSummary
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_sessions = parse_multiple(baseline_paths)
+    fixed_sessions    = parse_multiple(fixed_paths)
+
+    def _aggregate(sessions: List[SessionSummary]) -> dict:
+        trades = []
+        for s in sessions:
+            trades.extend(s.trades)
+        total  = len(trades)
+        wins   = sum(1 for t in trades if t.get("pnl_pts", 0) > 0)
+        losses = sum(1 for t in trades if t.get("pnl_pts", 0) < 0)
+        pnl    = sum(t.get("pnl_pts", 0) for t in trades)
+        blocked_total = sum(s.total_blocked for s in sessions)
+        all_blocked: Dict[str, int] = {}
+        for s in sessions:
+            for k, v in s.blocked_counts.items():
+                all_blocked[k] = all_blocked.get(k, 0) + v
+        all_tags: Dict[str, int] = {}
+        for s in sessions:
+            for k, v in s.tag_counts.items():
+                all_tags[k] = all_tags.get(k, 0) + v
+        return {
+            "sessions":        len(sessions),
+            "total_trades":    total,
+            "winners":         wins,
+            "losers":          losses,
+            "win_rate_pct":    round(wins / total * 100, 1) if total else 0.0,
+            "net_pnl_pts":     round(pnl, 2),
+            "total_blocked":   blocked_total,
+            "blocked_counts":  all_blocked,
+            "tag_counts":      all_tags,
+        }
+
+    base = _aggregate(baseline_sessions)
+    fix  = _aggregate(fixed_sessions)
+
+    text_path = out_dir / "comparison_report.txt"
+    _write_comparison_text(base, fix, baseline_paths, fixed_paths, text_path)
+    logger.info(f"[DASHBOARD] Comparison report saved → {text_path}")
+
+    return {
+        "text":             text_path,
+        "baseline_summary": base,
+        "fixed_summary":    fix,
+    }
+
+
+def _write_comparison_text(
+    base: dict,
+    fix: dict,
+    baseline_paths: List,
+    fixed_paths: List,
+    output_path: Path,
+) -> None:
+    sep  = "=" * 70
+    sep2 = "-" * 70
+
+    def _delta(key: str, fmt: str = ".1f", higher_is_better: bool = True) -> str:
+        bval = base.get(key, 0)
+        fval = fix.get(key, 0)
+        diff = fval - bval
+        sign = "+" if diff >= 0 else ""
+        arrow = "▲" if (diff > 0) == higher_is_better else ("▼" if diff != 0 else "=")
+        return f"{fval:{fmt}} ({sign}{diff:{fmt}} {arrow})"
+
+    lines = [
+        sep,
+        "  HEAD-TO-HEAD COMPARISON: BASELINE vs FIXED",
+        sep,
+        f"  Baseline logs  : {[str(p) for p in baseline_paths]}",
+        f"  Fixed logs     : {[str(p) for p in fixed_paths]}",
+        sep2,
+        f"  {'Metric':<30} {'Baseline':>12} {'Fixed':>20}",
+        sep2,
+        f"  {'Sessions':<30} {base['sessions']:>12} {_fix_val(fix,'sessions'):>20}",
+        f"  {'Total trades':<30} {base['total_trades']:>12} {_fix_val(fix,'total_trades'):>20}",
+        f"  {'Winners':<30} {base['winners']:>12} {_fix_val(fix,'winners'):>20}",
+        f"  {'Losers':<30} {base['losers']:>12} {_fix_val(fix,'losers'):>20}",
+        f"  {'Win rate %':<30} {base['win_rate_pct']:>11.1f}% {_delta('win_rate_pct','.1f',True):>20}",
+        f"  {'Net P&L (pts)':<30} {base['net_pnl_pts']:>+12.2f} {_delta('net_pnl_pts','+.2f',True):>20}",
+        f"  {'Total blocked':<30} {base['total_blocked']:>12} {_delta('total_blocked','d',False):>20}",
+        sep2,
+    ]
+
+    # Blocked breakdown comparison
+    all_reasons = set(base["blocked_counts"]) | set(fix["blocked_counts"])
+    if all_reasons:
+        lines += ["", "  BLOCKED ENTRY BREAKDOWN", sep2]
+        for r in sorted(all_reasons):
+            bv = base["blocked_counts"].get(r, 0)
+            fv = fix["blocked_counts"].get(r, 0)
+            diff = fv - bv
+            lines.append(f"  {r:<30} {bv:>12} {fv:>12}  ({'+' if diff>=0 else ''}{diff})")
+
+    # P1-P4 tag comparison
+    all_tags = set(base["tag_counts"]) | set(fix["tag_counts"])
+    if all_tags:
+        lines += ["", "  P1-P4 TAGS FIRED", sep2]
+        for tag in sorted(all_tags):
+            bv = base["tag_counts"].get(tag, 0)
+            fv = fix["tag_counts"].get(tag, 0)
+            lines.append(f"  [{tag}]{'':>3}{bv:>12}  →  {fv}")
+
+    lines += ["", sep, ""]
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _fix_val(d: dict, key: str) -> str:
+    return str(d.get(key, 0))
+
+
+# ── CLI entry point ────────────────────────────────────────────────────────────
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m dashboard",
+        description="Trading engine dashboard — parse logs and emit reports.",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # report sub-command
+    rep = sub.add_parser("report", help="Generate a full report from a log file.")
+    rep.add_argument("log", help="Path to the session log file.")
+    rep.add_argument("-o", "--output-dir", default="reports",
+                     help="Output directory (default: reports/)")
+
+    # compare sub-command
+    cmp = sub.add_parser("compare", help="Compare baseline vs fixed log files.")
+    cmp.add_argument("--baseline", nargs="+", required=True,
+                     help="Baseline log file(s) (pre-fix).")
+    cmp.add_argument("--fixed", nargs="+", required=True,
+                     help="Fixed log file(s) (P1–P4 active).")
+    cmp.add_argument("-o", "--output-dir", default="reports",
+                     help="Output directory (default: reports/)")
+
+    return p
+
+
+def _main(argv=None) -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    args = _build_parser().parse_args(argv)
+
+    if args.command == "report":
+        result = generate_full_report(args.log, output_dir=args.output_dir)
+        print(f"\nArtifacts written to: {args.output_dir}")
+        for key, val in result.items():
+            if key != "summary" and val:
+                print(f"  {key:<6}: {val}")
+
+    elif args.command == "compare":
+        result = compare_sessions(
+            baseline_paths=args.baseline,
+            fixed_paths=args.fixed,
+            output_dir=args.output_dir,
+        )
+        print(f"\nComparison report: {result['text']}")
+        b = result["baseline_summary"]
+        f = result["fixed_summary"]
+        print(f"  Baseline: {b['total_trades']} trades, "
+              f"{b['win_rate_pct']:.1f}% win, {b['net_pnl_pts']:+.2f} pts")
+        print(f"  Fixed:    {f['total_trades']} trades, "
+              f"{f['win_rate_pct']:.1f}% win, {f['net_pnl_pts']:+.2f} pts")
+
+
+if __name__ == "__main__":
+    _main()
