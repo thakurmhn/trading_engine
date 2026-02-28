@@ -45,7 +45,9 @@ account_type = 'PAPER'          # 'PAPER' or 'LIVE'
 quantity = 130                  # lot size - Nifty - 65
 buffer = 5
 profit_loss_point = 25          # Used for target profit/stoploss 
-MAX_TRADES_PER_DAY = 20         # Maximum trades per day
+MAX_TRADES_PER_DAY = 8          # P3-D: Reduced from 20 → 8. Options buying requires
+                                # high-conviction setups. Lower frequency → lower theta
+                                # drag and spread cost across the session.
 
 CALL_MONEYNESS = 'ITM'          # strike/contract type - ITM/OTM  
 PUT_MONEYNESS  = 'ITM'

@@ -74,17 +74,23 @@ YELLOW = "\033[93m"
 CYAN   = "\033[96m"
 RESET  = "\033[0m"
 
-# ── Score weights (spec-aligned) ───────────────────────────────────────────────
-# Total max = 95 (Acceptance path) / 90 (Rejection path)
+# ── Score weights ──────────────────────────────────────────────────────────────
+# P2 revision (Priority 2 audit fixes):
+#   adx_strength   10→15 pts — quartile scoring 0/5/10/15 for stronger trend gate
+#   cpr_width      10→15 pts — CPR width is the #1 day-type predictor (spec: 5→15)
+#   rsi_score      10→5  pts — RSI hard-block does the heavy filtering; score reduced
+#   vwap_position  10→5  pts — directional context; weight released to ADX+CPR
+# Net theoretical max: 15+5+15+5+15+15+15+15 = 100 pts
+# Existing thresholds (50/60) remain valid.
 WEIGHTS = {
-    "trend_alignment":   20,   # 15m+3m bundled: both=20, HTF-only=10, neither=0
-    "rsi_score":         10,   # RSI >55(CALL)/<45(PUT)=10; 50-55/45-50=5
+    "trend_alignment":   15,   # 15m+3m bundled: both=15, HTF-only=7, neither=0
+    "rsi_score":          5,   # RSI >55(CALL)/<45(PUT)=5; hard-block does filtering
     "cci_score":         15,   # CCI >100=10, >150=+5 → 15 max; symmetric for PUT
-    "vwap_position":     10,   # above VWAP=CALL, below=PUT
+    "vwap_position":      5,   # above VWAP=CALL, below=PUT
     "pivot_structure":   15,   # Acceptance=15, Rejection/Breakout=10, Continuation=5
     "momentum_ok":       15,   # dual-EMA dual-close + gap widening (boolean)
-    "cpr_width":          5,   # Narrow CPR = +5 (trending breakout day)
-    "entry_type_bonus":   5,   # Pullback or Rejection entry = +5
+    "cpr_width":         15,   # Narrow=15, Normal=0, Wide=-5 (day-type predictor)
+    "adx_strength":      15,   # ADX quartile: <18=0, 18-25=5, 25-35=10, 35+=15
 }
 
 # ── ATR regime thresholds ──────────────────────────────────────────────────────
@@ -161,30 +167,26 @@ def liquidity_zone(candle, supertrend_line, bias, atr, timeframe):
 
 def _score_trend_alignment(bias_15m, indicators, side):
     """
-    Supertrend alignment — 15m + 3m bundled (20 pts max).
+    Supertrend alignment — 15m + 3m bundled (15 pts max after weight revision).
 
-    Spec: both 15m and 3m aligned = 20, HTF only = 10, neither = 0.
-    This replaces the old split (trend_15m=20 + trend_3m=15 = 35 over-weight).
-
-    Partial credit for early-reversal: 15m opposing but slope improving = 6.
+    Both 15m and 3m aligned = 15, HTF only = 7, neither = 0.
+    Partial credit for early-reversal: 15m opposing but slope improving = 4.
     """
     w    = WEIGHTS["trend_alignment"]
     b15  = _norm_bias(bias_15m)
     b3   = _norm_bias(indicators.get("st_bias_3m", "NEUTRAL"))
 
-    # Both aligned — spec full credit
     if side == "CALL":
-        if b15 == "BULLISH" and b3 == "BULLISH":  return w          # 20
-        if b15 == "BULLISH" and b3 == "NEUTRAL":   return w * 3 // 4 # 15
-        if b15 == "BULLISH":                        return w // 2    # 10 — HTF only
-        if b15 == "NEUTRAL" and b3 == "BULLISH":    return w // 4    # 5 — LTF only
-        # HTF opposes — check slope improving
+        if b15 == "BULLISH" and b3 == "BULLISH":  return w          # 15
+        if b15 == "BULLISH" and b3 == "NEUTRAL":   return w * 3 // 4 # 11
+        if b15 == "BULLISH":                        return w // 2    # 7 — HTF only
+        if b15 == "NEUTRAL" and b3 == "BULLISH":    return w // 4    # 3 — LTF only
         if b15 == "BEARISH":
             try:
                 c15 = indicators.get("candle_15m")
                 if c15 is not None:
                     sl = str(c15.get("supertrend_slope", "")).upper()
-                    if sl == "UP": return w // 3   # 6 — early reversal
+                    if sl == "UP": return w // 4   # 3 — early reversal credit
             except Exception:
                 pass
         return 0
@@ -198,7 +200,7 @@ def _score_trend_alignment(bias_15m, indicators, side):
                 c15 = indicators.get("candle_15m")
                 if c15 is not None:
                     sl = str(c15.get("supertrend_slope", "")).upper()
-                    if sl == "DOWN": return w // 3
+                    if sl == "DOWN": return w // 4
             except Exception:
                 pass
         return 0
@@ -377,29 +379,65 @@ def _score_momentum_ok(indicators, side):
 
 def _score_cpr_width(indicators):
     """
-    CPR width bonus (5 pts max) — spec: Narrow CPR = trending day = +5.
+    CPR width score (15 pts max — P2-B revision; spec: 5 → 15).
+
+    CPR width is the single strongest predictor of day type. A NARROW CPR
+    preceding a trending day earns the full 15-pt bonus. WIDE CPR (choppy day)
+    deducts 5 pts to penalise momentum entries into indecisive sessions.
+    NORMAL = neutral (0 pts).
 
     indicators["cpr_width"] set by signals.py via classify_cpr_width().
     Values: "NARROW" | "NORMAL" | "WIDE"
     """
-    w         = WEIGHTS["cpr_width"]
+    w         = WEIGHTS["cpr_width"]    # 15
     cpr_width = indicators.get("cpr_width", "NORMAL")
-    return w if cpr_width == "NARROW" else 0
+    if cpr_width == "NARROW":
+        pts = w           # +15: high probability trending day
+    elif cpr_width == "WIDE":
+        pts = -5          # penalty: choppy session, momentum entries risky
+    else:
+        pts = 0           # NORMAL: neutral
+    logging.debug(f"[CPR_WEIGHT] cpr_width={cpr_width} → {pts:+d}/{w} pts")
+    return pts
 
 
-def _score_entry_type(indicators):
+def _score_adx(indicators):
     """
-    Entry type bonus (5 pts max) — spec: Pullback or Rejection entry = +5.
+    ADX trend strength score (15 pts max — P2-A quartile revision).
 
-    indicators["entry_type"] set by detect_signal() after pivot classification.
-    Values: "BREAKOUT" | "PULLBACK" | "REJECTION" | "CONTINUATION"
+    Differentiates entries by underlying trend conviction. Same ST alignment
+    can occur in ADX=19 (weak trend) or ADX=40 (strong trend) — this scorer
+    rewards the latter with a full 15-pt bonus.
 
-    Spec rationale: Pullback entries have better R:R than direct breakout chasing.
-    Rejection entries trade proven supply/demand zones.
+    Quartile mapping (P2-A spec):
+      ADX < 18  : 0  — trend too weak, no bonus
+      18–25     : 5  — moderate trend, partial bonus
+      25–35     : 10 — established trend, strong bonus
+      35+       : 15 — strong trend, maximum conviction bonus
+
+    indicators["adx14"] or indicators["candle_15m"]["adx14"] is used.
+    Falls back to 5-pt neutral default if ADX unavailable (no penalty).
     """
-    w          = WEIGHTS["entry_type_bonus"]
-    entry_type = indicators.get("entry_type", "CONTINUATION")
-    return w if entry_type in ("PULLBACK", "REJECTION") else 0
+    w = WEIGHTS["adx_strength"]    # 15
+
+    adx = _safe_float(indicators.get("adx14"))
+    if adx is None:
+        # Try 15m candle snapshot
+        c15 = indicators.get("candle_15m")
+        if c15 is not None:
+            adx = _safe_float(c15.get("adx14"))
+
+    if adx is None:
+        logging.debug("[ADX_SCORE] ADX unavailable — using neutral default 5")
+        return 5    # unavailable — neutral partial, don't penalise
+
+    if adx >= 35:   pts = w        # 15 — strong trend
+    elif adx >= 25: pts = 10       # established trend
+    elif adx >= 18: pts = 5        # moderate trend
+    else:           pts = 0        # trend too weak
+
+    logging.debug(f"[ADX_SCORE] adx={adx:.1f} → {pts}/{w} pts")
+    return pts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -603,23 +641,23 @@ def check_entry_condition(candle, indicators, bias_15m,
             "pivot_structure":  _score_pivot(pivot_signal, side),
             "momentum_ok":      _score_momentum_ok(indicators, side),
             "cpr_width":        _score_cpr_width(indicators),
-            "entry_type_bonus": _score_entry_type(indicators),
+            "adx_strength":     _score_adx(indicators),
         }
         total = sum(bd.values())
 
-        # Enhanced logging v5: show indicator availability + scorer breakdown
+        # Enhanced logging: show indicator availability + scorer breakdown
         _mom_state = "OK" if indicators.get("momentum_ok_" + side.lower()) else "NO"
         _cpr_state = indicators.get("cpr_width", "?")
-        _et_state  = indicators.get("entry_type", "?")
+        _adx_val   = _safe_float(indicators.get("adx14")) or "?"
         _rsi_prev  = "AVAIL" if indicators.get("rsi_prev") is not None else "MISS"
 
         logging.debug(
-            f"[SCORE BREAKDOWN v5][{side}] {total}/{side_threshold} | "
-            f"Indicators: MOM={_mom_state} CPR={_cpr_state} ET={_et_state} RSI_prev={_rsi_prev} | "
-            f"ST={bd['trend_alignment']:2d}/20 RSI={bd['rsi_score']:2d}/10 "
-            f"CCI={bd['cci_score']:2d}/15 VWAP={bd['vwap_position']:2d}/10 "
+            f"[SCORE BREAKDOWN v7][{side}] {total}/{side_threshold} | "
+            f"Indicators: MOM={_mom_state} CPR={_cpr_state} ADX={_adx_val} RSI_prev={_rsi_prev} | "
+            f"ST={bd['trend_alignment']:2d}/15 RSI={bd['rsi_score']:2d}/5 "
+            f"CCI={bd['cci_score']:2d}/15 VWAP={bd['vwap_position']:2d}/5 "
             f"PIV={bd['pivot_structure']:2d}/15 MOM={bd['momentum_ok']:2d}/15 "
-            f"CPR={bd['cpr_width']:2d}/5 ET={bd['entry_type_bonus']:2d}/5"
+            f"CPR={bd['cpr_width']:2d}/15 ADX={bd['adx_strength']:2d}/15"
         )
 
         if total > best_score:
@@ -702,8 +740,8 @@ def check_entry_condition(candle, indicators, bias_15m,
             delta   = _rsi_v - _rsi_p
             _rsi_a  = f"({'↑' if delta > 0 else '↓'}{abs(delta):.1f})"
         _mom_s  = "MOM=✓" if best_bd.get("momentum_ok", 0) > 0 else "MOM=✗"
-        _cpr_s  = f"CPR={indicators.get('cpr_width','?')}"
-        _et_s   = f"ET={indicators.get('entry_type','?')}"
+        _cpr_s  = f"CPR={indicators.get('cpr_width','?')}({best_bd.get('cpr_width',0):+d})"
+        _adx_s  = f"ADX={_safe_float(indicators.get('adx14')) or '?'}({best_bd.get('adx_strength',0):d}/15)"
         _piv_s  = ""
         if pivot_signal and pivot_signal[0] == best_side:
             _piv_s = f" pivot={pivot_signal[1]}"
@@ -711,11 +749,11 @@ def check_entry_condition(candle, indicators, bias_15m,
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
             f"{surcharge_note} {regime} {strength}"
-            f" | ST={best_bd.get('trend_alignment',0)}/20"
+            f" | ST={best_bd.get('trend_alignment',0)}/15"
             f" {_rsi_s}{_rsi_a} {_cci_s}"
-            f" VWAP={best_bd.get('vwap_position',0)}/10"
+            f" VWAP={best_bd.get('vwap_position',0)}/5"
             f" PIV={best_bd.get('pivot_structure',0)}/15"
-            f" {_mom_s} {_cpr_s} {_et_s}"
+            f" {_mom_s} {_cpr_s} {_adx_s}"
             f"{_piv_s}{RESET}"
         )
     else:
@@ -725,4 +763,196 @@ def check_entry_condition(candle, indicators, bias_15m,
         )
         logging.debug(f"[ENTRY BLOCKED] {result['reason']}")
 
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3-A  PRE-SESSION DAILY SENTIMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_daily_sentiment(
+    prev_high: float,
+    prev_low: float,
+    prev_close: float,
+    cpr_levels: dict,
+    camarilla_levels: dict,
+    compression_state_at_close: str = "NEUTRAL",
+    atr_value: float = None,
+) -> dict:
+    """Infer pre-session directional bias from prior-day price structure.
+
+    Uses only price-derived inputs (no volume, no discretionary indicators).
+    Should be called once before the session starts (e.g. in do_warmup or
+    at the beginning of paper_order when hist_yesterday_15m is available).
+
+    Parameters
+    ----------
+    prev_high, prev_low, prev_close:
+        Prior trading day OHLC values for the underlying index.
+    cpr_levels:
+        Output of calculate_cpr() — keys: "pivot", "bc", "tc".
+    camarilla_levels:
+        Output of calculate_camarilla_pivots() — keys: r3, r4, s3, s4.
+    compression_state_at_close:
+        Market state of CompressionState at prior-day session end.
+        "ENERGY_BUILDUP" → opening gap/momentum prediction.
+    atr_value:
+        Prior-day ATR (14 period on 15m bars).  Used for normalisation.
+        If None, raw price distances are used.
+
+    Returns
+    -------
+    dict with keys:
+        sentiment       : "BULLISH" | "BEARISH" | "NEUTRAL"
+        confidence      : float 0-100
+        preferred_side  : "CALL" | "PUT" | None
+        day_type_pred   : "TRENDING" | "RANGE" | "NEUTRAL"
+        threshold_adj   : int (-5 to +10) — modify entry threshold for the day
+        max_hold_adj    : int (-3 to +2)  — modify MAX_HOLD bars for the day
+        reasons         : list[str]       — human-readable evidence trail
+    """
+    reasons: list = []
+    bullish_pts = 0
+    bearish_pts = 0
+
+    tc  = _safe_float(cpr_levels.get("tc"))
+    bc  = _safe_float(cpr_levels.get("bc"))
+    pivot = _safe_float(cpr_levels.get("pivot"))
+    r3  = _safe_float(camarilla_levels.get("r3"))
+    r4  = _safe_float(camarilla_levels.get("r4"))
+    s3  = _safe_float(camarilla_levels.get("s3"))
+    s4  = _safe_float(camarilla_levels.get("s4"))
+
+    atr = _safe_float(atr_value) if atr_value is not None else None
+    day_range = prev_high - prev_low if prev_high and prev_low else 0.0
+    ref_unit  = atr if (atr and atr > 0) else max(day_range, 1.0)
+
+    # ── 1. CPR width → day type prediction ───────────────────────────────────
+    cpr_width_raw = None
+    day_type_pred = "NEUTRAL"
+    if tc is not None and bc is not None:
+        cpr_width_raw = tc - bc
+        width_ratio   = cpr_width_raw / ref_unit if ref_unit > 0 else 0
+        if width_ratio < 0.25:
+            day_type_pred = "TRENDING"
+            reasons.append(f"NARROW_CPR({width_ratio:.2f}x) → trending day predicted")
+        elif width_ratio > 0.80:
+            day_type_pred = "RANGE"
+            reasons.append(f"WIDE_CPR({width_ratio:.2f}x) → range/choppy day predicted")
+        else:
+            reasons.append(f"NORMAL_CPR({width_ratio:.2f}x) → neutral day")
+
+    # ── 2. Camarilla close position → directional bias ────────────────────────
+    if r3 is not None and s3 is not None:
+        if prev_close > r3:
+            bullish_pts += 3
+            reasons.append(f"CLOSE_ABOVE_R3({prev_close:.0f}>{r3:.0f}) → bullish bias")
+        elif prev_close < s3:
+            bearish_pts += 3
+            reasons.append(f"CLOSE_BELOW_S3({prev_close:.0f}<{s3:.0f}) → bearish bias")
+        else:
+            reasons.append(f"CLOSE_IN_RANGE({s3:.0f}–{r3:.0f}) → no clear Camarilla bias")
+
+    if r4 is not None and s4 is not None:
+        if prev_close > r4:
+            bullish_pts += 2
+            reasons.append(f"CLOSE_ABOVE_R4({prev_close:.0f}>{r4:.0f}) → strong bullish breakout")
+        elif prev_close < s4:
+            bearish_pts += 2
+            reasons.append(f"CLOSE_BELOW_S4({prev_close:.0f}<{s4:.0f}) → strong bearish breakdown")
+
+    # ── 3. CPR position — close vs pivot ─────────────────────────────────────
+    if pivot is not None:
+        if prev_close > pivot:
+            bullish_pts += 1
+            reasons.append(f"CLOSE_ABOVE_PIVOT({prev_close:.0f}>{pivot:.0f})")
+        elif prev_close < pivot:
+            bearish_pts += 1
+            reasons.append(f"CLOSE_BELOW_PIVOT({prev_close:.0f}<{pivot:.0f})")
+
+    # ── 4. Balance zone inference (price-based VAH/VAL proxy) ────────────────
+    # The middle 60% of the prior day's range represents accepted value.
+    # A close outside this zone = imbalance → directional momentum expected.
+    if day_range > 0:
+        val_proxy = prev_low  + 0.20 * day_range   # lower boundary of 60% zone
+        vah_proxy = prev_high - 0.20 * day_range   # upper boundary of 60% zone
+        if prev_close > vah_proxy:
+            bullish_pts += 2
+            reasons.append(
+                f"CLOSE_ABOVE_VALUE_AREA({prev_close:.0f}>{vah_proxy:.0f}) → imbalance bullish"
+            )
+        elif prev_close < val_proxy:
+            bearish_pts += 2
+            reasons.append(
+                f"CLOSE_BELOW_VALUE_AREA({prev_close:.0f}<{val_proxy:.0f}) → imbalance bearish"
+            )
+        else:
+            reasons.append(f"CLOSE_IN_VALUE_AREA → balanced, range likely")
+
+    # ── 5. Prior-day compression at close → opening momentum prediction ───────
+    if compression_state_at_close == "ENERGY_BUILDUP":
+        reasons.append(
+            "COMPRESSION_AT_CLOSE → explosive opening move likely "
+            "(direction from Camarilla bias)"
+        )
+        # Amplify whichever directional bias already leads
+        if bullish_pts > bearish_pts:
+            bullish_pts += 2
+        elif bearish_pts > bullish_pts:
+            bearish_pts += 2
+        else:
+            bullish_pts += 1   # tie → slight bullish default (market usually up-biased)
+
+    # ── 6. Determine sentiment ────────────────────────────────────────────────
+    total_pts = bullish_pts + bearish_pts
+    if total_pts == 0:
+        sentiment      = "NEUTRAL"
+        preferred_side = None
+        confidence     = 0.0
+    elif bullish_pts > bearish_pts:
+        sentiment      = "BULLISH"
+        preferred_side = "CALL"
+        confidence     = round(100.0 * bullish_pts / total_pts, 1)
+    elif bearish_pts > bullish_pts:
+        sentiment      = "BEARISH"
+        preferred_side = "PUT"
+        confidence     = round(100.0 * bearish_pts / total_pts, 1)
+    else:
+        sentiment      = "NEUTRAL"
+        preferred_side = None
+        confidence     = 50.0
+
+    # ── 7. Map sentiment → scoring adjustments ────────────────────────────────
+    if day_type_pred == "TRENDING":
+        threshold_adj = -5    # easier entries on trending days
+        max_hold_adj  = +2    # hold longer in trending conditions
+    elif day_type_pred == "RANGE":
+        threshold_adj = +8    # harder entries — need stronger confirmation
+        max_hold_adj  = -3    # exit sooner before reversal
+    else:
+        threshold_adj = 0
+        max_hold_adj  = 0
+
+    if sentiment == "NEUTRAL":
+        threshold_adj += 3    # extra caution on neutral sentiment
+
+    result = {
+        "sentiment":       sentiment,
+        "confidence":      confidence,
+        "preferred_side":  preferred_side,
+        "day_type_pred":   day_type_pred,
+        "threshold_adj":   threshold_adj,
+        "max_hold_adj":    max_hold_adj,
+        "bullish_pts":     bullish_pts,
+        "bearish_pts":     bearish_pts,
+        "reasons":         reasons,
+    }
+
+    logging.info(
+        f"[DAILY_SENTIMENT] sentiment={sentiment} confidence={confidence:.0f}% "
+        f"preferred_side={preferred_side} day_type_pred={day_type_pred} "
+        f"threshold_adj={threshold_adj:+d} max_hold_adj={max_hold_adj:+d} "
+        f"bull_pts={bullish_pts} bear_pts={bearish_pts} "
+        f"reasons={' | '.join(reasons)}"
+    )
     return result

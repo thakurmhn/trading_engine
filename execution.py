@@ -58,6 +58,15 @@ SCALP_SL_POINTS = 4.0
 SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
 STARTUP_SUPPRESSION_MINUTES = 5
+# P3-C: Paper mode slippage — models bid/ask spread + market impact on fills.
+# Applied to ENTRY price in paper mode so paper P&L reflects realistic fills.
+# Set to 0.0 to disable. Recommended: 4.0 pts for NIFTY ITM options.
+PAPER_SLIPPAGE_POINTS = 4.0
+# P2-D: Trade class labels — ensures scalp_mode never bleeds into trend trades.
+TRADE_CLASS_SCALP = "SCALP"
+TRADE_CLASS_TREND = "TREND"
+# P2-C: Partial TG exit — fraction of quantity exited at first TG hit.
+PARTIAL_TG_QTY_FRAC = 0.50
 RESTART_STATE_VERSION = 1
 DEFAULT_TIME_EXIT_CANDLES = 8
 DEFAULT_OSC_RSI_CALL = 75.0
@@ -1032,7 +1041,7 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     hf_mgr = state.get("hf_exit_manager")
     if hf_mgr is not None:
         try:
-            if hf_mgr.check_exit(current_ltp, timestamp, current_volume=option_volume):
+            if hf_mgr.check_exit(current_ltp, timestamp, current_volume=option_volume, bars_held=bars_held):
                 hf_reason = hf_mgr.last_reason or "HF_EXIT"
                 if hf_reason == "MOMENTUM_EXHAUSTION" and bars_held < 2:
                     logging.info(
@@ -1064,23 +1073,30 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         )
         return True, "SL_HIT"
 
-    # 2B) Momentum scalp exits (only for scalp trades, no min-bar gate)
+    # 2B) Momentum scalp exits — only for SCALP trade class (P1-B / P2-D).
+    # HFT override (step 1) always runs first; scalp exits run after hard SL.
+    # Trend trades (trade_class=TREND) NEVER enter this block — scalp_mode is
+    # set to True only during momentum scalp entry in paper_order / live_order.
     if state.get("scalp_mode", False):
         scalp_pt = float(state.get("scalp_pt_points", SCALP_PT_POINTS))
         scalp_sl = float(state.get("scalp_sl_points", SCALP_SL_POINTS))
         premium_move = float(current_ltp - entry_price)
+        logging.debug(
+            f"[SCALP_OVERRIDE] trade_class={state.get('trade_class', TRADE_CLASS_SCALP)} "
+            f"premium_move={premium_move:.2f} scalp_pt={scalp_pt:.2f} scalp_sl={scalp_sl:.2f}"
+        )
         if premium_move >= scalp_pt:
             audit("SCALP_PT_HIT", "SCALP_PT_HIT", f"premium_move>={scalp_pt:.2f}", premium_move=premium_move)
             logging.info(
-                f"{GREEN}[EXIT][SCALP_PT_HIT] {side} premium_move={premium_move:.2f} "
-                f"target={scalp_pt:.2f} ltp={current_ltp:.2f}{RESET}"
+                f"{GREEN}[EXIT][SCALP_PT_HIT][SCALP_OVERRIDE] {side} "
+                f"premium_move={premium_move:.2f} target={scalp_pt:.2f} ltp={current_ltp:.2f}{RESET}"
             )
             return True, "SCALP_PT_HIT"
         if premium_move <= -scalp_sl:
             audit("SCALP_SL_HIT", "SCALP_SL_HIT", f"premium_move<=-{scalp_sl:.2f}", premium_move=premium_move)
             logging.info(
-                f"{RED}[EXIT][SCALP_SL_HIT] {side} premium_move={premium_move:.2f} "
-                f"stop=-{scalp_sl:.2f} ltp={current_ltp:.2f}{RESET}"
+                f"{RED}[EXIT][SCALP_SL_HIT][SCALP_OVERRIDE] {side} "
+                f"premium_move={premium_move:.2f} stop=-{scalp_sl:.2f} ltp={current_ltp:.2f}{RESET}"
             )
             return True, "SCALP_SL_HIT"
         return False, None
@@ -1120,11 +1136,31 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         return False, None
 
     if tg_hit:
-        audit("TG", "TARGET_HIT", f"ltp>={tg:.2f}")
-        logging.info(
-            f"{GREEN}[EXIT][TG_HIT] {side} ltp={current_ltp:.2f} tg={tg:.2f} bars_held={bars_held}{RESET}"
-        )
-        return True, "TARGET_HIT"
+        # P2-C: Partial TG exit — first TG hit exits 50% of quantity.
+        # The remaining 50% continues with SL ratcheted to TG (break-even+).
+        # On second trigger (full_tg_booked=True already consumed), full exit.
+        if not state.get("partial_tg_booked", False):
+            partial_qty = max(1, int(state.get("quantity", 0) * PARTIAL_TG_QTY_FRAC))
+            state["partial_tg_booked"] = True
+            state["partial_tg_qty"]    = partial_qty
+            state["stop"]              = tg   # ratchet SL to TG level
+            state["pt_deferred_logged"] = 0
+            audit("TG", "TG_PARTIAL_EXIT", f"ltp>={tg:.2f} qty={partial_qty}")
+            logging.info(
+                f"{GREEN}[EXIT][PARTIAL_EXIT][TG] {side} ltp={current_ltp:.2f} "
+                f"tg={tg:.2f} partial_qty={partial_qty} "
+                f"remaining_qty={state.get('quantity', 0) - partial_qty} "
+                f"SL_ratcheted_to={tg:.2f} bars_held={bars_held}{RESET}"
+            )
+            return True, "TG_PARTIAL_EXIT"
+        else:
+            # Remaining 50% has now run beyond TG — full close
+            audit("TG", "TARGET_HIT", f"ltp>={tg:.2f} full_exit")
+            logging.info(
+                f"{GREEN}[EXIT][TG_HIT][FULL] {side} ltp={current_ltp:.2f} "
+                f"tg={tg:.2f} bars_held={bars_held}{RESET}"
+            )
+            return True, "TARGET_HIT"
 
     if pt_hit and bars_held >= min_bars_for_pt_tg:
         audit("PT", "PT_HIT", f"ltp>={pt:.2f}")
@@ -1847,7 +1883,59 @@ def process_order(state, df_slice, info, spot_price,
         state["exit_check_count"] = check_count + 1
         return False, None
 
-    # --- Route exit order ---
+    # P2-C: Partial TG exit — route only the partial quantity; keep position open
+    if exit_reason == "TG_PARTIAL_EXIT":
+        partial_qty = state.get("partial_tg_qty", max(1, qty // 2))
+        remaining   = max(0, qty - partial_qty)
+
+        if account_type.lower() == "paper":
+            success, order_id = send_paper_exit_order(symbol, partial_qty, exit_reason)
+        elif mode == "LIVE":
+            success, order_id = send_live_exit_order(symbol, partial_qty, exit_reason)
+        else:
+            success, order_id = True, "REPLAY_PARTIAL"
+
+        if success:
+            exit_price  = current_option_price if current_option_price else current_candle["close"]
+            # P3-C: apply paper slippage to partial exit (conservative — exit gets worse fill)
+            if account_type.lower() == "paper":
+                raw_exit = exit_price
+                exit_price = max(0.05, exit_price - PAPER_SLIPPAGE_POINTS)
+                logging.debug(
+                    f"[SLIPPAGE_MODELED] PARTIAL_EXIT raw={raw_exit:.2f} "
+                    f"slippage=-{PAPER_SLIPPAGE_POINTS:.1f} "
+                    f"effective={exit_price:.2f} qty={partial_qty}"
+                )
+            pnl_points  = exit_price - entry
+            pnl_value   = pnl_points * partial_qty
+
+            trade = info["call_buy"] if side == "CALL" else info["put_buy"]
+            trade["pnl"]     += pnl_value
+            trade["quantity"] = remaining
+            info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
+
+            trade["filled_df"].loc[dt.now(time_zone)] = {
+                "ticker":      symbol,
+                "price":       exit_price,
+                "action":      "PARTIAL_EXIT",
+                "stop_price":  entry,
+                "take_profit": pnl_value,
+                "spot_price":  spot_price,
+                "quantity":    partial_qty,
+            }
+            logging.info(
+                f"{GREEN}[PARTIAL_EXIT][{account_type.upper()} TG_PARTIAL_EXIT] "
+                f"{side} {symbol} partial_qty={partial_qty} remaining_qty={remaining} "
+                f"Entry={entry:.2f} Exit={exit_price:.2f} PnL={pnl_value:.2f} "
+                f"SL_now={state.get('stop', 'N/A')} PositionId={position_id}{RESET}"
+            )
+            # Position stays OPEN with reduced quantity — SL was already ratcheted
+            # to TG level inside check_exit_condition before returning TG_PARTIAL_EXIT
+            if mode == "LIVE":
+                update_order_status(order_id, "PENDING", partial_qty, exit_price, symbol)
+        return success, exit_reason
+
+    # --- Route full exit order ---
     if account_type.lower() == "paper":
         success, order_id = send_paper_exit_order(symbol, qty, exit_reason)
     else:
@@ -1858,8 +1946,17 @@ def process_order(state, df_slice, info, spot_price,
             success, order_id = True, "REPLAY_ORDER"
 
     if success:
-        # FIX: Use the option's actual traded price (from df), not spot candle close
+        # Use the option's actual traded price (from df), not spot candle close
         exit_price = current_option_price if current_option_price else current_candle["close"]
+        # P3-C: apply paper slippage to paper exit fills
+        if account_type.lower() == "paper":
+            raw_exit = exit_price
+            exit_price = max(0.05, exit_price - PAPER_SLIPPAGE_POINTS)
+            logging.debug(
+                f"[SLIPPAGE_MODELED] FULL_EXIT raw={raw_exit:.2f} "
+                f"slippage=-{PAPER_SLIPPAGE_POINTS:.1f} "
+                f"effective={exit_price:.2f} qty={qty}"
+            )
         pnl_points = exit_price - entry
         pnl_value  = pnl_points * qty
 
@@ -1893,6 +1990,15 @@ def process_order(state, df_slice, info, spot_price,
         # Strict lifecycle transition OPEN -> HOLD -> EXIT.
         state["is_open"] = False
         state["lifecycle_state"] = "EXIT"
+
+        # P1-C: false-breakout cooldown — activate when a compression breakout trade closes at loss
+        if state.get("source") == "COMPRESSION_BREAKOUT" and pnl_value < 0:
+            _compression_state.notify_trade_result(is_loss=True)
+            logging.info(
+                f"[FALSE_BREAKOUT_COOLDOWN] Compression breakout trade closed at loss "
+                f"pnl={pnl_value:.2f} symbol={symbol} PositionId={position_id}"
+            )
+
         if state.get("scalp_mode", False):
             cooldown_until = dt.now(time_zone) + timedelta(minutes=SCALP_COOLDOWN_MINUTES)
             info["scalp_cooldown_until"] = cooldown_until
@@ -2139,45 +2245,48 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
             elif paper_info[scalp_leg].get("trade_flag", 0) == 0 and paper_info[scalp_leg].get("is_open", False) is False:
                 if paper_info.get("trade_count", 0) < paper_info.get("max_trades", MAX_TRADES_PER_DAY):
                     opt_name = scalp_sig["symbol"]
-                    entry_price = float(scalp_sig["price"])
+                    # P3-C: apply slippage — scalp entries also get worse fills
+                    entry_price = float(scalp_sig["price"]) + PAPER_SLIPPAGE_POINTS
                     stop = round(entry_price - SCALP_SL_POINTS, 2)
                     pt = round(entry_price + SCALP_PT_POINTS, 2)
                     position_id = f"scalp_{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
                     paper_info[scalp_leg].update({
-                        "option_name":     opt_name,
-                        "quantity":        quantity,
-                        "buy_price":       entry_price,
-                        "order_type":      ORDER_TYPE,
-                        "trade_flag":      1,
-                        "pnl":             0,
-                        "reason":          "MOMENTUM_SCALP",
-                        "source":          "MOMENTUM_SCALP",
-                        "order_id":        f"paper_scalp_{opt_name}_{ct}",
-                        "position_id":     position_id,
-                        "entry_time":      ct,
-                        "entry_candle":    len(candles_3m) - 1,
-                        "side":            scalp_side,
-                        "position_side":   _long_position_side(scalp_side),
-                        "stop":            stop,
-                        "pt":              pt,
-                        "tg":              pt,
-                        "trail_start":     0,
-                        "trail_step":      0,
-                        "trail_updates":   0,
-                        "consec_count":    0,
-                        "prev_gap":        0,
-                        "peak_momentum":   0,
-                        "peak_candle":     len(candles_3m) - 1,
-                        "plateau_count":   0,
-                        "atr_value":       atr,
-                        "regime_context":  "SCALP",
-                        "is_open":         True,
-                        "lifecycle_state": "OPEN",
-                        "scalp_mode":      True,
-                        "scalp_pt_points": SCALP_PT_POINTS,
-                        "scalp_sl_points": SCALP_SL_POINTS,
-                        "partial_booked":  False,
-                        "hf_exit_manager": OptionExitManager(
+                        "option_name":       opt_name,
+                        "quantity":          quantity,
+                        "buy_price":         entry_price,
+                        "order_type":        ORDER_TYPE,
+                        "trade_flag":        1,
+                        "pnl":               0,
+                        "reason":            "MOMENTUM_SCALP",
+                        "source":            "MOMENTUM_SCALP",
+                        "order_id":          f"paper_scalp_{opt_name}_{ct}",
+                        "position_id":       position_id,
+                        "entry_time":        ct,
+                        "entry_candle":      len(candles_3m) - 1,
+                        "side":              scalp_side,
+                        "position_side":     _long_position_side(scalp_side),
+                        "stop":              stop,
+                        "pt":                pt,
+                        "tg":                pt,
+                        "trail_start":       0,
+                        "trail_step":        0,
+                        "trail_updates":     0,
+                        "consec_count":      0,
+                        "prev_gap":          0,
+                        "peak_momentum":     0,
+                        "peak_candle":       len(candles_3m) - 1,
+                        "plateau_count":     0,
+                        "atr_value":         atr,
+                        "regime_context":    "SCALP",
+                        "is_open":           True,
+                        "lifecycle_state":   "OPEN",
+                        "scalp_mode":        True,   # P2-D: only SCALP class gets this
+                        "trade_class":       TRADE_CLASS_SCALP,
+                        "scalp_pt_points":   SCALP_PT_POINTS,
+                        "scalp_sl_points":   SCALP_SL_POINTS,
+                        "partial_booked":    False,
+                        "partial_tg_booked": False,
+                        "hf_exit_manager":   OptionExitManager(
                             entry_price=entry_price,
                             side=scalp_side,
                             risk_buffer=1.0,
@@ -2199,6 +2308,11 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"[SCALP ENTRY][PAPER] {scalp_side} {opt_name} @ {entry_price:.2f} "
                         f"PT=+{SCALP_PT_POINTS:.1f} SL=-{SCALP_SL_POINTS:.1f} "
                         f"reason={scalp_sig['reason']} position_id={position_id}"
+                    )
+                    logging.info(
+                        f"[SCALP_TRADE] class={TRADE_CLASS_SCALP} side={scalp_side} "
+                        f"symbol={opt_name} scalp_mode=True trend_mode=False "
+                        f"position_id={position_id}"
                     )
                     logging.info(
                         "[ENTRY][NEW] "
@@ -2323,7 +2437,11 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     try:
         if paper_info[leg]["trade_flag"] == 0:
             if paper_info.get("trade_count", 0) >= paper_info.get("max_trades", MAX_TRADES_PER_DAY):
-                logging.info("[ENTRY SKIP] Max trades reached")
+                logging.info(
+                    f"[MAX_TRADES_CAP] trade_count={paper_info.get('trade_count', 0)} "
+                    f"max_trades={paper_info.get('max_trades', MAX_TRADES_PER_DAY)} "
+                    f"side={side} — entry blocked"
+                )
             else:
                 opt_type = "CE" if side == "CALL" else "PE"
                 opt_name, strike = get_option_by_moneyness(
@@ -2333,12 +2451,19 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
 
                 if opt_name and opt_name in df.index:
                     ltp_val = df.loc[opt_name, "ltp"]
-                    entry_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                    raw_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                    # P3-C: apply slippage to paper entry fills (models bid-ask spread)
+                    entry_price = raw_price + PAPER_SLIPPAGE_POINTS
+                    logging.debug(
+                        f"[SLIPPAGE_MODELED] ENTRY raw={raw_price:.2f} "
+                        f"slippage=+{PAPER_SLIPPAGE_POINTS:.1f} "
+                        f"effective={entry_price:.2f} side={side}"
+                    )
                     if not entry_price or entry_price <= 0:
                         logging.warning(f"[ENTRY SKIP] invalid entry_price={entry_price}")
                         return
 
-                    # FIX: pass candles_df so build_dynamic_levels can resolve entry candle
+                    # pass candles_df so build_dynamic_levels can resolve entry candle
                     levels = build_dynamic_levels(
                         entry_price, atr, side,
                         entry_candle=len(candles_3m) - 1,
@@ -2366,43 +2491,44 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     else:
                         regime_context = "EXTREME"
 
-                    # FIX: all required exit-state keys initialised
                     position_id = f"{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
                     paper_info[leg].update({
-                        "option_name":    opt_name,
-                        "quantity":       quantity,
-                        "buy_price":      entry_price,
-                        "order_type":     ORDER_TYPE,
-                        "trade_flag":     1,
-                        "pnl":            0,
-                        "reason":         reason,
-                        "source":         source,
-                        "order_id":       f"paper_{opt_name}_{ct}",
-                        "position_id":    position_id,
-                        "entry_time":     ct,
-                        "entry_candle":   len(candles_3m) - 1,
-                        "side":           side,
-                        "position_side":  _long_position_side(side),
-                        "stop":           stop,
-                        "pt":             pt,
-                        "tg":             tg,
-                        "trail_start":    trail_start,
-                        "trail_step":     trail_step,
-                        "trail_updates":  0,
-                        "consec_count":   0,
-                        "prev_gap":       0,
-                        "peak_momentum":  0,
-                        "peak_candle":    len(candles_3m) - 1,
-                        "plateau_count":  0,
-                        "atr_value":      atr,
-                        "regime_context": regime_context,
-                        "is_open":        True,
-                        "lifecycle_state": "OPEN",
-                        "scalp_mode":     False,
-                        "scalp_pt_points": SCALP_PT_POINTS,
-                        "scalp_sl_points": SCALP_SL_POINTS,
-                        "partial_booked": False,
-                        "hf_exit_manager": OptionExitManager(
+                        "option_name":       opt_name,
+                        "quantity":          quantity,
+                        "buy_price":         entry_price,
+                        "order_type":        ORDER_TYPE,
+                        "trade_flag":        1,
+                        "pnl":               0,
+                        "reason":            reason,
+                        "source":            source,
+                        "order_id":          f"paper_{opt_name}_{ct}",
+                        "position_id":       position_id,
+                        "entry_time":        ct,
+                        "entry_candle":      len(candles_3m) - 1,
+                        "side":              side,
+                        "position_side":     _long_position_side(side),
+                        "stop":              stop,
+                        "pt":                pt,
+                        "tg":                tg,
+                        "trail_start":       trail_start,
+                        "trail_step":        trail_step,
+                        "trail_updates":     0,
+                        "consec_count":      0,
+                        "prev_gap":          0,
+                        "peak_momentum":     0,
+                        "peak_candle":       len(candles_3m) - 1,
+                        "plateau_count":     0,
+                        "atr_value":         atr,
+                        "regime_context":    regime_context,
+                        "is_open":           True,
+                        "lifecycle_state":   "OPEN",
+                        "scalp_mode":        False,   # P2-D: TREND class never uses scalp exits
+                        "trade_class":       TRADE_CLASS_TREND,
+                        "scalp_pt_points":   SCALP_PT_POINTS,
+                        "scalp_sl_points":   SCALP_SL_POINTS,
+                        "partial_booked":    False,
+                        "partial_tg_booked": False,   # P2-C: partial TG exit tracking
+                        "hf_exit_manager":   OptionExitManager(
                             entry_price=entry_price,
                             side=side,
                             risk_buffer=1.0,
@@ -2637,6 +2763,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                             f"reason={scalp_sig['reason']} position_id={position_id}"
                         )
                         logging.info(
+                            f"[SCALP_TRADE] class={TRADE_CLASS_SCALP} side={scalp_side} "
+                            f"symbol={opt_name} scalp_mode=True trend_mode=False "
+                            f"position_id={position_id}"
+                        )
+                        logging.info(
                             "[ENTRY][NEW] "
                             f"timestamp={ct} symbol={opt_name} option_type={scalp_side} "
                             f"position_side={live_info[scalp_leg].get('position_side', 'LONG')} "
@@ -2758,7 +2889,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     try:
         if live_info[leg]["trade_flag"] == 0:
             if live_info.get("trade_count", 0) >= live_info.get("max_trades", MAX_TRADES_PER_DAY):
-                logging.info("[ENTRY SKIP] Max trades reached")
+                logging.info(
+                    f"[MAX_TRADES_CAP] trade_count={live_info.get('trade_count', 0)} "
+                    f"max_trades={live_info.get('max_trades', MAX_TRADES_PER_DAY)} "
+                    f"side={side} — entry blocked"
+                )
                 return
 
             opt_type = "CE" if side == "CALL" else "PE"

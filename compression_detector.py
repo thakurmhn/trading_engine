@@ -210,16 +210,51 @@ class CompressionState:
             state.consume_entry()
         elif state.has_entry:
             state.consume_entry()   # stale — position already open
+
+        # P1-C: After trade closes, notify the state machine of the result so
+        # the false-breakout cooldown can be activated on losses.
+        state.notify_trade_result(is_loss=True)
     """
 
+    # P1-C: Number of 15m bars to suppress new compression signals after a
+    # confirmed false breakout (trade exited at a loss). This prevents whipsaw
+    # re-entries during elevated post-expansion volatility.
+    FALSE_BREAKOUT_COOLDOWN_BARS: int = 5
+
     def __init__(self):
-        self.market_state: str           = "NEUTRAL"
+        self.market_state: str            = "NEUTRAL"
         self.zone:         Optional[dict] = None
         self.entry_signal: Optional[dict] = None
+        self._cooldown_bars_remaining: int = 0   # P1-C
 
     @property
     def has_entry(self) -> bool:
         return self.entry_signal is not None
+
+    @property
+    def cooldown_active(self) -> bool:
+        """True when false-breakout suppression is in effect."""
+        return self._cooldown_bars_remaining > 0
+
+    def notify_trade_result(self, is_loss: bool) -> None:
+        """Call after any compression-breakout trade is closed.
+
+        If the trade was a loss (false breakout), activates a cooldown that
+        suppresses new ENERGY_BUILDUP detection for FALSE_BREAKOUT_COOLDOWN_BARS
+        bars.  Wins do not trigger a cooldown — the market may continue.
+
+        Parameters
+        ----------
+        is_loss:
+            True when the trade was closed at a net loss (P&L < 0).
+        """
+        if is_loss:
+            self._cooldown_bars_remaining = self.FALSE_BREAKOUT_COOLDOWN_BARS
+            logging.info(
+                f"{YELLOW}[FALSE_BREAKOUT_COOLDOWN] "
+                f"Activated for {self.FALSE_BREAKOUT_COOLDOWN_BARS} bars. "
+                f"New compression signals suppressed to avoid whipsaw re-entry.{RESET}"
+            )
 
     def consume_entry(self) -> None:
         """Call after dispatching (or discarding) the entry signal."""
@@ -232,11 +267,14 @@ class CompressionState:
         Advance the state machine by one 15m bar.
 
         Transitions:
-          NEUTRAL        → detect_compression → ENERGY_BUILDUP (if zone found)
+          NEUTRAL        → detect_compression → ENERGY_BUILDUP (if zone found, no cooldown)
           ENERGY_BUILDUP → detect_expansion   → VOLATILITY_EXPANSION (if breakout)
                          → detect_compression → ENERGY_BUILDUP (still compressed)
                          → (else)             → NEUTRAL (zone dissolved)
           VOLATILITY_EXPANSION → entry_signal held; caller must call consume_entry()
+
+        P1-C: In NEUTRAL state, if false-breakout cooldown is active, the bar is
+        counted down and compression detection is skipped for that period.
         """
         if df_15m is None or df_15m.empty:
             return
@@ -244,6 +282,17 @@ class CompressionState:
         if self.market_state == "NEUTRAL":
             if len(df_15m) < 3:
                 return
+
+            # P1-C: decrement cooldown counter each bar while suppressed
+            if self._cooldown_bars_remaining > 0:
+                self._cooldown_bars_remaining -= 1
+                logging.info(
+                    f"{YELLOW}[FALSE_BREAKOUT_COOLDOWN] "
+                    f"Suppressing compression detection. "
+                    f"bars_remaining={self._cooldown_bars_remaining}{RESET}"
+                )
+                return
+
             zone = detect_compression(df_15m)
             if zone:
                 self.zone         = zone
@@ -288,3 +337,66 @@ class CompressionState:
                     self.zone         = None
 
         # VOLATILITY_EXPANSION: entry_signal held for caller to consume
+
+    def predict_opening_expansion(self) -> dict:
+        """Forecast whether a volatility expansion is likely at market open.
+
+        If the state machine is in ENERGY_BUILDUP, compression energy has been
+        accumulating and an explosive move within 2–3 bars (30–45 min) is
+        probable.  Higher compression_strength raises confidence.
+
+        Returns
+        -------
+        dict with keys:
+            forecast     : "EXPANSION_LIKELY" | "EXPANSION_UNLIKELY"
+            confidence   : float 0-100
+            market_state : current market_state string
+            zone         : compression zone dict or None
+            reasons      : list[str]
+        """
+        reasons: list = []
+
+        if self.market_state == "ENERGY_BUILDUP" and self.zone is not None:
+            strength = self.zone.get("compression_strength", 0.0)
+            if strength >= 3.0:
+                confidence = 85.0
+            elif strength >= 2.0:
+                confidence = 70.0
+            else:
+                confidence = 55.0
+
+            forecast = "EXPANSION_LIKELY"
+            reasons.append(
+                f"ENERGY_BUILDUP state, compression_strength={strength:.1f}x ATR "
+                f"→ VOLATILITY_EXPANSION expected within 2–3 bars (30–45 min)"
+            )
+            reasons.append(
+                f"Compression zone: {self.zone['compression_low']:.2f}"
+                f"–{self.zone['compression_high']:.2f}"
+            )
+            logging.info(
+                f"{CYAN}[COMPRESSION_FORECAST] "
+                f"state=ENERGY_BUILDUP → EXPANSION_LIKELY "
+                f"confidence={confidence:.0f}% "
+                f"strength={strength:.1f}x "
+                f"zone={self.zone['compression_low']:.2f}"
+                f"–{self.zone['compression_high']:.2f}{RESET}"
+            )
+        else:
+            confidence = 0.0
+            forecast = "EXPANSION_UNLIKELY"
+            reasons.append(
+                f"market_state={self.market_state} → no energy buildup at close, "
+                f"normal open expected"
+            )
+            logging.debug(
+                f"[COMPRESSION_FORECAST] state={self.market_state} → EXPANSION_UNLIKELY"
+            )
+
+        return {
+            "forecast":     forecast,
+            "confidence":   confidence,
+            "market_state": self.market_state,
+            "zone":         self.zone,
+            "reasons":      reasons,
+        }
