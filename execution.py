@@ -15,6 +15,8 @@ from config import (
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
     MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE, symbols,
     TREND_ENTRY_ADX_MIN,
+    SLOPE_ADX_GATE,
+    TIME_SLOPE_ADX_GATE,
 )
 from setup import (
     df, fyers, ticker, option_chain, spot_price,
@@ -39,8 +41,17 @@ from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
 from position_manager import make_replay_pm
 from option_exit_manager import OptionExitManager
 from day_type import (make_day_type_classifier, apply_day_type_to_pm,
-                      DayType, DayTypeResult)
+                      DayType, DayTypeResult, DayTypeClassifier)
 from compression_detector import CompressionState
+from reversal_detector import detect_reversal
+from failed_breakout_detector import detect_failed_breakout
+from zone_detector import (
+    detect_zones,
+    load_zones,
+    save_zones,
+    update_zone_activity,
+    detect_zone_revisit,
+)
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -52,9 +63,20 @@ MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
-# ===== Momentum scalp settings =====
+
+def log_entry_green(msg: str) -> None:
+    """Emit entry-path logs in green while preserving message payload."""
+    logging.info(f"{GREEN}{msg}{RESET}")
+
+# ===== Dip/Rally scalp settings =====
 SCALP_PT_POINTS = 7.0
 SCALP_SL_POINTS = 4.0
+SCALP_MIN_HOLD_BARS = 2
+SCALP_EXTREME_MOVE_ATR_MULT = 0.90
+SCALP_ATR_SL_MIN_MULT = 0.04
+SCALP_ATR_SL_MAX_MULT = 0.12
+TREND_MIN_HOLD_BARS = 3
+TREND_EXTREME_MOVE_ATR_MULT = 1.15
 SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
 STARTUP_SUPPRESSION_MINUTES = 5
@@ -75,6 +97,8 @@ DEFAULT_OSC_CCI_CALL = 130.0
 DEFAULT_OSC_CCI_PUT = -130.0
 DEFAULT_OSC_WR_CALL = -10.0
 DEFAULT_OSC_WR_PUT = -88.0
+EMA_STRETCH_BLOCK_MULT = 3.0
+EMA_STRETCH_TAG_MULT = 2.0
 
 #===========================================================
 # Initalize filled_df
@@ -89,6 +113,11 @@ except NameError:
 today_str = datetime.now().strftime("%Y-%m-%d")
 
 _compression_state = CompressionState()   # for paper_order / live_order
+
+_paper_dtc = None        # DayTypeClassifier for paper_order per-session
+_paper_dtc_date = ""     # date guard for daily reset
+_live_dtc = None         # DayTypeClassifier for live_order per-session
+_live_dtc_date = ""      # date guard for daily reset
 
 def map_status_code(code):
     status_map = {
@@ -355,6 +384,7 @@ def _validate_restored_positions_on_startup(
     cpr_pre = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
     cam_pre = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
 
+    _rev_sig_gate = detect_reversal(candles_3m, cam_pre, current_time=now_ts)
     quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
         candles_3m=candles_3m,
         candles_15m=candles_15m if candles_15m is not None else pd.DataFrame(),
@@ -363,6 +393,9 @@ def _validate_restored_positions_on_startup(
         adx_min=float(TREND_ENTRY_ADX_MIN),
         cpr_levels=cpr_pre,
         camarilla_levels=cam_pre,
+        reversal_signal=_rev_sig_gate,
+        day_type_result=None,
+        open_bias_context=None,
     )
 
     for leg, side in (("call_buy", "CALL"), ("put_buy", "PUT")):
@@ -523,115 +556,72 @@ def _get_option_market_snapshot(symbol, fallback_price):
     return option_price, max(0.0, option_volume)
 
 
-def _update_scalp_premium_history(info, side, price, ts):
-    """Store bounded premium history for momentum scalp detection."""
-    if "scalp_hist" not in info or not isinstance(info["scalp_hist"], dict):
-        info["scalp_hist"] = {"CALL": [], "PUT": []}
-    side_hist = info["scalp_hist"].setdefault(side, [])
-    ts_obj = pd.Timestamp(ts)
-    if ts_obj.tzinfo is None:
-        ts_obj = ts_obj.tz_localize(time_zone)
-    else:
-        ts_obj = ts_obj.tz_convert(time_zone)
-    side_hist.append({"ts": ts_obj, "price": float(price)})
-    if len(side_hist) > SCALP_HISTORY_MAXLEN:
-        trimmed = len(side_hist) - SCALP_HISTORY_MAXLEN
-        del side_hist[: len(side_hist) - SCALP_HISTORY_MAXLEN]
-        logging.debug(f"[SCALP HIST] side={side} trimmed={trimmed} maxlen={SCALP_HISTORY_MAXLEN}")
+def _detect_scalp_dip_rally_signal(candles_3m, traditional_levels, atr):
+    """Detect scalp opportunities with normalized long-option semantics.
 
-
-def _rsi_series(series, period=8):
-    """Lightweight RSI for premium momentum checks."""
-    s = pd.Series(series, dtype="float64")
-    diff = s.diff()
-    gain = diff.clip(lower=0).rolling(period, min_periods=period).mean()
-    loss = (-diff.clip(upper=0)).rolling(period, min_periods=period).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    return (100 - (100 / (1 + rs))).astype(float)
-
-
-def _detect_scalp_momentum_signal(info, spot_px, ts):
-    """Detect premium momentum burst on CALL/PUT candidates.
-
-    Trigger if premium expansion > baseline volatility and at least one
-    momentum trigger is true:
-      1) EMA gap/slope threshold,
-      2) ATR-like premium spike,
-      3) RSI momentum-zone cross.
+    CALL represents buy-on-dip of a CALL option (long premium).
+    PUT represents sell-on-rally setup executed as long PUT option (long premium).
     """
-    signals = []
-    for side, opt_side in [("CALL", "CE"), ("PUT", "PE")]:
-        opt_name, _ = get_option_by_moneyness(
-            spot_px,
-            opt_side,
-            moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS,
-        )
-        if not opt_name or opt_name not in df.index:
-            continue
-        ltp = df.loc[opt_name, "ltp"]
-        if ltp is None or (isinstance(ltp, float) and pd.isna(ltp)):
-            continue
-        px = float(ltp)
-        if px <= 0:
-            continue
-        _update_scalp_premium_history(info, side, px, ts)
-        hist = info.get("scalp_hist", {}).get(side, [])
-        if len(hist) < 10:
-            continue
-
-        s = pd.Series([x["price"] for x in hist], dtype="float64")
-        ret = s.diff().fillna(0.0)
-        baseline_vol = float(ret.tail(20).std(ddof=0)) if len(ret) >= 5 else 0.0
-        baseline_vol = max(0.25, baseline_vol)
-        expansion = abs(float(ret.iloc[-1])) > (1.1 * baseline_vol)
-
-        ema_fast = s.ewm(span=5, adjust=False).mean()
-        ema_slow = s.ewm(span=13, adjust=False).mean()
-        gap_now = float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
-        gap_prev = float(ema_fast.iloc[-2] - ema_slow.iloc[-2])
-        gap_slope = gap_now - gap_prev
-        gap_thr = max(0.5, 0.003 * float(s.iloc[-1]))
-
-        atr_like = float(ret.tail(5).abs().mean())
-        atr_base = float(ret.tail(20).abs().mean()) if len(ret) >= 20 else baseline_vol
-        atr_base = max(0.25, atr_base)
-        atr_spike = atr_like > (1.35 * atr_base)
-
-        rsi = _rsi_series(s, period=8)
-        rsi_now = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
-        rsi_prev = float(rsi.iloc[-2]) if not pd.isna(rsi.iloc[-2]) else 50.0
-
-        if side == "CALL":
-            ema_ok = gap_now > gap_thr and gap_slope > 0
-            osc_ok = rsi_prev <= 60 and rsi_now > 60
-            score = abs(gap_now)
-        else:
-            ema_ok = gap_now < -gap_thr and gap_slope < 0
-            osc_ok = rsi_prev >= 60 and rsi_now < 60
-            score = abs(gap_now)
-
-        if expansion and (ema_ok or atr_spike or osc_ok):
-            reasons = []
-            if ema_ok:
-                reasons.append("EMA_GAP")
-            if atr_spike:
-                reasons.append("ATR_SPIKE")
-            if osc_ok:
-                reasons.append("OSC_CROSS")
-            signals.append(
-                {
-                    "side": side,
-                    "symbol": opt_name,
-                    "price": px,
-                    "reason": "+".join(reasons),
-                    "score": score,
-                }
-            )
-
-    if not signals:
+    if len(candles_3m) < 2 or traditional_levels is None or atr is None or atr <= 0:
         return None
-    signals.sort(key=lambda x: x["score"], reverse=True)
-    return signals[0]
+
+    last = candles_3m.iloc[-1]
+    rng = last.high - last.low
+    if rng == 0:
+        return None
+
+    # Define support/resistance levels
+    s1 = traditional_levels.get("s1")
+    s2 = traditional_levels.get("s2")
+    p = traditional_levels.get("pivot")
+    r1 = traditional_levels.get("r1")
+    r2 = traditional_levels.get("r2")
+
+    atr_buf = 0.25 * atr  # Proximity buffer in underlying points
+
+    # CALL: Buy on dip at support
+    for level, name in [(s1, "S1"), (s2, "S2"), (p, "PIVOT")]:
+        if level and last.low <= level + atr_buf and (last.close - last.low) > 0.5 * rng:
+            # Touched support and rejected (closed in upper half)
+            sl_zone = level - (0.5 * atr)
+            logging.info(
+                f"[SCALP_BUY_DIP] side=CALL reason=REJECTION_{name} "
+                f"zone={name} level={level:.2f} atr={atr:.2f} sl_zone={sl_zone:.2f} "
+                "long=True"
+            )
+            return {
+                "side": "CALL",
+                "position_type": "LONG",
+                "reason": f"SCALP_BUY_DIP_{name}",
+                "tag": "SCALP_BUY_DIP",
+                "zone": name,
+                "level": float(level),
+                "sl_zone": float(sl_zone),
+                "stop": float(sl_zone),
+            }
+
+    # PUT: Sell on rally at resistance
+    for level, name in [(r1, "R1"), (r2, "R2"), (p, "PIVOT")]:
+        if level and last.high >= level - atr_buf and (last.high - last.close) > 0.5 * rng:
+            # Touched resistance and rejected (closed in lower half)
+            sl_zone = level + (0.5 * atr)
+            logging.info(
+                f"[SCALP_SELL_RALLY] side=PUT reason=REJECTION_{name} "
+                f"zone={name} level={level:.2f} atr={atr:.2f} sl_zone={sl_zone:.2f} "
+                "long=True"
+            )
+            return {
+                "side": "PUT",
+                "position_type": "LONG",
+                "reason": f"SCALP_SELL_RALLY_{name}",
+                "tag": "SCALP_SELL_RALLY",
+                "zone": name,
+                "level": float(level),
+                "sl_zone": float(sl_zone),
+                "stop": float(sl_zone),
+            }
+
+    return None
 
 
 def _can_enter_scalp(info, burst_key, now_ts):
@@ -744,6 +734,90 @@ def _long_position_side(option_type):
     return "LONG"
 
 
+def entry_gate_context(
+    allowed_side,
+    zone_tag,
+    gap_tag,
+    atr_stretch,
+    rsi_bounds,
+    cci_bounds,
+    day_type_result=None,
+    open_bias_context=None,
+):
+    """Merge day/opening context with oscillator zone context for entry gating."""
+    rsi_lo, rsi_hi = float(rsi_bounds[0]), float(rsi_bounds[1])
+    cci_lo, cci_hi = float(cci_bounds[0]), float(cci_bounds[1])
+
+    day_type_tag = "UNKNOWN"
+    if isinstance(day_type_result, str):
+        day_type_tag = day_type_result or "UNKNOWN"
+    elif day_type_result is not None:
+        day_type_tag = getattr(getattr(day_type_result, "name", None), "value", "UNKNOWN") or "UNKNOWN"
+
+    bias = "Neutral"
+    open_bias = "UNKNOWN"
+    if isinstance(open_bias_context, dict):
+        bias = str(open_bias_context.get("bias", "Neutral"))
+        open_bias = str(open_bias_context.get("open_bias", "UNKNOWN"))
+        ctx_gap = open_bias_context.get("gap_tag")
+        if ctx_gap:
+            gap_tag = str(ctx_gap)
+
+    if zone_tag == "ZoneA":
+        # Enforce default strict ceiling/floor, but preserve ATR-based expansion
+        # that was already applied before this call (rsi_bounds reflects it).
+        rsi_lo = max(rsi_lo, 30.0)
+        rsi_hi = min(rsi_hi, max(70.0, float(rsi_bounds[1])))   # keep ATR expansion
+        cci_lo = max(cci_lo, min(-150.0, float(cci_bounds[0])))  # keep ATR expansion
+        cci_hi = min(cci_hi, max(150.0, float(cci_bounds[1])))   # keep ATR expansion
+        osc_context = "ZoneA-Blocker"
+    elif zone_tag == "ZoneB":
+        rsi_lo = min(rsi_lo, 25.0)
+        rsi_hi = max(rsi_hi, 75.0)
+        cci_lo = min(cci_lo, -220.0)
+        cci_hi = max(cci_hi, 220.0)
+        osc_context = "ZoneB-Reversal"
+    else:
+        rsi_lo = min(rsi_lo, 20.0)
+        rsi_hi = max(rsi_hi, 80.0)
+        cci_lo = min(cci_lo, -260.0)
+        cci_hi = max(cci_hi, 260.0)
+        osc_context = "ZoneC-Continuation"
+
+    if gap_tag == "GAP_UP" and allowed_side == "CALL":
+        rsi_hi += 5.0
+        cci_hi += 30.0
+    elif gap_tag == "GAP_DOWN" and allowed_side == "PUT":
+        rsi_lo -= 5.0
+        cci_lo -= 30.0
+
+    if np.isfinite(atr_stretch) and atr_stretch >= 2.0:
+        if allowed_side == "CALL":
+            rsi_hi += 3.0
+            cci_hi += 20.0
+        elif allowed_side == "PUT":
+            rsi_lo -= 3.0
+            cci_lo -= 20.0
+
+    bias_upper = bias.upper()
+    bias_aligned = (
+        (allowed_side == "CALL" and (gap_tag == "GAP_UP" or "POSITIVE" in bias_upper))
+        or (allowed_side == "PUT" and (gap_tag == "GAP_DOWN" or "NEGATIVE" in bias_upper))
+    )
+
+    return {
+        "rsi_bounds": (float(rsi_lo), float(rsi_hi)),
+        "cci_bounds": (float(cci_lo), float(cci_hi)),
+        "osc_context": osc_context,
+        "zone_tag": zone_tag,
+        "day_type_tag": day_type_tag,
+        "open_bias": open_bias,
+        "bias": bias,
+        "gap_tag": gap_tag,
+        "bias_aligned": bool(bias_aligned),
+    }
+
+
 def _supertrend_alignment_gate(candles_3m, candles_15m, timestamp, symbol):
     """Validate 3m/15m Supertrend alignment before trend-signal scoring.
 
@@ -800,10 +874,10 @@ def _supertrend_alignment_gate(candles_3m, candles_15m, timestamp, symbol):
     )
     if not aligned:
         logging.info(
-            "[ENTRY BLOCKED][ST_CONFLICT] "
+            "[ENTRY DIAG][ST_CONFLICT_CANDIDATE] "
             f"timestamp={details['timestamp']} symbol={details['symbol']} "
             f"ST3m_bias={details['ST3m_bias']} ST15m_bias={details['ST15m_bias']} "
-            "reason=Supertrend bias conflict, entry suppressed."
+            "reason=Conflict candidate detected; evaluating overrides before blocking."
         )
 
     return aligned, allowed_side, details
@@ -815,12 +889,16 @@ def _trend_entry_quality_gate(
     timestamp,
     symbol,
     adx_min=18.0,
-    rsi_min=35.0,
-    rsi_max=65.0,
-    cci_min=-120.0,
-    cci_max=120.0,
+    rsi_min=30.0,
+    rsi_max=70.0,
+    cci_min=-150.0,
+    cci_max=150.0,
     cpr_levels=None,
     camarilla_levels=None,
+    reversal_signal=None,
+    failed_breakout_signal=None,
+    day_type_result=None,
+    open_bias_context=None,
 ):
     """Hard quality gate for trend entries.
 
@@ -830,7 +908,7 @@ def _trend_entry_quality_gate(
        15m slope is not checked.
     3) ADX must be > adx_min.
     4) Oscillators must not be in extremes:
-       RSI in [35, 65], CCI in [-120, 120].
+       RSI in [30, 70], CCI in [-150, 150] (default; widened from [35,65]/[-120,120]).
     """
     logging.info(
         "[ENTRY CONFIG] "
@@ -838,6 +916,11 @@ def _trend_entry_quality_gate(
         f"adx_min={adx_min} rsi_range=[{rsi_min},{rsi_max}] "
         f"cci_range=[{cci_min},{cci_max}]"
     )
+    _entry_log = globals().get("log_entry_green")
+    if not callable(_entry_log):
+        _entry_log = logging.info
+    _adx_gate_min = float(adx_min)
+    logging.info(f"[ENTRY GATE][TREND] Evaluating trend entry for {symbol} @ {timestamp}")
     aligned, allowed_side, st_details = _supertrend_alignment_gate(
         candles_3m=candles_3m,
         candles_15m=candles_15m,
@@ -882,7 +965,6 @@ def _trend_entry_quality_gate(
         and np.isfinite(rsi_val)
         and rsi_val < 30.0
         and close_below_s4
-        and cpr_width == "NARROW"
         and compressed_cam
     )
     osc_override_call = bool(
@@ -890,7 +972,6 @@ def _trend_entry_quality_gate(
         and np.isfinite(rsi_val)
         and rsi_val > 70.0
         and close_above_r4
-        and cpr_width == "NARROW"
         and compressed_cam
     )
     osc_override = bool(osc_override_put or osc_override_call)
@@ -914,64 +995,568 @@ def _trend_entry_quality_gate(
     )
 
     if not aligned:
+        candidate_side = None
+        if st_details.get("ST3m_bias") == "BULLISH":
+            candidate_side = "CALL"
+        elif st_details.get("ST3m_bias") == "BEARISH":
+            candidate_side = "PUT"
+        elif close_above_r4:
+            candidate_side = "CALL"
+        elif close_below_s4:
+            candidate_side = "PUT"
+
+        st_conflict_override = False
+        st_conflict_reason = None
+        if candidate_side and reversal_signal is not None:
+            if reversal_signal.get("side") == candidate_side and reversal_signal.get("score", 0) >= 55:
+                st_conflict_override = True
+                st_conflict_reason = (
+                    f"REVERSAL_OVERRIDE side={candidate_side} score={reversal_signal.get('score')}"
+                )
+        if not st_conflict_override and candidate_side == "CALL" and close_above_r4 and compressed_cam:
+            st_conflict_override = True
+            st_conflict_reason = "CPR_PIVOT_OVERRIDE CALL close_above_r4 with compressed_cam"
+        if not st_conflict_override and candidate_side == "PUT" and close_below_s4 and compressed_cam:
+            st_conflict_override = True
+            st_conflict_reason = "CPR_PIVOT_OVERRIDE PUT close_below_s4 with compressed_cam"
+        if not st_conflict_override and candidate_side and np.isfinite(adx_val) and adx_val >= _adx_gate_min + 6.0:
+            st_conflict_override = True
+            st_conflict_reason = f"ADX_OVERRIDE adx={adx_val:.1f} >= {_adx_gate_min + 6.0:.1f}"
+
+        if st_conflict_override:
+            allowed_side = candidate_side
+            st_details["st_conflict_override"] = True
+            st_details["st_conflict_override_reason"] = st_conflict_reason
+            _entry_log(
+                "[ENTRY ALLOWED][ST_CONFLICT_OVERRIDE] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"reason={st_conflict_reason}"
+            )
+        else:
+            logging.info(
+                "[ENTRY BLOCKED][ST_CONFLICT] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={candidate_side} "
+                "reason=Supertrend conflict, no override qualified."
+            )
+            return False, candidate_side, "Supertrend conflict, entry suppressed.", st_details
+
+    # Failed breakout governance:
+    # - block entries in failed breakout opposite direction
+    # - allow aligned reversal direction and tag for attribution
+    if isinstance(failed_breakout_signal, dict) and failed_breakout_signal.get("side") in {"CALL", "PUT"}:
+        fb_side = str(failed_breakout_signal.get("side"))
+        st_details["failed_breakout"] = True
+        st_details["failed_breakout_side"] = fb_side
+        st_details["failed_breakout_pivot"] = failed_breakout_signal.get("pivot", "")
+        st_details["failed_breakout_tag"] = failed_breakout_signal.get("tag", "FAILED_BREAKOUT_REVERSAL")
+        if allowed_side != fb_side:
+            logging.info(
+                "[ENTRY BLOCKED][FAILED_BREAKOUT_MISMATCH] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"failed_breakout_side={fb_side} pivot={st_details['failed_breakout_pivot']}"
+            )
+            return False, allowed_side, "Failed breakout opposite direction, entry suppressed.", st_details
         logging.info(
-            "[ENTRY BLOCKED][ST_CONFLICT] "
-            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            "reason=Supertrend conflict, entry suppressed."
+            "[FAILED_BREAKOUT][REVERSAL] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            f"pivot={st_details['failed_breakout_pivot']} tag={st_details['failed_breakout_tag']}"
         )
-        return False, allowed_side, "Supertrend conflict, entry suppressed.", st_details
 
     slope_ok_3m = (
         (st_details["ST3m_bias"] == "BULLISH" and str(st_details["ST3m_slope"]).upper() == "UP")
         or (st_details["ST3m_bias"] == "BEARISH" and str(st_details["ST3m_slope"]).upper() == "DOWN")
     )
     if not slope_ok_3m:
-        logging.info(
-            "[ENTRY BLOCKED][ST_SLOPE_CONFLICT] "
-            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']} "
-            "reason=3m slope does not confirm bias direction, entry suppressed."
-        )
-        return False, allowed_side, "3m slope does not confirm bias direction, entry suppressed.", st_details
+        # ── ST_SLOPE_CONFLICT override check ──────────────────────────────────
+        # Allow override when reversal detector strongly confirms direction OR
+        # when CPR compression + pivot breakout aligns with the trade side.
+        _slope_override_reason = None
+
+        # Path A: reversal signal aligned with allowed_side
+        if (reversal_signal is not None
+                and reversal_signal.get("side") == allowed_side
+                and reversal_signal.get("score", 0) >= 50):
+            _slope_override_reason = (
+                f"REVERSAL_OVERRIDE: reversal_score={reversal_signal['score']} "
+                f"strength={reversal_signal.get('strength')} "
+                f"pivot_zone={reversal_signal.get('pivot_zone')} "
+                f"osc_confirmed={reversal_signal.get('osc_confirmed')}"
+            )
+
+        # Path B: CPR compression + pivot breakout (NARROW CPR + close near R4/S4)
+        if _slope_override_reason is None:
+            if (cpr_width == "NARROW" and compressed_cam
+                    and allowed_side == "CALL" and close_above_r4):
+                _slope_override_reason = (
+                    "CPR_PIVOT_OVERRIDE: NARROW_CPR + compressed_cam + CALL close_above_r4"
+                )
+            elif (cpr_width == "NARROW" and compressed_cam
+                    and allowed_side == "PUT" and close_below_s4):
+                _slope_override_reason = (
+                    "CPR_PIVOT_OVERRIDE: NARROW_CPR + compressed_cam + PUT close_below_s4"
+                )
+
+        # Path C: weak-trend ADX gate — slope reading is unreliable in low-trend environments
+        # Below SLOPE_ADX_GATE, slope can flip randomly; block would suppress real signals.
+        _slope_adx_gate = float(globals().get("SLOPE_ADX_GATE", 17.0))
+        if _slope_override_reason is None and np.isfinite(adx_val) and adx_val < _slope_adx_gate:
+            _slope_override_reason = (
+                f"ADX_WEAK_SLOPE_GATE: adx={adx_val:.1f} < gate={_slope_adx_gate:.1f} "
+                "slope conflict suppressed in low-trend environment"
+            )
+
+        # Path D: time-based override — after 11:00 IST, flat slope acceptable if ADX < TIME_SLOPE_ADX_GATE
+        if _slope_override_reason is None:
+            try:
+                _ts_str = str(timestamp).replace("T", " ")
+                _ts_hour = int(_ts_str.split(" ")[-1].split(":")[0])
+            except (ValueError, IndexError):
+                _ts_hour = 0
+            _time_slope_gate = float(globals().get("TIME_SLOPE_ADX_GATE", 25.0))
+            if _ts_hour >= 11 and np.isfinite(adx_val) and adx_val < _time_slope_gate:
+                _slope_override_reason = (
+                    f"TIME_SLOPE_OVERRIDE: post-11:00 flat slope "
+                    f"adx={adx_val:.1f} < time_gate={_time_slope_gate:.1f}"
+                )
+
+        if _slope_override_reason:
+            _entry_log(
+                "[ENTRY ALLOWED][ST_SLOPE_OVERRIDE] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']} "
+                f"override_reason={_slope_override_reason}"
+            )
+            st_details["slope_override_reason"] = _slope_override_reason
+        else:
+            logging.info(
+                "[SLOPE_CONFLICT][3m] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']} "
+                "reason=3m slope does not confirm bias direction, entry suppressed."
+            )
+            logging.info(
+                "[ENTRY BLOCKED][ST_SLOPE_CONFLICT] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']}"
+            )
+            return False, allowed_side, "Slope mismatch, entry suppressed.", st_details
     logging.info(
-        "[ENTRY ALLOWED][ST_BIAS_OK] "
+        "[ENTRY CHECK][ST_BIAS_OK] "
         f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
         f"ST15m_bias={st_details['ST15m_bias']} ST3m_bias={st_details['ST3m_bias']} "
-        f"ST3m_slope={st_details['ST3m_slope']} "
-        "reason=15m/3m biases aligned and 3m slope confirmed."
+        f"ST3m_slope={st_details['ST3m_slope']}"
     )
 
-    if not np.isfinite(adx_val) or adx_val <= float(adx_min):
-        logging.info(
-            "[ENTRY BLOCKED][WEAK_ADX] "
-            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            f"ADX={adx_val} adx_min={adx_min} reason=Weak trend strength, entry suppressed."
-        )
-        return False, allowed_side, "Weak trend strength, entry suppressed.", st_details
+    if not np.isfinite(adx_val) or adx_val <= _adx_gate_min:
+        adx_override = False
+        adx_override_reason = None
+        if reversal_signal is not None and reversal_signal.get("side") == allowed_side and reversal_signal.get("score", 0) >= 60:
+            adx_override = True
+            adx_override_reason = f"REVERSAL_ADX_OVERRIDE score={reversal_signal.get('score')}"
+        elif allowed_side == "CALL" and close_above_r4 and compressed_cam:
+            adx_override = True
+            adx_override_reason = "CPR_PIVOT_ADX_OVERRIDE CALL close_above_r4 with compressed_cam"
+        elif allowed_side == "PUT" and close_below_s4 and compressed_cam:
+            adx_override = True
+            adx_override_reason = "CPR_PIVOT_ADX_OVERRIDE PUT close_below_s4 with compressed_cam"
 
-    if (
-        (np.isfinite(rsi_val) and (rsi_val < float(rsi_min) or rsi_val > float(rsi_max)))
-        or (np.isfinite(cci_val) and (cci_val < float(cci_min) or cci_val > float(cci_max)))
-    ):
-        if osc_override:
-            logging.info(
-                "[ENTRY ALLOWED][OSC_OVERRIDE_PIVOT_BREAK] "
+        if adx_override:
+            st_details["weak_adx_override"] = True
+            st_details["weak_adx_override_reason"] = adx_override_reason
+            _entry_log(
+                "[ENTRY ALLOWED][WEAK_ADX_OVERRIDE] "
                 f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-                f"close={close_val} s4={s4_val} r4={r4_val} "
-                f"s4_threshold={s4_thr} r4_threshold={r4_thr} atr={atr_val} "
-                f"RSI={rsi_val} CCI={cci_val} cpr_width={cpr_width} compressed_cam={compressed_cam}"
+                f"ADX={adx_val} adx_min={_adx_gate_min} reason={adx_override_reason}"
             )
-            return True, allowed_side, "OK", st_details
-        logging.info(
-            "[ENTRY BLOCKED][OSC_EXTREME] "
-            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            f"RSI={rsi_val} CCI={cci_val} "
-            f"rsi_range=[{rsi_min},{rsi_max}] cci_range=[{cci_min},{cci_max}] "
-            "reason=Oscillator extreme, entry suppressed."
-        )
-        return False, allowed_side, "Oscillator extreme, entry suppressed.", st_details
+        else:
+            logging.info(
+                "[ENTRY BLOCKED][WEAK_ADX] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"ADX={adx_val} adx_min={_adx_gate_min} reason=Weak trend strength, entry suppressed."
+            )
+            return False, allowed_side, "Weak trend strength, entry suppressed.", st_details
 
-    return True, allowed_side, "OK", st_details
+    # Standalone EMA stretch governance (independent of reversal detector score generation).
+    ema9_val = float("nan")
+    ema13_val = float("nan")
+    if last_3m is not None:
+        ema9_val = float(last_3m.get("ema9")) if pd.notna(last_3m.get("ema9")) else float("nan")
+        ema13_val = float(last_3m.get("ema13")) if pd.notna(last_3m.get("ema13")) else float("nan")
+    if (not np.isfinite(ema9_val) or not np.isfinite(ema13_val)) and candles_3m is not None and "close" in candles_3m.columns:
+        _cl = candles_3m["close"].astype(float)
+        if len(_cl) >= 1:
+            ema9_val = float(_cl.ewm(span=9, adjust=False).mean().iloc[-1])
+        if len(_cl) >= 1:
+            ema13_val = float(_cl.ewm(span=13, adjust=False).mean().iloc[-1])
+    ema_ref = ema9_val if np.isfinite(ema9_val) else ema13_val
+    ema_stretch_mult = float("nan")
+    if np.isfinite(close_val) and np.isfinite(ema_ref) and np.isfinite(atr_val) and atr_val > 0:
+        ema_stretch_mult = (close_val - ema_ref) / atr_val
+    st_details["ema_stretch_mult"] = ema_stretch_mult
+    st_details["ema_stretch_blocked"] = False
+    st_details["ema_stretch_tagged"] = False
+    _ema_block_mult = float(globals().get("EMA_STRETCH_BLOCK_MULT", 3.0))
+    _ema_tag_mult = float(globals().get("EMA_STRETCH_TAG_MULT", 2.0))
+    _side_extreme = (
+        (allowed_side == "CALL" and np.isfinite(ema_stretch_mult) and ema_stretch_mult >= _ema_block_mult)
+        or (allowed_side == "PUT" and np.isfinite(ema_stretch_mult) and ema_stretch_mult <= -_ema_block_mult)
+    )
+    _side_tag = (
+        (allowed_side == "CALL" and np.isfinite(ema_stretch_mult) and ema_stretch_mult >= _ema_tag_mult)
+        or (allowed_side == "PUT" and np.isfinite(ema_stretch_mult) and ema_stretch_mult <= -_ema_tag_mult)
+    )
+    if _side_tag:
+        st_details["ema_stretch_tagged"] = True
+        logging.info(
+            "[EMA_STRETCH][TAG] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            f"stretch={ema_stretch_mult:.2f}x threshold={_ema_tag_mult:.1f}x"
+        )
+    if _side_extreme:
+        _ema_override = (
+            isinstance(reversal_signal, dict)
+            and reversal_signal.get("side") == allowed_side
+            and float(reversal_signal.get("score", 0)) >= 70.0
+        )
+        if _ema_override:
+            st_details["ema_stretch_override"] = True
+            logging.info(
+                "[EMA_STRETCH][OVERRIDE] "
+                f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                f"stretch={ema_stretch_mult:.2f}x reason=Aligned high-score reversal override."
+            )
+        else:
+            st_details["ema_stretch_blocked"] = True
+            logging.info(
+                "[ENTRY BLOCKED][EMA_STRETCH] "
+                f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                f"stretch={ema_stretch_mult:.2f}x threshold={_ema_block_mult:.1f}x "
+                "reason=Distance from EMA exceeded standalone stretch gate."
+            )
+            return False, allowed_side, "EMA stretch gate, entry suppressed.", st_details
+
+    # ── Trend-aware oscillator thresholds ─────────────────────────────────────
+    # Strong trends produce naturally extreme RSI/CCI — blocking on fixed ranges
+    # mis-categorises trend momentum as "exhausted".  Expand the acceptable band
+    # when ADX confirms a genuine trend.
+    #
+    #   ADX ≤ 30   : default [30–70] RSI, [-150, +150] CCI
+    #   ADX  30–40 : moderate expansion [25–75] RSI, [-200, +200] CCI
+    #   ADX > 40   : wide expansion     [20–80] RSI, [-250, +250] CCI
+    # Additionally, ATR-based expansion adds up to 5 RSI / 30 CCI pts in high-vol regimes.
+    #
+    # When an oscillator falls inside the expanded (not default) window, the
+    # trade is still allowed but tagged [OSC_OVERRIDE][TREND_CONFIRMED].
+    # When outside even the expanded window, fall through to the existing
+    # pivot-break override or block.
+
+    _default_rsi_min, _default_rsi_max = float(rsi_min), float(rsi_max)
+    _default_cci_min, _default_cci_max = float(cci_min), float(cci_max)
+    gap_tag = "NO_GAP"
+    if np.isfinite(close_val) and np.isfinite(r4_val) and close_val > r4_val:
+        gap_tag = "GAP_UP"
+    elif np.isfinite(close_val) and np.isfinite(s4_val) and close_val < s4_val:
+        gap_tag = "GAP_DOWN"
+
+    if np.isfinite(adx_val) and adx_val > 40:
+        _eff_rsi_min, _eff_rsi_max = 20.0, 80.0
+        _eff_cci_min, _eff_cci_max = -250.0, 250.0
+        _adx_osc_tier = "ADX_STRONG_40"
+    elif np.isfinite(adx_val) and adx_val > 30:
+        _eff_rsi_min, _eff_rsi_max = 25.0, 75.0
+        _eff_cci_min, _eff_cci_max = -200.0, 200.0
+        _adx_osc_tier = "ADX_MOD_30"
+    else:
+        _eff_rsi_min, _eff_rsi_max = _default_rsi_min, _default_rsi_max
+        _eff_cci_min, _eff_cci_max = _default_cci_min, _default_cci_max
+        _adx_osc_tier = "ADX_DEFAULT"
+
+    st_details["adx_osc_tier"]           = _adx_osc_tier
+    st_details["eff_rsi_range"]          = [_eff_rsi_min, _eff_rsi_max]
+    st_details["eff_cci_range"]          = [_eff_cci_min, _eff_cci_max]
+    st_details["osc_threshold_expanded"] = (_adx_osc_tier != "ADX_DEFAULT")
+
+    # ATR expansion: high-volatility regimes push oscillators to more extreme readings
+    # without signifying exhaustion — expand proportionally above the ADX tier base.
+    _atr_rsi_exp = 0.0
+    _atr_cci_exp = 0.0
+    _atr_expand_tier = "ATR_DEFAULT"
+    _atr_series = (
+        candles_3m["atr14"].dropna()
+        if candles_3m is not None and "atr14" in candles_3m.columns
+        else pd.Series(dtype=float)
+    )
+    if len(_atr_series) >= 10 and np.isfinite(atr_val) and atr_val > 0:
+        _atr_ma = float(_atr_series.tail(10).mean())
+        if _atr_ma > 0 and atr_val > 1.5 * _atr_ma:
+            _atr_rsi_exp, _atr_cci_exp = 5.0, 30.0
+            _atr_expand_tier = "ATR_HIGH"
+        elif _atr_ma > 0 and atr_val > 1.3 * _atr_ma:
+            _atr_rsi_exp, _atr_cci_exp = 3.0, 20.0
+            _atr_expand_tier = "ATR_ELEVATED"
+    _eff_rsi_min -= _atr_rsi_exp
+    _eff_rsi_max += _atr_rsi_exp
+    _eff_cci_min -= _atr_cci_exp
+    _eff_cci_max += _atr_cci_exp
+    st_details["atr_expand_tier"] = _atr_expand_tier
+    st_details["eff_rsi_range"] = [_eff_rsi_min, _eff_rsi_max]
+    st_details["eff_cci_range"] = [_eff_cci_min, _eff_cci_max]
+
+    atr_stretch = float("nan")
+    if len(_atr_series) >= 10 and np.isfinite(atr_val):
+        _atr_ma = float(_atr_series.tail(10).mean())
+        if np.isfinite(_atr_ma) and _atr_ma > 0:
+            atr_stretch = atr_val / _atr_ma
+
+    # Gap-aware and ATR-stretch aware relaxation for fast sessions.
+    _stretch_relax = 0.0
+    if np.isfinite(atr_stretch) and atr_stretch > 1.0:
+        _stretch_relax = min(4.0, (atr_stretch - 1.0) * 4.0)
+
+    if gap_tag == "GAP_UP" and allowed_side == "CALL":
+        _eff_rsi_max += 2.0 + _stretch_relax
+        _eff_cci_max += 10.0 + (_stretch_relax * 6.0)
+    elif gap_tag == "GAP_DOWN" and allowed_side == "PUT":
+        _eff_rsi_min -= 2.0 + _stretch_relax
+        _eff_cci_min -= 10.0 + (_stretch_relax * 6.0)
+
+    st_details["eff_rsi_range"] = [_eff_rsi_min, _eff_rsi_max]
+    st_details["eff_cci_range"] = [_eff_cci_min, _eff_cci_max]
+
+    if np.isfinite(close_val) and np.isfinite(r3_val) and np.isfinite(s3_val) and s3_val <= close_val <= r3_val:
+        zone_tag = "ZoneA"
+    elif (
+        np.isfinite(close_val)
+        and (
+            (np.isfinite(r3_val) and np.isfinite(r4_val) and r3_val < close_val <= r4_val)
+            or (np.isfinite(s4_val) and np.isfinite(s3_val) and s4_val <= close_val < s3_val)
+        )
+    ):
+        zone_tag = "ZoneB"
+    elif np.isfinite(close_val) and (
+        (np.isfinite(r4_val) and close_val > r4_val)
+        or (np.isfinite(s4_val) and close_val < s4_val)
+    ):
+        zone_tag = "ZoneC"
+    else:
+        zone_tag = "ZoneA"
+
+    st_details["osc_zone"] = zone_tag
+    st_details["gap_tag"] = gap_tag
+    st_details["atr_stretch"] = atr_stretch
+
+    _entry_gate_ctx_fn = globals().get("entry_gate_context")
+    if callable(_entry_gate_ctx_fn):
+        merged_ctx = _entry_gate_ctx_fn(
+            allowed_side=allowed_side,
+            zone_tag=zone_tag,
+            gap_tag=gap_tag,
+            atr_stretch=atr_stretch,
+            rsi_bounds=(_eff_rsi_min, _eff_rsi_max),
+            cci_bounds=(_eff_cci_min, _eff_cci_max),
+            day_type_result=day_type_result,
+            open_bias_context=open_bias_context,
+        )
+    else:
+        merged_ctx = {
+            "rsi_bounds": (float(_eff_rsi_min), float(_eff_rsi_max)),
+            "cci_bounds": (float(_eff_cci_min), float(_eff_cci_max)),
+            "osc_context": (
+                "ZoneA-Blocker" if zone_tag == "ZoneA"
+                else ("ZoneB-Reversal" if zone_tag == "ZoneB" else "ZoneC-Continuation")
+            ),
+            "zone_tag": zone_tag,
+            "day_type_tag": "UNKNOWN",
+            "open_bias": "UNKNOWN",
+            "bias": "Neutral",
+            "gap_tag": gap_tag,
+            "bias_aligned": False,
+        }
+    _eff_rsi_min, _eff_rsi_max = merged_ctx["rsi_bounds"]
+    _eff_cci_min, _eff_cci_max = merged_ctx["cci_bounds"]
+    st_details["eff_rsi_range"] = [_eff_rsi_min, _eff_rsi_max]
+    st_details["eff_cci_range"] = [_eff_cci_min, _eff_cci_max]
+    st_details["osc_context"] = merged_ctx["osc_context"]
+    st_details["day_type_tag"] = merged_ctx["day_type_tag"]
+    st_details["open_bias"] = merged_ctx["open_bias"]
+    st_details["bias"] = merged_ctx["bias"]
+    st_details["bias_aligned"] = merged_ctx["bias_aligned"]
+
+    _bias_unknown = (merged_ctx.get("day_type_tag", "UNKNOWN") == "UNKNOWN"
+                     or merged_ctx.get("gap_tag", "UNKNOWN") == "UNKNOWN")
+    if merged_ctx["bias_aligned"]:
+        logging.info(
+            "[DAY_BIAS_ALIGN] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            f"day_type={merged_ctx['day_type_tag']} bias={merged_ctx['bias']} gap={merged_ctx['gap_tag']}"
+        )
+    elif _bias_unknown:
+        # P4: pre-09:30 or pre-DTC bars — suppress noisy MISALIGN, emit UNKNOWN instead
+        logging.debug(
+            "[DAY_BIAS_UNKNOWN] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            f"day_type={merged_ctx['day_type_tag']} bias={merged_ctx['bias']} gap={merged_ctx['gap_tag']}"
+        )
+    else:
+        logging.info(
+            "[DAY_BIAS_MISALIGN] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            f"day_type={merged_ctx['day_type_tag']} bias={merged_ctx['bias']} gap={merged_ctx['gap_tag']}"
+        )
+
+    _entry_log(
+        "[ENTRY ALLOWED][ST_BIAS_OK] "
+        f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+        f"osc_context={merged_ctx['osc_context']} day_type={merged_ctx['day_type_tag']} "
+        f"bias={merged_ctx['bias']} "
+        f"thresholds=RSI[{_eff_rsi_min:.1f},{_eff_rsi_max:.1f}] "
+        f"CCI[{_eff_cci_min:.1f},{_eff_cci_max:.1f}]"
+    )
+    logging.info(
+        "[ENTRY_GATE_CONTEXT] "
+        f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+        f"osc_context={merged_ctx['osc_context']} day_type={merged_ctx['day_type_tag']} "
+        f"open_bias={merged_ctx['open_bias']} bias={merged_ctx['bias']} "
+        f"gap={merged_ctx['gap_tag']} atr_stretch={atr_stretch if np.isfinite(atr_stretch) else 'N/A'} "
+        f"rsi_range=[{_eff_rsi_min:.1f},{_eff_rsi_max:.1f}] cci_range=[{_eff_cci_min:.1f},{_eff_cci_max:.1f}]"
+    )
+
+    logging.info(
+        "[OSC_CONTEXT] "
+        f"timestamp={timestamp} symbol={symbol} zone={zone_tag} gap={merged_ctx['gap_tag']} "
+        f"atr_stretch={atr_stretch if np.isfinite(atr_stretch) else 'N/A'} "
+        f"RSI={rsi_val if np.isfinite(rsi_val) else 'N/A'} CCI={cci_val if np.isfinite(cci_val) else 'N/A'} "
+        f"rsi_range=[{_eff_rsi_min},{_eff_rsi_max}] cci_range=[{_eff_cci_min},{_eff_cci_max}] "
+        f"close={close_val if np.isfinite(close_val) else 'N/A'} r3={r3_val if np.isfinite(r3_val) else 'N/A'} "
+        f"r4={r4_val if np.isfinite(r4_val) else 'N/A'} s3={s3_val if np.isfinite(s3_val) else 'N/A'} "
+        f"s4={s4_val if np.isfinite(s4_val) else 'N/A'}"
+    )
+
+    _rsi_in_default = (not np.isfinite(rsi_val)) or (_default_rsi_min <= rsi_val <= _default_rsi_max)
+    _cci_in_default = (not np.isfinite(cci_val)) or (_default_cci_min <= cci_val <= _default_cci_max)
+    _rsi_in_expanded = (not np.isfinite(rsi_val)) or (_eff_rsi_min <= rsi_val <= _eff_rsi_max)
+    _cci_in_expanded = (not np.isfinite(cci_val)) or (_eff_cci_min <= cci_val <= _eff_cci_max)
+
+    # Case 1: within default thresholds — no issue, proceed
+    if _rsi_in_default and _cci_in_default:
+        return True, allowed_side, "OK", st_details
+
+    # Case 2: outside default but within expanded (ADX or ATR tier override)
+    if _rsi_in_expanded and _cci_in_expanded:
+        if _adx_osc_tier != "ADX_DEFAULT" or _atr_expand_tier != "ATR_DEFAULT":
+            logging.info(
+                "[OSC_OVERRIDE][TREND_CONFIRMED] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"ADX={adx_val:.1f} tier={_adx_osc_tier} atr_tier={_atr_expand_tier} "
+                f"RSI={rsi_val:.1f} (expanded [{_eff_rsi_min},{_eff_rsi_max}]) "
+                f"CCI={cci_val:.1f} (expanded [{_eff_cci_min},{_eff_cci_max}]) "
+                f"default_rsi=[{_default_rsi_min},{_default_rsi_max}] "
+                f"default_cci=[{_default_cci_min},{_default_cci_max}] "
+                "reason=ADX/ATR trend confirms oscillator extreme is momentum not exhaustion."
+            )
+            if zone_tag == "ZoneB":
+                logging.info(
+                    "[OSC_REVERSAL][ZoneB][TRIGGER] "
+                    f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                    "reason=Zone B extreme treated as reversal trigger."
+                )
+            elif zone_tag == "ZoneC":
+                logging.info(
+                    "[OSC_CONTINUATION][ZoneC][RELAXED] "
+                    f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                    "reason=Zone C extreme treated as continuation context."
+                )
+            st_details["osc_trend_override"] = True
+            return True, allowed_side, "OK", st_details
+
+    # Case 3: outside even expanded thresholds — check existing pivot-break override
+    if osc_override:
+        _entry_log(
+            "[ENTRY ALLOWED][OSC_OVERRIDE_PIVOT_BREAK] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            f"close={close_val} s4={s4_val} r4={r4_val} "
+            f"s4_threshold={s4_thr} r4_threshold={r4_thr} atr={atr_val} "
+            f"RSI={rsi_val} CCI={cci_val} compressed_cam={compressed_cam}"
+        )
+        return True, allowed_side, "OK", st_details
+
+    # Case 4: S4/R4 breakout relief — price below S4−ATR (PUT) or above R4+ATR (CALL)
+    # When price trades decisively outside the Camarilla extreme levels, oscillator
+    # exhaustion reflects momentum continuation, not a reversal — allow entry.
+    _s4_relief_thr = (s4_val - atr_val) if np.isfinite(s4_val) and np.isfinite(atr_val) else float("nan")
+    _r4_relief_thr = (r4_val + atr_val) if np.isfinite(r4_val) and np.isfinite(atr_val) else float("nan")
+
+    _put_relief = bool(
+        allowed_side == "PUT"
+        and np.isfinite(close_val) and np.isfinite(_s4_relief_thr)
+        and close_val < _s4_relief_thr
+    )
+    _call_relief = bool(
+        allowed_side == "CALL"
+        and np.isfinite(close_val) and np.isfinite(_r4_relief_thr)
+        and close_val > _r4_relief_thr
+    )
+
+    if _put_relief:
+        logging.info(
+            "[OSC_RELIEF][S4/R4_BREAK] "
+            f"side=PUT reason=Price below S4, oscillator extreme bypassed "
+            f"timestamp={timestamp} symbol={symbol} "
+            f"close={close_val:.2f} s4={s4_val:.2f} s4_relief_thr={_s4_relief_thr:.2f} "
+            f"atr={atr_val:.2f} RSI={rsi_val:.1f} CCI={cci_val:.1f}"
+        )
+        logging.info(
+            "[OSC_CONTINUATION][ZoneC][RELAXED] "
+            f"timestamp={timestamp} symbol={symbol} side=PUT "
+            "reason=Price below S4-ATR relief."
+        )
+        st_details["osc_relief_override"] = True
+        return True, allowed_side, "OK", st_details
+
+    if _call_relief:
+        logging.info(
+            "[OSC_RELIEF][S4/R4_BREAK] "
+            f"side=CALL reason=Price above R4, oscillator extreme bypassed "
+            f"timestamp={timestamp} symbol={symbol} "
+            f"close={close_val:.2f} r4={r4_val:.2f} r4_relief_thr={_r4_relief_thr:.2f} "
+            f"atr={atr_val:.2f} RSI={rsi_val:.1f} CCI={cci_val:.1f}"
+        )
+        logging.info(
+            "[OSC_CONTINUATION][ZoneC][RELAXED] "
+            f"timestamp={timestamp} symbol={symbol} side=CALL "
+            "reason=Price above R4+ATR relief."
+        )
+        st_details["osc_relief_override"] = True
+        return True, allowed_side, "OK", st_details
+
+    # All cases exhausted — genuinely blocked (log only here so relief is not counted as block)
+    logging.info(
+        "[ENTRY BLOCKED][OSC_EXTREME] "
+        f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+        f"RSI={rsi_val} CCI={cci_val} "
+        f"rsi_range=[{_eff_rsi_min},{_eff_rsi_max}] cci_range=[{_eff_cci_min},{_eff_cci_max}] "
+        f"tier={_adx_osc_tier} atr_tier={_atr_expand_tier} ADX={adx_val:.1f} "
+        "reason=Oscillator extreme outside all expanded thresholds, entry suppressed."
+    )
+    if zone_tag == "ZoneA":
+        logging.info(
+            "[OSC_EXTREME][ZoneA][BLOCKER] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            "reason=Inside S3-R3 strict threshold blocker."
+        )
+    elif zone_tag == "ZoneB":
+        logging.info(
+            "[OSC_REVERSAL][ZoneB][TRIGGER] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            "reason=Zone B extreme observed while blocked."
+        )
+    else:
+        logging.info(
+            "[OSC_CONTINUATION][ZoneC][RELAXED] "
+            f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+            "reason=Zone C extreme observed while blocked."
+        )
+    return False, allowed_side, "Oscillator extreme, entry suppressed.", st_details
 
 
 def check_exit_condition(df_slice, state, option_price=None, option_volume=None, timestamp=None):
@@ -1043,11 +1628,11 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         try:
             if hf_mgr.check_exit(current_ltp, timestamp, current_volume=option_volume, bars_held=bars_held):
                 hf_reason = hf_mgr.last_reason or "HF_EXIT"
-                if hf_reason == "MOMENTUM_EXHAUSTION" and bars_held < 2:
+                if hf_reason == "MOMENTUM_EXHAUSTION" and bars_held < 3:
                     logging.info(
                         "[EXIT SUPPRESSED] "
                         f"symbol={symbol} option_type={side} position_side={position_side} "
-                        f"reason=Premature exit suppressed, minimum hold enforced. bars_held={bars_held}"
+                        f"reason=Premature exit suppressed (MOMENTUM_EXHAUSTION), minimum hold enforced. bars_held={bars_held}"
                     )
                 elif bars_held <= 0 and hf_reason not in {"SL_HIT", "PT_HIT"}:
                     logging.info(
@@ -1065,41 +1650,81 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         except Exception as e:
             logging.warning(f"[HF EXIT] manager error: {e}")
 
-    # 2) Stop loss - always active catastrophic backstop
+    # 2) Stop loss - with scalp survivability guardrail.
+    # Scalp trades should survive initial noise for >=2 bars unless move is extreme.
     if stop is not None and current_ltp <= stop:
+        if state.get("scalp_mode", False):
+            min_hold = int(state.get("scalp_min_hold_bars", SCALP_MIN_HOLD_BARS))
+            atr_val = float(state.get("atr_value", 0.0) or 0.0)
+            extreme_mul = float(state.get("scalp_extreme_move_atr_mult", SCALP_EXTREME_MOVE_ATR_MULT))
+            extreme_pts = max(2.0, atr_val * extreme_mul * 0.06)
+            emergency_stop = float(stop) - extreme_pts
+            if bars_held < min_hold and current_ltp > emergency_stop:
+                logging.info(
+                    "[EXIT SUPPRESSED][SCALP_MIN_HOLD] "
+                    f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                    f"min_hold={min_hold} ltp={current_ltp:.2f} stop={stop:.2f} "
+                    f"emergency_stop={emergency_stop:.2f}"
+                )
+                return False, None
+            if bars_held < min_hold and current_ltp <= emergency_stop:
+                logging.info(
+                    "[EXIT ALLOWED][SCALP_EXTREME_MOVE] "
+                    f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                    f"ltp={current_ltp:.2f} emergency_stop={emergency_stop:.2f}"
+                )
+        else:
+            min_hold = int(state.get("trend_min_hold_bars", TREND_MIN_HOLD_BARS))
+            atr_val = float(state.get("atr_value", 0.0) or 0.0)
+            extreme_mul = float(state.get("trend_extreme_move_atr_mult", TREND_EXTREME_MOVE_ATR_MULT))
+            extreme_pts = max(3.0, atr_val * extreme_mul * 0.06)
+            emergency_stop = float(stop) - extreme_pts
+            if bars_held < min_hold and current_ltp > emergency_stop:
+                logging.info(
+                    "[EXIT SUPPRESSED][TREND_MIN_HOLD] "
+                    f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                    f"min_hold={min_hold} ltp={current_ltp:.2f} stop={stop:.2f} "
+                    f"emergency_stop={emergency_stop:.2f}"
+                )
+                return False, None
+            if bars_held < min_hold and current_ltp <= emergency_stop:
+                logging.info(
+                    "[EXIT ALLOWED][TREND_EXTREME_MOVE] "
+                    f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                    f"ltp={current_ltp:.2f} emergency_stop={emergency_stop:.2f}"
+                )
         audit("SL", "SL_HIT", f"ltp<={stop:.2f}")
         logging.info(
             f"{RED}[EXIT][SL_HIT] {side} ltp={current_ltp:.2f} stop={stop:.2f} bars_held={bars_held}{RESET}"
         )
+        if not state.get("scalp_mode", False):
+            logging.info(
+                f"[TREND_LOSS] {side} trade_class={state.get('trade_class', 'TREND')} "
+                f"bars_held={bars_held} entry={state.get('buy_price', '?')} "
+                f"stop={stop:.2f} ltp={current_ltp:.2f}"
+            )
         return True, "SL_HIT"
 
-    # 2B) Momentum scalp exits — only for SCALP trade class (P1-B / P2-D).
-    # HFT override (step 1) always runs first; scalp exits run after hard SL.
-    # Trend trades (trade_class=TREND) NEVER enter this block — scalp_mode is
-    # set to True only during momentum scalp entry in paper_order / live_order.
+    # 2B) Dip/rally scalp exits — only for SCALP trade class (P1-B / P2-D).
     if state.get("scalp_mode", False):
-        scalp_pt = float(state.get("scalp_pt_points", SCALP_PT_POINTS))
-        scalp_sl = float(state.get("scalp_sl_points", SCALP_SL_POINTS))
-        premium_move = float(current_ltp - entry_price)
-        logging.debug(
-            f"[SCALP_OVERRIDE] trade_class={state.get('trade_class', TRADE_CLASS_SCALP)} "
-            f"premium_move={premium_move:.2f} scalp_pt={scalp_pt:.2f} scalp_sl={scalp_sl:.2f}"
-        )
-        if premium_move >= scalp_pt:
-            audit("SCALP_PT_HIT", "SCALP_PT_HIT", f"premium_move>={scalp_pt:.2f}", premium_move=premium_move)
-            logging.info(
-                f"{GREEN}[EXIT][SCALP_PT_HIT][SCALP_OVERRIDE] {side} "
-                f"premium_move={premium_move:.2f} target={scalp_pt:.2f} ltp={current_ltp:.2f}{RESET}"
+        # Survivability guardrail: must hold for at least 2 bars
+        if bars_held >= 2:
+            scalp_pt = float(state.get("scalp_pt_points", SCALP_PT_POINTS))
+            premium_move = float(current_ltp - entry_price)
+            logging.debug(
+                f"[SCALP_EXIT_CHECK] bars_held={bars_held} "
+                f"premium_move={premium_move:.2f} scalp_pt={scalp_pt:.2f}"
             )
-            return True, "SCALP_PT_HIT"
-        if premium_move <= -scalp_sl:
-            audit("SCALP_SL_HIT", "SCALP_SL_HIT", f"premium_move<=-{scalp_sl:.2f}", premium_move=premium_move)
-            logging.info(
-                f"{RED}[EXIT][SCALP_SL_HIT][SCALP_OVERRIDE] {side} "
-                f"premium_move={premium_move:.2f} stop=-{scalp_sl:.2f} ltp={current_ltp:.2f}{RESET}"
-            )
-            return True, "SCALP_SL_HIT"
-        return False, None
+            if premium_move >= scalp_pt:
+                audit("SCALP_PT_HIT", "SCALP_PT_HIT", f"premium_move>={scalp_pt:.2f}", premium_move=premium_move)
+                logging.info(
+                    f"{GREEN}[EXIT][SCALP_PT_HIT] {side} "
+                    f"premium_move={premium_move:.2f} target={scalp_pt:.2f} ltp={current_ltp:.2f}{RESET}"
+                )
+                return True, "SCALP_PT_HIT"
+        # No SCALP_SL_HIT logic here. The main SL_HIT check at the top of the function
+        # will use the ATR-based `state['stop']`.
+        # Do not return, allow fall-through to other exit checks like HFT.
 
     # 3) PT/TG structured checks
     tg_hit = tg is not None and current_ltp >= tg
@@ -1303,9 +1928,13 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     state["prev_gap"] = ema_gap
     if state["plateau_count"] >= 2 and abs(momentum) < peak_momentum * 0.4 and len(osc_hits) >= 1:
         x_type = contextual_exit_type()
-        audit(x_type, "MOMENTUM_EXIT", "ema_plateau+momentum_drop")
-        logging.info(f"{YELLOW}[EXIT][MOMENTUM] {side} plateau+drop+osc{RESET}")
-        return True, "MOMENTUM_EXIT"
+        momentum_reason = "MOMENTUM_EXHAUSTION" if not state.get("scalp_mode", False) else "MOMENTUM_EXIT"
+        audit(x_type, momentum_reason, "ema_plateau+momentum_drop")
+        logging.info(
+            f"{YELLOW}[EXIT][MOMENTUM] {side} reason={momentum_reason} "
+            f"plateau+drop+osc bars_held={bars_held}{RESET}"
+        )
+        return True, momentum_reason
 
     if i - entry_candle >= time_exit_candles and state.get("trail_updates", 0) == 0:
         audit("ATR", "TIME_EXIT", f"no_trail_for_{time_exit_candles}_candles")
@@ -1317,28 +1946,28 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
 
 def build_dynamic_levels(entry_price, atr, side, entry_candle,
                          rr_ratio=2.0, profit_loss_point=5, candles_df=None,
-                         trail_start_frac=0.5):
+                         trail_start_frac=0.5, adx_value: float = 0.0):
     """
     Build SL/PT/TG/trail for OPTIONS BUYING (long call or long put).
-    
-    ✅ v2.0 QUICK PROFIT BOOKING MODEL (3–5 bars target)
+
+    ✅ v3.0 ATR-SCALED STOP-LOSS MODEL
     ═════════════════════════════════════════════════════════════
-    
-    Design principles:
-    - Tighter targets for quick profit booking vs long-hold strategies
-    - Dynamic scaling based on ATR volatility regime
-    - SL ≈ -8–11%, PT ≈ +10–13%, TG ≈ +15–20% (vs old 18%/25%/45%)
-    - Trail step scales with volatility: 2–3% of entry
-    
-    Volatility Regimes (based on Nifty ATR):
-    - Regime 1 (ATR ≤ 60):    Very Low   → SL=-8%  PT=+10% TG=+15%
-    - Regime 2 (60< ATR≤100): Low        → SL=-9%  PT=+11% TG=+16%
-    - Regime 3 (100<ATR≤150): Moderate  → SL=-10% PT=+12% TG=+18%
-    - Regime 4 (150<ATR≤250): High      → SL=-11% PT=+13% TG=+20%
-    - Regime 5 (ATR > 250):   Extreme   → Skip (too risky for quick booking)
-    
-    Example (Entry=300 in Regime 3):
-    SL=270 (-10%), PT=336 (+12%), TG=354 (+18%), Trail=6 (2%)
+
+    Stop-loss is now a direct ATR multiple, preventing premature exits in
+    strong trending markets while tightening in weak/choppy conditions.
+
+    SL tiers (ADX-adaptive):
+    - ADX > 40 (very strong trend): SL = Entry − 2.5 × ATR
+    - ADX 20–40 (default):          SL = Entry − 2.0 × ATR
+    - ADX < 20 (weak trend):        SL = Entry − 1.2 × ATR
+
+    Profit targets remain percentage-based (ATR-regime) to preserve RR ratio.
+    Volatility regimes (Nifty ATR) govern PT/TG/trail:
+    - Regime 1 (ATR ≤ 60):    Very Low   → PT=+10% TG=+15%
+    - Regime 2 (60< ATR≤100): Low        → PT=+11% TG=+16%
+    - Regime 3 (100<ATR≤150): Moderate   → PT=+12% TG=+18%
+    - Regime 4 (150<ATR≤250): High       → PT=+13% TG=+20%
+    - Regime 5 (ATR > 250):   Extreme    → Skip (too volatile)
     """
     if entry_price is None or entry_price <= 0:
         logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
@@ -1348,28 +1977,60 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         logging.warning("[LEVELS] ATR unavailable")
         return {"valid": False}
 
-    # ════════ VOLATILITY REGIME CLASSIFICATION ════════
+    # ════════ ATR-SCALED SL — ADX TIER ════════
+    adx_val_f = float(adx_value) if adx_value and np.isfinite(float(adx_value)) else 0.0
+    if adx_val_f > 40:
+        sl_mult  = 2.5
+        sl_tier  = "ADX_STRONG_40"
+    elif adx_val_f > 0 and adx_val_f < 20:
+        sl_mult  = 1.2
+        sl_tier  = "ADX_WEAK_20"
+    else:
+        sl_mult  = 2.0
+        sl_tier  = "ADX_DEFAULT"
+
+    # ════════ ATR EXPANSION — volatile regimes need wider SL breathing room ════════
+    # Mirrors the oscillator gate ATR tier logic (same thresholds: 1.3× and 1.5× MA).
+    # In high-volatility sessions, a 1.2×ATR stop gets hit on the first bar.
+    # Expanding sl_mult proportionally reduces premature stop-outs without widening
+    # in calm/normal conditions.
+    _atr_sl_expand = 1.0
+    _sl_atr_tier   = "ATR_DEFAULT"
+    _sl_atr_series = (
+        candles_df["atr14"].dropna()
+        if candles_df is not None and not candles_df.empty and "atr14" in candles_df.columns
+        else pd.Series(dtype=float)
+    )
+    if len(_sl_atr_series) >= 10 and np.isfinite(atr) and atr > 0:
+        _atr_sl_ma = float(_sl_atr_series.tail(10).mean())
+        if _atr_sl_ma > 0 and atr > 1.5 * _atr_sl_ma:
+            _atr_sl_expand = 1.75
+            _sl_atr_tier   = "ATR_HIGH"
+        elif _atr_sl_ma > 0 and atr > 1.2 * _atr_sl_ma:
+            _atr_sl_expand = 1.35
+            _sl_atr_tier   = "ATR_ELEVATED"
+    sl_mult = min(round(sl_mult * _atr_sl_expand, 3), 3.5)
+
+    stop = max(round(entry_price - sl_mult * atr, 2), 1.0)
+
+    # ════════ VOLATILITY REGIME (PT / TG / TRAIL) ════════
     if atr <= 60:
-        regime = "VERY_LOW"
-        sl_pct   = 0.08   # 8% stop loss
-        pt_pct   = 0.10   # 10% partial target
-        tg_pct   = 0.15   # 15% full target
-        step_pct = 0.02   # 2% trail step
+        regime   = "VERY_LOW"
+        pt_pct   = 0.10
+        tg_pct   = 0.15
+        step_pct = 0.02
     elif atr <= 100:
-        regime = "LOW"
-        sl_pct   = 0.09
+        regime   = "LOW"
         pt_pct   = 0.11
         tg_pct   = 0.16
         step_pct = 0.025
     elif atr <= 150:
-        regime = "MODERATE"
-        sl_pct   = 0.10
+        regime   = "MODERATE"
         pt_pct   = 0.12
         tg_pct   = 0.18
         step_pct = 0.03
     elif atr <= 250:
-        regime = "HIGH"
-        sl_pct   = 0.11
+        regime   = "HIGH"
         pt_pct   = 0.13
         tg_pct   = 0.20
         step_pct = 0.035
@@ -1377,31 +2038,34 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
         return {"valid": False}
 
-    # ════════ CALCULATE LEVELS ════════
-    stop           = round(entry_price * (1 - sl_pct),  2)
-    partial_target = round(entry_price * (1 + pt_pct),  2)
-    full_target    = round(entry_price * (1 + tg_pct),  2)
+    partial_target = round(entry_price * (1 + pt_pct), 2)
+    full_target    = round(entry_price * (1 + tg_pct), 2)
     trail_start    = round(entry_price * pt_pct * float(trail_start_frac), 2)
     trail_step     = round(max(entry_price * step_pct, 1.5), 2)
-    
-    # ════════ AUDIT LOG WITH PERCENTAGES ════════
+
+    sl_dist_pct = (entry_price - stop) / entry_price * 100
+
+    # ════════ AUDIT LOG ════════
     logging.info(
-        f"{CYAN}[LEVELS] {regime:12} | {side} entry={entry_price:.2f} | "
-        f"SL={stop:.2f}({-sl_pct*100:5.1f}%) "
-        f"PT={partial_target:.2f}({pt_pct*100:+5.1f}%) "
-        f"TG={full_target:.2f}({tg_pct*100:+5.1f}%) "
+        f"{CYAN}[LEVELS][ATR_SL] {regime:12} | {side} entry={entry_price:.2f} | "
+        f"SL={stop:.2f}(-{sl_dist_pct:.1f}% | {sl_mult}×ATR tier={sl_tier}/{_sl_atr_tier}) "
+        f"PT={partial_target:.2f}({pt_pct*100:+.1f}%) "
+        f"TG={full_target:.2f}({tg_pct*100:+.1f}%) "
         f"| TrailStart={trail_start:.2f} TrailStep={trail_step:.2f} "
-        f"ATR={atr:.1f} trail_start_frac={trail_start_frac:.2f}{RESET}"
+        f"ATR={atr:.1f} ADX={adx_val_f:.1f}{RESET}"
     )
 
     return {
-        "valid": True,
-        "stop": stop,
-        "pt": partial_target,
-        "tg": full_target,
+        "valid":      True,
+        "stop":       stop,
+        "pt":         partial_target,
+        "tg":         full_target,
         "trail_start": trail_start,
         "trail_step": trail_step,
-        "regime": regime,
+        "regime":     regime,
+        "sl_mult":    sl_mult,
+        "sl_tier":    sl_tier,
+        "sl_atr_tier": _sl_atr_tier,
     }
 
 def update_trailing_stop(current_price, entry_price, current_stop,
@@ -2202,6 +2866,39 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     cpr_pre = calculate_cpr(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
     trad_pre = calculate_traditional_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
     cam_pre = calculate_camarilla_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+
+    # ── Day Type Classifier (paper mode) — init once per calendar day ──────
+    global _paper_dtc, _paper_dtc_date
+    _today_paper = ct.strftime("%Y-%m-%d")
+    if _paper_dtc is None or _paper_dtc_date != _today_paper:
+        try:
+            _paper_dtc = make_day_type_classifier(
+                cam_pre, cpr_pre,
+                float(pivot_src_pre["high"]),
+                float(pivot_src_pre["low"]),
+                float(pivot_src_pre["close"]),
+            )
+            _paper_dtc_date = _today_paper
+            logging.info(
+                f"[DAY TYPE] Paper classifier initialized "
+                f"R3={cam_pre.get('r3',float('nan')):.0f} R4={cam_pre.get('r4',float('nan')):.0f} "
+                f"S3={cam_pre.get('s3',float('nan')):.0f} S4={cam_pre.get('s4',float('nan')):.0f}"
+            )
+        except Exception as _dtc_err:
+            logging.debug(f"[DAY TYPE] Paper DTC init error: {_dtc_err}")
+
+    _paper_day_type = DayTypeResult()   # UNKNOWN default
+    if _paper_dtc is not None:
+        try:
+            _paper_day_type = _paper_dtc.update(candles_3m)
+            # Lock classification at midday when confidence is stable
+            _bar_t_paper = ct.hour * 60 + ct.minute
+            if _bar_t_paper >= 12 * 60 and _paper_day_type.confidence in ("MEDIUM", "HIGH"):
+                _paper_dtc.lock_classification()
+                _paper_day_type.log()
+        except Exception as _dtc_upd_err:
+            logging.debug(f"[DAY TYPE] Paper DTC update error: {_dtc_upd_err}")
+
     breakdown_ctx = _opening_s4_breakdown_context(candles_3m, cpr_pre, cam_pre, pre_atr, ct)
 
     # Cooldown
@@ -2228,15 +2925,21 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
 
     atr = pre_atr
 
-    # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
+    # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = paper_info.get("scalp_cooldown_until")
     if scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
     else:
-        scalp_sig = _detect_scalp_momentum_signal(paper_info, spot_price, ct)
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
         if scalp_sig:
+            log_entry_green(
+                f"[ENTRY ATTEMPT][SCALP][PAPER] side={scalp_sig.get('side')} "
+                f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                "long=True"
+            )
             scalp_side = scalp_sig["side"]
             scalp_leg = "call_buy" if scalp_side == "CALL" else "put_buy"
             burst_key = f"{scalp_side}:{last_candle_time}"
@@ -2244,10 +2947,27 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                 logging.info(f"[SCALP SKIP] duplicate burst {burst_key}")
             elif paper_info[scalp_leg].get("trade_flag", 0) == 0 and paper_info[scalp_leg].get("is_open", False) is False:
                 if paper_info.get("trade_count", 0) < paper_info.get("max_trades", MAX_TRADES_PER_DAY):
-                    opt_name = scalp_sig["symbol"]
+                    opt_type = "CE" if scalp_side == "CALL" else "PE"
+                    opt_name, _strike = get_option_by_moneyness(
+                        spot_price,
+                        opt_type,
+                        moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
+                    )
+                    if not opt_name:
+                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        return
+
+                    ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
+                    base_entry = float(ltp_val) if (ltp_val is not None and not pd.isna(ltp_val)) else float(spot_price or 0)
+                    if base_entry <= 0:
+                        logging.info(f"[SCALP SKIP] invalid entry premium for {opt_name}")
+                        return
+
                     # P3-C: apply slippage — scalp entries also get worse fills
-                    entry_price = float(scalp_sig["price"]) + PAPER_SLIPPAGE_POINTS
-                    stop = round(entry_price - SCALP_SL_POINTS, 2)
+                    entry_price = base_entry + PAPER_SLIPPAGE_POINTS
+                    atr_sl_mult = float(np.clip(atr * 0.001, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
+                    atr_sl_points = max(SCALP_SL_POINTS, round(entry_price * atr_sl_mult, 2))
+                    stop = round(entry_price - atr_sl_points, 2)
                     pt = round(entry_price + SCALP_PT_POINTS, 2)
                     position_id = f"scalp_{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
                     paper_info[scalp_leg].update({
@@ -2257,13 +2977,14 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "order_type":        ORDER_TYPE,
                         "trade_flag":        1,
                         "pnl":               0,
-                        "reason":            "MOMENTUM_SCALP",
-                        "source":            "MOMENTUM_SCALP",
+                        "reason":            scalp_sig["reason"],
+                        "source":            scalp_sig.get("tag", "SCALP"),
                         "order_id":          f"paper_scalp_{opt_name}_{ct}",
                         "position_id":       position_id,
                         "entry_time":        ct,
                         "entry_candle":      len(candles_3m) - 1,
                         "side":              scalp_side,
+                        "position_type":     scalp_sig.get("position_type", "LONG"),
                         "position_side":     _long_position_side(scalp_side),
                         "stop":              stop,
                         "pt":                pt,
@@ -2283,7 +3004,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "scalp_mode":        True,   # P2-D: only SCALP class gets this
                         "trade_class":       TRADE_CLASS_SCALP,
                         "scalp_pt_points":   SCALP_PT_POINTS,
-                        "scalp_sl_points":   SCALP_SL_POINTS,
+                        "scalp_sl_points":   atr_sl_points,
+                        "scalp_min_hold_bars": SCALP_MIN_HOLD_BARS,
+                        "scalp_extreme_move_atr_mult": SCALP_EXTREME_MOVE_ATR_MULT,
+                        "scalp_zone":        scalp_sig.get("zone"),
+                        "scalp_zone_level":  scalp_sig.get("level"),
+                        "scalp_zone_stop":   scalp_sig.get("sl_zone"),
                         "partial_booked":    False,
                         "partial_tg_booked": False,
                         "hf_exit_manager":   OptionExitManager(
@@ -2304,14 +3030,19 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     }
                     paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
                     paper_info["scalp_last_burst_key"] = burst_key
-                    logging.info(
+                    log_entry_green(
                         f"[SCALP ENTRY][PAPER] {scalp_side} {opt_name} @ {entry_price:.2f} "
-                        f"PT=+{SCALP_PT_POINTS:.1f} SL=-{SCALP_SL_POINTS:.1f} "
-                        f"reason={scalp_sig['reason']} position_id={position_id}"
+                        f"PT=+{SCALP_PT_POINTS:.1f} SL=-{atr_sl_points:.2f} "
+                        f"reason={scalp_sig['reason']} zone={scalp_sig.get('zone')} "
+                        f"position_type={paper_info[scalp_leg].get('position_type', 'LONG')} "
+                        "long=True "
+                        f"position_id={position_id}"
                     )
                     logging.info(
                         f"[SCALP_TRADE] class={TRADE_CLASS_SCALP} side={scalp_side} "
                         f"symbol={opt_name} scalp_mode=True trend_mode=False "
+                        f"position_type={paper_info[scalp_leg].get('position_type', 'LONG')} long=True "
+                        f"tag={scalp_sig.get('tag')} "
                         f"position_id={position_id}"
                     )
                     logging.info(
@@ -2326,6 +3057,43 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     return
 
     # 6. Signal evaluation
+    _paper_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
+    _paper_gap = "NO_GAP"
+    if np.isfinite(_paper_close) and np.isfinite(cam_pre.get("r3", float("nan"))) and _paper_close > float(cam_pre.get("r3")):
+        _paper_gap = "GAP_UP"
+    elif np.isfinite(_paper_close) and np.isfinite(cam_pre.get("s3", float("nan"))) and _paper_close < float(cam_pre.get("s3")):
+        _paper_gap = "GAP_DOWN"
+    _paper_bias = "Positive" if _paper_gap == "GAP_UP" else ("Negative" if _paper_gap == "GAP_DOWN" else "Neutral")
+    _paper_open_bias = "UNKNOWN"
+    if np.isfinite(_paper_close):
+        if np.isfinite(cam_pre.get("r4", float("nan"))) and _paper_close > float(cam_pre.get("r4")):
+            _paper_open_bias = "Above R4, continuation likely"
+        elif np.isfinite(cam_pre.get("r3", float("nan"))) and _paper_close > float(cam_pre.get("r3")):
+            _paper_open_bias = "Above R3, expected momentum continuation"
+        elif np.isfinite(cam_pre.get("s4", float("nan"))) and _paper_close < float(cam_pre.get("s4")):
+            _paper_open_bias = "Below S4, downside continuation likely"
+        elif np.isfinite(cam_pre.get("s3", float("nan"))) and _paper_close < float(cam_pre.get("s3")):
+            _paper_open_bias = "Below S3, downside pressure active"
+        else:
+            _paper_open_bias = "Inside S3-R3, balanced open"
+
+    # Prefer DTC classification; fall back to gap-based tag for reversal_detector string param
+    _dtc_name = getattr(getattr(_paper_day_type, "name", None), "value", None)
+    _paper_day_type_tag = (
+        _dtc_name if (_dtc_name and _dtc_name != "UNKNOWN")
+        else ("GAP_DAY" if _paper_gap in ("GAP_UP", "GAP_DOWN") else "NEUTRAL_DAY")
+    )
+    _rev_sig_paper = detect_reversal(
+        candles_3m, cam_pre,
+        current_time=ct,
+        day_type_tag=_paper_day_type_tag,
+    )
+    _fb_sig_paper = detect_failed_breakout(candles_3m, cam_pre)
+    log_entry_green(
+        f"[ENTRY ATTEMPT][TREND][PAPER] symbol={ticker} "
+        f"atr={atr:.2f} trade_count={paper_info.get('trade_count', 0)} "
+        f"day_type={_paper_day_type_tag} confidence={getattr(_paper_day_type, 'confidence', 'N/A')}"
+    )
     quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
         candles_3m=candles_3m,
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
@@ -2334,12 +3102,19 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         adx_min=float(TREND_ENTRY_ADX_MIN),
         cpr_levels=cpr_pre,
         camarilla_levels=cam_pre,
+        reversal_signal=_rev_sig_paper,
+        failed_breakout_signal=_fb_sig_paper,
+        day_type_result=_paper_day_type,
+        open_bias_context={"gap_tag": _paper_gap, "bias": _paper_bias, "open_bias": _paper_open_bias},
     )
     if not quality_ok:
-        tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
-            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else (
-                "WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME"
-            )
+        tag = (
+            "ST_CONFLICT" if "Supertrend conflict" in gate_reason else
+            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else
+            "WEAK_ADX" if "Weak trend strength" in gate_reason else
+            "FAILED_BREAKOUT" if "Failed breakout" in gate_reason else
+            "EMA_STRETCH" if "EMA stretch" in gate_reason else
+            "OSC_EXTREME"
         )
         logging.info(
             f"[ENTRY BLOCKED][{tag}] "
@@ -2398,6 +3173,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         vwap=tpma,
         orb_high=orb_h,
         orb_low=orb_l,
+        osc_relief_active=st_details.get("osc_relief_override", False),
     )
 
     # 7. Entry
@@ -2409,6 +3185,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     side   = signal["side"]
     reason = signal["reason"]
     source = signal.get("source", "UNKNOWN")
+    signal["osc_context"] = st_details.get("osc_context", "UNKNOWN")
+    signal["day_type"] = st_details.get("day_type_tag", "UNKNOWN")
+    signal["open_bias"] = st_details.get("open_bias", "UNKNOWN")
+    signal["failed_breakout"] = bool(st_details.get("failed_breakout", False))
+    signal["ema_stretch"] = bool(st_details.get("ema_stretch_tagged", False))
+    signal["ema_stretch_mult"] = st_details.get("ema_stretch_mult")
     tpma_str = f"{tpma:.1f}" if tpma else "N/A"  # Format tpma conditionally
     logging.info(
         f"[SIGNAL][PAPER] {side} score={signal.get('score','?')} "
@@ -2464,10 +3246,13 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         return
 
                     # pass candles_df so build_dynamic_levels can resolve entry candle
+                    _last_bar = candles_3m.iloc[-1] if candles_3m is not None and not candles_3m.empty else None
+                    _adx_entry = float(_last_bar.get("adx14", 0)) if _last_bar is not None and pd.notna(_last_bar.get("adx14")) else 0.0
                     levels = build_dynamic_levels(
                         entry_price, atr, side,
                         entry_candle=len(candles_3m) - 1,
-                        candles_df=candles_3m
+                        candles_df=candles_3m,
+                        adx_value=_adx_entry,
                     )
                     if not levels.get("valid", False):
                         logging.warning(f"[ENTRY SKIP] {side} levels failed (ATR extreme?)")
@@ -2477,6 +3262,21 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     tg = levels["tg"]
                     trail_start = levels["trail_start"]
                     trail_step = levels["trail_step"]
+
+                    # Apply DTC PM modifiers: override trail_step / record pm_max_hold
+                    _pm_max_hold_paper = None
+                    if _paper_day_type.pm_trail_step is not None:
+                        trail_step = _paper_day_type.pm_trail_step
+                        logging.debug(
+                            f"[DAY_TYPE][PM] PAPER trail_step→{trail_step:.3f} "
+                            f"day_type={_paper_day_type_tag} confidence={_paper_day_type.confidence}"
+                        )
+                    if _paper_day_type.pm_max_hold is not None:
+                        _pm_max_hold_paper = _paper_day_type.pm_max_hold
+                        logging.debug(
+                            f"[DAY_TYPE][PM] PAPER pm_max_hold→{_pm_max_hold_paper} "
+                            f"day_type={_paper_day_type_tag} confidence={_paper_day_type.confidence}"
+                        )
 
                     if atr is None or pd.isna(atr):
                         regime_context = "ATR_UNKNOWN"
@@ -2501,6 +3301,16 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "pnl":               0,
                         "reason":            reason,
                         "source":            source,
+                        "osc_context":       signal.get("osc_context", st_details.get("osc_context", "UNKNOWN")),
+                        "day_type":          signal.get("day_type", st_details.get("day_type_tag", "UNKNOWN")),
+                        "open_bias":         signal.get("open_bias", st_details.get("open_bias", "UNKNOWN")),
+                        "failed_breakout":   bool(signal.get("failed_breakout", False)),
+                        "ema_stretch":       bool(signal.get("ema_stretch", False)),
+                        "ema_stretch_mult":  signal.get("ema_stretch_mult"),
+                        "zone_revisit":      bool(signal.get("zone_revisit", False)),
+                        "zone_revisit_type": signal.get("zone_revisit_type", "NONE"),
+                        "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
+                        "zone_age_bars":     signal.get("zone_age_bars", 0),
                         "order_id":          f"paper_{opt_name}_{ct}",
                         "position_id":       position_id,
                         "entry_time":        ct,
@@ -2526,8 +3336,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "trade_class":       TRADE_CLASS_TREND,
                         "scalp_pt_points":   SCALP_PT_POINTS,
                         "scalp_sl_points":   SCALP_SL_POINTS,
+                        "trend_min_hold_bars": TREND_MIN_HOLD_BARS,
+                        "trend_extreme_move_atr_mult": TREND_EXTREME_MOVE_ATR_MULT,
                         "partial_booked":    False,
                         "partial_tg_booked": False,   # P2-C: partial TG exit tracking
+                        "pm_max_hold":       _pm_max_hold_paper,  # DTC override (None = use default)
+                        "day_type_modifier": getattr(_paper_day_type, "signal_modifier", 0),
                         "hf_exit_manager":   OptionExitManager(
                             entry_price=entry_price,
                             side=side,
@@ -2657,6 +3471,39 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     cpr_pre = calculate_cpr(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
     trad_pre = calculate_traditional_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
     cam_pre = calculate_camarilla_pivots(pivot_src_pre["high"], pivot_src_pre["low"], pivot_src_pre["close"])
+
+    # ── Day Type Classifier (live mode) — init once per calendar day ───────
+    global _live_dtc, _live_dtc_date
+    _today_live = ct.strftime("%Y-%m-%d")
+    if _live_dtc is None or _live_dtc_date != _today_live:
+        try:
+            _live_dtc = make_day_type_classifier(
+                cam_pre, cpr_pre,
+                float(pivot_src_pre["high"]),
+                float(pivot_src_pre["low"]),
+                float(pivot_src_pre["close"]),
+            )
+            _live_dtc_date = _today_live
+            logging.info(
+                f"[DAY TYPE] Live classifier initialized "
+                f"R3={cam_pre.get('r3',float('nan')):.0f} R4={cam_pre.get('r4',float('nan')):.0f} "
+                f"S3={cam_pre.get('s3',float('nan')):.0f} S4={cam_pre.get('s4',float('nan')):.0f}"
+            )
+        except Exception as _dtc_err:
+            logging.debug(f"[DAY TYPE] Live DTC init error: {_dtc_err}")
+
+    _live_day_type = DayTypeResult()   # UNKNOWN default
+    if _live_dtc is not None:
+        try:
+            _live_day_type = _live_dtc.update(candles_3m)
+            # Lock classification at midday when confidence is stable
+            _bar_t_live = ct.hour * 60 + ct.minute
+            if _bar_t_live >= 12 * 60 and _live_day_type.confidence in ("MEDIUM", "HIGH"):
+                _live_dtc.lock_classification()
+                _live_day_type.log()
+        except Exception as _dtc_upd_err:
+            logging.debug(f"[DAY TYPE] Live DTC update error: {_dtc_upd_err}")
+
     breakdown_ctx = _opening_s4_breakdown_context(candles_3m, cpr_pre, cam_pre, pre_atr, ct)
 
     if live_info.get("last_exit_time"):
@@ -2682,15 +3529,21 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
 
     atr = pre_atr
 
-    # 5A. Momentum scalp entry flow (premium burst capture with own cool-down)
+    # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = live_info.get("scalp_cooldown_until")
     if scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
     else:
-        scalp_sig = _detect_scalp_momentum_signal(live_info, spot_price, ct)
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
         if scalp_sig:
+            log_entry_green(
+                f"[ENTRY ATTEMPT][SCALP][LIVE] side={scalp_sig.get('side')} "
+                f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                "long=True"
+            )
             scalp_side = scalp_sig["side"]
             scalp_leg = "call_buy" if scalp_side == "CALL" else "put_buy"
             burst_key = f"{scalp_side}:{last_candle_time}"
@@ -2698,9 +3551,25 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                 logging.info(f"[SCALP SKIP] duplicate burst {burst_key}")
             elif live_info[scalp_leg].get("trade_flag", 0) == 0 and live_info[scalp_leg].get("is_open", False) is False:
                 if live_info.get("trade_count", 0) < live_info.get("max_trades", MAX_TRADES_PER_DAY):
-                    opt_name = scalp_sig["symbol"]
-                    entry_price = float(scalp_sig["price"])
-                    stop = round(entry_price - SCALP_SL_POINTS, 2)
+                    opt_type = "CE" if scalp_side == "CALL" else "PE"
+                    opt_name, _strike = get_option_by_moneyness(
+                        spot_price,
+                        opt_type,
+                        moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
+                    )
+                    if not opt_name:
+                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        return
+
+                    ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
+                    entry_price = float(ltp_val) if (ltp_val is not None and not pd.isna(ltp_val)) else float(spot_price or 0)
+                    if entry_price <= 0:
+                        logging.info(f"[SCALP SKIP] invalid entry premium for {opt_name}")
+                        return
+
+                    atr_sl_mult = float(np.clip(atr * 0.001, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
+                    atr_sl_points = max(SCALP_SL_POINTS, round(entry_price * atr_sl_mult, 2))
+                    stop = round(entry_price - atr_sl_points, 2)
                     pt = round(entry_price + SCALP_PT_POINTS, 2)
                     success, order_id = send_live_entry_order(opt_name, quantity, 1)
                     if success:
@@ -2712,13 +3581,14 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                             "order_type":      ORDER_TYPE,
                             "trade_flag":      1,
                             "pnl":             0,
-                            "reason":          "MOMENTUM_SCALP",
-                            "source":          "MOMENTUM_SCALP",
+                            "reason":          scalp_sig["reason"],
+                            "source":          scalp_sig.get("tag", "SCALP"),
                             "order_id":        order_id,
                             "position_id":     position_id,
                             "entry_time":      ct,
                             "entry_candle":    len(candles_3m) - 1,
                             "side":            scalp_side,
+                            "position_type":   scalp_sig.get("position_type", "LONG"),
                             "position_side":   _long_position_side(scalp_side),
                             "stop":            stop,
                             "pt":              pt,
@@ -2737,7 +3607,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                             "lifecycle_state": "OPEN",
                             "scalp_mode":      True,
                             "scalp_pt_points": SCALP_PT_POINTS,
-                            "scalp_sl_points": SCALP_SL_POINTS,
+                            "scalp_sl_points": atr_sl_points,
+                            "scalp_min_hold_bars": SCALP_MIN_HOLD_BARS,
+                            "scalp_extreme_move_atr_mult": SCALP_EXTREME_MOVE_ATR_MULT,
+                            "scalp_zone":      scalp_sig.get("zone"),
+                            "scalp_zone_level": scalp_sig.get("level"),
+                            "scalp_zone_stop": scalp_sig.get("sl_zone"),
                             "partial_booked":  False,
                             "hf_exit_manager": OptionExitManager(
                                 entry_price=entry_price,
@@ -2757,14 +3632,19 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         }
                         live_info["trade_count"] = live_info.get("trade_count", 0) + 1
                         live_info["scalp_last_burst_key"] = burst_key
-                        logging.info(
+                        log_entry_green(
                             f"[SCALP ENTRY][LIVE] {scalp_side} {opt_name} @ {entry_price:.2f} "
-                            f"PT=+{SCALP_PT_POINTS:.1f} SL=-{SCALP_SL_POINTS:.1f} "
-                            f"reason={scalp_sig['reason']} position_id={position_id}"
+                            f"PT=+{SCALP_PT_POINTS:.1f} SL=-{atr_sl_points:.2f} "
+                            f"reason={scalp_sig['reason']} zone={scalp_sig.get('zone')} "
+                            f"position_type={live_info[scalp_leg].get('position_type', 'LONG')} "
+                            "long=True "
+                            f"position_id={position_id}"
                         )
                         logging.info(
                             f"[SCALP_TRADE] class={TRADE_CLASS_SCALP} side={scalp_side} "
                             f"symbol={opt_name} scalp_mode=True trend_mode=False "
+                            f"position_type={live_info[scalp_leg].get('position_type', 'LONG')} long=True "
+                            f"tag={scalp_sig.get('tag')} "
                             f"position_id={position_id}"
                         )
                         logging.info(
@@ -2779,6 +3659,43 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         return
 
     # 6. Signal evaluation
+    _live_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
+    _live_gap = "NO_GAP"
+    if np.isfinite(_live_close) and np.isfinite(cam_pre.get("r3", float("nan"))) and _live_close > float(cam_pre.get("r3")):
+        _live_gap = "GAP_UP"
+    elif np.isfinite(_live_close) and np.isfinite(cam_pre.get("s3", float("nan"))) and _live_close < float(cam_pre.get("s3")):
+        _live_gap = "GAP_DOWN"
+    _live_bias = "Positive" if _live_gap == "GAP_UP" else ("Negative" if _live_gap == "GAP_DOWN" else "Neutral")
+    _live_open_bias = "UNKNOWN"
+    if np.isfinite(_live_close):
+        if np.isfinite(cam_pre.get("r4", float("nan"))) and _live_close > float(cam_pre.get("r4")):
+            _live_open_bias = "Above R4, continuation likely"
+        elif np.isfinite(cam_pre.get("r3", float("nan"))) and _live_close > float(cam_pre.get("r3")):
+            _live_open_bias = "Above R3, expected momentum continuation"
+        elif np.isfinite(cam_pre.get("s4", float("nan"))) and _live_close < float(cam_pre.get("s4")):
+            _live_open_bias = "Below S4, downside continuation likely"
+        elif np.isfinite(cam_pre.get("s3", float("nan"))) and _live_close < float(cam_pre.get("s3")):
+            _live_open_bias = "Below S3, downside pressure active"
+        else:
+            _live_open_bias = "Inside S3-R3, balanced open"
+
+    # Prefer DTC classification; fall back to gap-based tag for reversal_detector string param
+    _live_dtc_name = getattr(getattr(_live_day_type, "name", None), "value", None)
+    _live_day_type_tag = (
+        _live_dtc_name if (_live_dtc_name and _live_dtc_name != "UNKNOWN")
+        else ("GAP_DAY" if _live_gap in ("GAP_UP", "GAP_DOWN") else "NEUTRAL_DAY")
+    )
+    _rev_sig_live = detect_reversal(
+        candles_3m, cam_pre,
+        current_time=ct,
+        day_type_tag=_live_day_type_tag,
+    )
+    _fb_sig_live = detect_failed_breakout(candles_3m, cam_pre)
+    log_entry_green(
+        f"[ENTRY ATTEMPT][TREND][LIVE] symbol={ticker} "
+        f"atr={atr:.2f} trade_count={live_info.get('trade_count', 0)} "
+        f"day_type={_live_day_type_tag} confidence={getattr(_live_day_type, 'confidence', 'N/A')}"
+    )
     quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
         candles_3m=candles_3m,
         candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
@@ -2787,12 +3704,19 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         adx_min=float(TREND_ENTRY_ADX_MIN),
         cpr_levels=cpr_pre,
         camarilla_levels=cam_pre,
+        reversal_signal=_rev_sig_live,
+        failed_breakout_signal=_fb_sig_live,
+        day_type_result=_live_day_type,
+        open_bias_context={"gap_tag": _live_gap, "bias": _live_bias, "open_bias": _live_open_bias},
     )
     if not quality_ok:
-        tag = "ST_CONFLICT" if "Supertrend conflict" in gate_reason else (
-            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else (
-                "WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME"
-            )
+        tag = (
+            "ST_CONFLICT" if "Supertrend conflict" in gate_reason else
+            "SLOPE_MISMATCH" if "Slope mismatch" in gate_reason else
+            "WEAK_ADX" if "Weak trend strength" in gate_reason else
+            "FAILED_BREAKOUT" if "Failed breakout" in gate_reason else
+            "EMA_STRETCH" if "EMA stretch" in gate_reason else
+            "OSC_EXTREME"
         )
         logging.info(
             f"[ENTRY BLOCKED][{tag}] "
@@ -2851,6 +3775,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         vwap=tpma,
         orb_high=orb_h,
         orb_low=orb_l,
+        osc_relief_active=st_details.get("osc_relief_override", False),
     )
 
     # 7. Entry
@@ -2862,6 +3787,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     side   = signal["side"]
     reason = signal["reason"]
     source = signal.get("source", "UNKNOWN")
+    signal["osc_context"] = st_details.get("osc_context", "UNKNOWN")
+    signal["day_type"] = st_details.get("day_type_tag", "UNKNOWN")
+    signal["open_bias"] = st_details.get("open_bias", "UNKNOWN")
+    signal["failed_breakout"] = bool(st_details.get("failed_breakout", False))
+    signal["ema_stretch"] = bool(st_details.get("ema_stretch_tagged", False))
+    signal["ema_stretch_mult"] = st_details.get("ema_stretch_mult")
     tpma_str = f"{tpma:.1f}" if tpma else "N/A"  # Format tpma conditionally
     logging.info(
         f"[SIGNAL][LIVE] {side} score={signal.get('score','?')} "
@@ -2909,10 +3840,13 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     return
 
                 # FIX: pass candles_df
+                _last_bar_live = candles_3m.iloc[-1] if candles_3m is not None and not candles_3m.empty else None
+                _adx_entry_live = float(_last_bar_live.get("adx14", 0)) if _last_bar_live is not None and pd.notna(_last_bar_live.get("adx14")) else 0.0
                 levels = build_dynamic_levels(
                     entry_price, atr, side,
                     entry_candle=len(candles_3m) - 1,
-                    candles_df=candles_3m
+                    candles_df=candles_3m,
+                    adx_value=_adx_entry_live,
                 )
                 if not levels.get("valid", False):
                     logging.warning(f"[ENTRY SKIP] {side} levels failed")
@@ -2922,6 +3856,21 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                 tg = levels["tg"]
                 trail_start = levels["trail_start"]
                 trail_step = levels["trail_step"]
+
+                # Apply DTC PM modifiers: override trail_step / record pm_max_hold
+                _pm_max_hold_live = None
+                if _live_day_type.pm_trail_step is not None:
+                    trail_step = _live_day_type.pm_trail_step
+                    logging.debug(
+                        f"[DAY_TYPE][PM] LIVE trail_step→{trail_step:.3f} "
+                        f"day_type={_live_day_type_tag} confidence={_live_day_type.confidence}"
+                    )
+                if _live_day_type.pm_max_hold is not None:
+                    _pm_max_hold_live = _live_day_type.pm_max_hold
+                    logging.debug(
+                        f"[DAY_TYPE][PM] LIVE pm_max_hold→{_pm_max_hold_live} "
+                        f"day_type={_live_day_type_tag} confidence={_live_day_type.confidence}"
+                    )
 
                 if atr is None or pd.isna(atr):
                     regime_context = "ATR_UNKNOWN"
@@ -2952,6 +3901,16 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     "pnl":            0,
                     "reason":         reason,
                     "source":         source,
+                    "osc_context":    signal.get("osc_context", st_details.get("osc_context", "UNKNOWN")),
+                    "day_type":       signal.get("day_type", st_details.get("day_type_tag", "UNKNOWN")),
+                    "open_bias":      signal.get("open_bias", st_details.get("open_bias", "UNKNOWN")),
+                    "failed_breakout": bool(signal.get("failed_breakout", False)),
+                    "ema_stretch":    bool(signal.get("ema_stretch", False)),
+                    "ema_stretch_mult": signal.get("ema_stretch_mult"),
+                    "zone_revisit":   bool(signal.get("zone_revisit", False)),
+                    "zone_revisit_type": signal.get("zone_revisit_type", "NONE"),
+                    "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
+                    "zone_age_bars":  signal.get("zone_age_bars", 0),
                     "order_id":       order_id,
                     "position_id":    position_id,
                     "entry_time":     ct,
@@ -2976,7 +3935,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     "scalp_mode":     False,
                     "scalp_pt_points": SCALP_PT_POINTS,
                     "scalp_sl_points": SCALP_SL_POINTS,
+                    "trend_min_hold_bars": TREND_MIN_HOLD_BARS,
+                    "trend_extreme_move_atr_mult": TREND_EXTREME_MOVE_ATR_MULT,
                     "partial_booked": False,
+                    "pm_max_hold":    _pm_max_hold_live,   # DTC override (None = use default)
+                    "day_type_modifier": getattr(_live_day_type, "signal_modifier", 0),
                     "hf_exit_manager": OptionExitManager(
                         entry_price=entry_price,
                         side=side,
@@ -3455,6 +4418,29 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         # DTC is updated every bar; locked at 12:00 (midday — classification stable).
         _dtc      = None   # populated on first bar below
         _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
+        _opening_bias_logged = False
+        _session_open_price = None
+        _session_prev_close = None
+        _open_bias_context = {"gap_tag": "UNKNOWN", "bias": "Unknown", "open_bias": "UNKNOWN"}
+        _zone_revisit_signal = None
+        _zone_cache = pathlib.Path(f"zones_{sym.replace(':', '_')}_{date_str or 'session'}.json")
+        _zones = load_zones(_zone_cache)
+        if not _zones:
+            _hist_15m = detect_zones(df_15m_all)
+            _zones = _hist_15m
+        if not _zones:
+            _fyers_df_15m = pd.DataFrame()
+            try:
+                from zone_detector import fetch_fyers_15m_history
+                _fyers_df_15m = fetch_fyers_15m_history(fyers, sym, days=10)
+            except Exception:
+                _fyers_df_15m = pd.DataFrame()
+            if not _fyers_df_15m.empty:
+                _zones = detect_zones(_fyers_df_15m)
+        if _zones:
+            save_zones(_zones, _zone_cache)
+        if _zones:
+            logging.info(f"[ZONE_CONTEXT] zones_loaded={len(_zones)} cache={_zone_cache}")
 
         # ── Compression state — fresh per symbol/session ───────────────────────
         _comp_state = CompressionState()
@@ -3492,6 +4478,8 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             # ── Bar time gate ─────────────────────────────────────────────────
             ts    = pd.Timestamp(bar_time)
             bar_t = ts.hour * 60 + ts.minute
+            if _session_open_price is None and np.isfinite(bar_close):
+                _session_open_price = float(bar_close)
 
             # ── Day Type Classifier — update every bar ─────────────────────────
             # Initialize DTC on first bar using previous-session OHLC
@@ -3510,6 +4498,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                         float(prev_bar["low"]),
                         float(prev_bar["close"]),
                     )
+                    _session_prev_close = float(prev_bar["close"])
                     logging.info(
                         f"[DAY TYPE] Classifier initialized "
                         f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
@@ -3522,6 +4511,53 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             if _dtc is not None:
                 _day_type = _dtc.update(slice_3m)
+                if (not _opening_bias_logged) and bar_t >= (9 * 60 + 30):
+                    _opening_bias_logged = True
+                    _gap_pct = float("nan")
+                    if (
+                        _session_open_price is not None
+                        and _session_prev_close is not None
+                        and _session_prev_close != 0
+                    ):
+                        _gap_pct = ((_session_open_price - _session_prev_close) / _session_prev_close) * 100.0
+
+                    if np.isfinite(_gap_pct):
+                        if _gap_pct >= 0.5:
+                            _gap_tag = "GAP_UP"
+                            _bias_txt = "Positive"
+                        elif _gap_pct <= -0.5:
+                            _gap_tag = "GAP_DOWN"
+                            _bias_txt = "Negative"
+                        else:
+                            _gap_tag = "NEUTRAL"
+                            _bias_txt = "Neutral"
+                    else:
+                        _gap_tag = "UNKNOWN"
+                        _bias_txt = "Unknown"
+
+                    _open_bias_msg = "Inside S3-R3, balanced open"
+                    _close_ref = float(slice_3m["close"].iloc[-1]) if len(slice_3m) else float("nan")
+                    _cam_ctx = getattr(_dtc, "pc", None)
+                    if _cam_ctx is not None and np.isfinite(_close_ref):
+                        if np.isfinite(_cam_ctx.r4) and _close_ref > _cam_ctx.r4:
+                            _open_bias_msg = "Above R4, continuation likely"
+                        elif np.isfinite(_cam_ctx.r3) and _close_ref > _cam_ctx.r3:
+                            _open_bias_msg = "Above R3, expected momentum continuation"
+                        elif np.isfinite(_cam_ctx.s4) and _close_ref < _cam_ctx.s4:
+                            _open_bias_msg = "Below S4, downside continuation likely"
+                        elif np.isfinite(_cam_ctx.s3) and _close_ref < _cam_ctx.s3:
+                            _open_bias_msg = "Below S3, downside pressure active"
+
+                    logging.info(
+                        "[DAY_TYPE] "
+                        f"{_gap_tag} bias={_bias_txt} open={_gap_pct:+.2f}% vs prev close"
+                    )
+                    logging.info(f"[OPEN_BIAS] {_open_bias_msg}")
+                    _open_bias_context = {
+                        "gap_tag": _gap_tag,
+                        "bias": _bias_txt,
+                        "open_bias": _open_bias_msg,
+                    }
                 # Lock classification at 12:00 (midday — stable for rest of session)
                 if bar_t == 12 * 60 and _day_type.confidence in ("MEDIUM", "HIGH"):
                     _dtc.lock_classification()
@@ -3593,6 +4629,15 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"strength={comp_sig['compression_zone']['compression_strength']:.1f}x "
                     f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f}{RESET}"
                 )
+                # P3: bias alignment for compression trades
+                _comp_gap = _open_bias_context.get("gap_tag", "UNKNOWN")
+                _comp_side = comp_sig["side"]
+                if _comp_gap == "UNKNOWN":
+                    comp_sig["open_bias_aligned"] = "NEUTRAL"
+                elif (_comp_side == "CALL" and _comp_gap == "GAP_UP") or (_comp_side == "PUT" and _comp_gap == "GAP_DOWN"):
+                    comp_sig["open_bias_aligned"] = "ALIGNED"
+                else:
+                    comp_sig["open_bias_aligned"] = "MISALIGNED"
                 apply_day_type_to_pm(pm, _day_type)
                 pm.open(i, bar_time, bar_close, entry_premium, comp_sig)
                 signals_fired.append({
@@ -3620,7 +4665,20 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
             trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
             cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+            if np.isfinite(atr):
+                update_zone_activity(_zones, bar_close, float(atr), bar_time)
+                _zone_revisit_signal = detect_zone_revisit(slice_3m, _zones, float(atr))
 
+            _rev_day_type_tag = (
+                getattr(getattr(_day_type, "name", None), "value", None)
+                if _day_type is not None else None
+            )
+            _rev_sig_replay = detect_reversal(
+                slice_3m, cam,
+                current_time=bar_time,
+                day_type_tag=_rev_day_type_tag,
+            )
+            _fb_sig_replay = detect_failed_breakout(slice_3m, cam)
             quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
                 candles_3m=slice_3m,
                 candles_15m=slice_15m,
@@ -3629,6 +4687,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 adx_min=float(TREND_ENTRY_ADX_MIN),
                 cpr_levels=cpr,
                 camarilla_levels=cam,
+                reversal_signal=_rev_sig_replay,
+                failed_breakout_signal=_fb_sig_replay,
+                day_type_result=_day_type,
+                open_bias_context=_open_bias_context,
             )
             if not quality_ok:
                 blocker_key = (
@@ -3637,7 +4699,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     else (
                         "SLOPE_MISMATCH"
                         if "Slope mismatch" in gate_reason
-                        else ("WEAK_ADX" if "Weak trend strength" in gate_reason else "OSC_EXTREME")
+                        else (
+                            "WEAK_ADX" if "Weak trend strength" in gate_reason else (
+                                "FAILED_BREAKOUT" if "Failed breakout" in gate_reason else (
+                                    "EMA_STRETCH" if "EMA stretch" in gate_reason else "OSC_EXTREME"
+                                )
+                            )
+                        )
                     )
                 )
                 blocker_counts[blocker_key] = blocker_counts.get(blocker_key, 0) + 1
@@ -3670,6 +4738,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     orb_high=orb_h,
                     orb_low=orb_l,
                     day_type_result=_day_type,
+                    osc_relief_active=st_details.get("osc_relief_override", False),
                 )
             except Exception as e:
                 logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
@@ -3708,7 +4777,27 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             # Enrich signal with current ST and day type for PM entry tracking
             signal["st_bias"]  = str(last_row.get("supertrend_bias", "?"))
             signal["pivot"]    = signal.get("pivot", "")
-            signal["day_type"] = _day_type.name.value
+            signal["day_type"] = st_details.get("day_type_tag", _day_type.name.value)
+            signal["osc_context"] = st_details.get("osc_context", "UNKNOWN")
+            signal["open_bias"] = st_details.get("open_bias", _open_bias_context.get("open_bias", "UNKNOWN"))
+            signal["failed_breakout"] = bool(st_details.get("failed_breakout", False))
+            signal["ema_stretch"] = bool(st_details.get("ema_stretch_tagged", False))
+            signal["ema_stretch_mult"] = st_details.get("ema_stretch_mult")
+            if isinstance(_zone_revisit_signal, dict):
+                signal["zone_revisit"] = True
+                signal["zone_revisit_type"] = _zone_revisit_signal.get("zone_type", "UNKNOWN")
+                signal["zone_revisit_action"] = _zone_revisit_signal.get("action", "UNKNOWN")
+                signal["zone_age_bars"] = _zone_revisit_signal.get("zone_age_bars", 0)
+
+            # P3: Attach open_bias_aligned for log_parser trade attribution.
+            # A CALL trade aligns with a bullish open (GAP_UP); PUT aligns with GAP_DOWN.
+            _gap = _open_bias_context.get("gap_tag", "UNKNOWN")
+            if _gap == "UNKNOWN":
+                signal["open_bias_aligned"] = "NEUTRAL"
+            elif (side == "CALL" and _gap == "GAP_UP") or (side == "PUT" and _gap == "GAP_DOWN"):
+                signal["open_bias_aligned"] = "ALIGNED"
+            else:
+                signal["open_bias_aligned"] = "MISALIGNED"
 
             # Apply day type overrides to PM (trail step, max hold)
             apply_day_type_to_pm(pm, _day_type)
@@ -3740,6 +4829,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 "reason":      reason,
                 "source":      source,
                 "pivot":       signal.get("pivot", ""),
+                "osc_context": signal.get("osc_context", "UNKNOWN"),
+                "day_type":    signal.get("day_type", "UNKNOWN"),
+                "open_bias":   signal.get("open_bias", "UNKNOWN"),
+                "failed_breakout": signal.get("failed_breakout", False),
+                "ema_stretch": signal.get("ema_stretch", False),
+                "zone_revisit": signal.get("zone_revisit", False),
+                "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
                 "underlying":  bar_close,
                 "est_premium": entry_premium,
             })

@@ -49,6 +49,11 @@ MAX_TRADES_PER_DAY = 8          # P3-D: Reduced from 20 → 8. Options buying re
                                 # high-conviction setups. Lower frequency → lower theta
                                 # drag and spread cost across the session.
 
+# ── Default Lot Size ────────────────────────────────────────────────────────────
+# All trade sizing must reference DEFAULT_LOT_SIZE — never hard-code quantities.
+# Override at runtime:  DEFAULT_LOT_SIZE=1 python execution.py
+DEFAULT_LOT_SIZE = int(os.getenv("DEFAULT_LOT_SIZE", "2"))
+
 CALL_MONEYNESS = 'ITM'          # strike/contract type - ITM/OTM  
 PUT_MONEYNESS  = 'ITM'
 
@@ -112,7 +117,9 @@ OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
 #   Both overridable via env vars of the same name.
 # ==================================================================
 
-TREND_ENTRY_ADX_MIN = float(os.getenv("TREND_ENTRY_ADX_MIN", "18.0"))
+TREND_ENTRY_ADX_MIN  = float(os.getenv("TREND_ENTRY_ADX_MIN",  "18.0"))
+SLOPE_ADX_GATE       = float(os.getenv("SLOPE_ADX_GATE",       "20.0"))
+TIME_SLOPE_ADX_GATE  = float(os.getenv("TIME_SLOPE_ADX_GATE",  "25.0"))   # Path D: post-11:00 flat slope allowed if ADX < this
 ST_RR_RATIO         = float(os.getenv("ST_RR_RATIO",         "2.0"))
 ST_TG_RR_RATIO      = float(os.getenv("ST_TG_RR_RATIO",      "1.0"))
 
@@ -127,6 +134,10 @@ MODE =   "STRATEGY"                         # "COLLECT" or "STRATEGY"      # Col
 
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,3 +153,4 @@ logging.info(
     f"[ENTRY CONFIG] TREND_ENTRY_ADX_MIN={TREND_ENTRY_ADX_MIN} "
     f"ST_RR_RATIO={ST_RR_RATIO} ST_TG_RR_RATIO={ST_TG_RR_RATIO}"
 )
+logging.info(f"[CONFIG] DEFAULT_LOT_SIZE={DEFAULT_LOT_SIZE}")

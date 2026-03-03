@@ -116,6 +116,12 @@ THRESHOLDS = {
 ATR_LOW_MAX  = 15    # below → LOW regime (blocked)
 ATR_HIGH_MIN = 120   # above → HIGH regime
 
+# ── Volatility context scoring constants ───────────────────────────────────────
+# Theta penalty: abs(theta) pts/day > threshold → apply score penalty
+_THETA_PENALTY_THRESHOLD = 5.0
+# Vega risk high: vega pts per 1% vol move > threshold → reduce position size
+_VEGA_RISK_HIGH = 15.0
+
 # ── Pivot tier multipliers (applied within type bracket) ───────────────────────
 # Used to differentiate quality within Acceptance/Rejection/Breakout brackets.
 _TIER1_LEVELS = {"R4", "R5", "H4", "H5", "S4", "S5", "L4", "L5"}
@@ -506,7 +512,15 @@ def _score_open_bias(indicators, side):
 
 def check_entry_condition(candle, indicators, bias_15m,
                           pivot_signal=None, current_time=None,
-                          day_type_result=None):
+                          day_type_result=None,
+                          reversal_signal=None,
+                          osc_relief_active=False,
+                          lot_size=None,
+                          expiry=None,
+                          is_expiry_roll=False,
+                          symbol=None,
+                          vix_tier=None,
+                          greeks=None):
     """
     Scoring engine v5 — complete spec implementation.
 
@@ -542,6 +556,7 @@ def check_entry_condition(candle, indicators, bias_15m,
         "score":     0,
         "threshold": 52,
         "breakdown": {},
+        "lot_size":  None,   # filled in after lot-size enforcement block
     }
 
     # ── 1. ATR regime gate ────────────────────────────────────────────────────
@@ -560,13 +575,32 @@ def check_entry_condition(candle, indicators, bias_15m,
 
     # ── 2. RSI exhaustion guard ───────────────────────────────────────────────
     _rsi_3m = _safe_float(candle.get("rsi14") or candle.get("rsi"))
-    if _rsi_3m is not None:
+    _reversal_override_active = (
+        reversal_signal is not None and reversal_signal.get("side") in ("CALL", "PUT")
+    )
+    if _rsi_3m is not None and not _reversal_override_active:
         if _rsi_3m < 30:
             result["reason"] = f"RSI_OVERSOLD ({_rsi_3m:.1f}<30) — PUT into capitulation blocked"
             return result
         if _rsi_3m > 75:
             result["reason"] = f"RSI_OVERBOUGHT ({_rsi_3m:.1f}>75) — CALL into exhaustion blocked"
             return result
+    elif _rsi_3m is not None and _reversal_override_active:
+        # Reversal detector is active: oscillator extremes become CONFIRMATION, not blockers
+        rev_side = reversal_signal["side"]
+        if _rsi_3m < 30 and rev_side != "CALL":
+            result["reason"] = f"RSI_OVERSOLD ({_rsi_3m:.1f}<30) — reversal side mismatch, blocked"
+            return result
+        if _rsi_3m > 75 and rev_side != "PUT":
+            result["reason"] = f"RSI_OVERBOUGHT ({_rsi_3m:.1f}>75) — reversal side mismatch, blocked"
+            return result
+        logging.info(
+            f"{CYAN}[REVERSAL_OVERRIDE] RSI={_rsi_3m:.1f} oscillator extreme flipped to "
+            f"confirmation for {rev_side} reversal "
+            f"score={reversal_signal.get('score')} "
+            f"strength={reversal_signal.get('strength')} "
+            f"pivot_zone={reversal_signal.get('pivot_zone')}{RESET}"
+        )
 
     # ── 3. Time-of-day filters ────────────────────────────────────────────────
     _late_session   = False
@@ -605,6 +639,22 @@ def check_entry_condition(candle, indicators, bias_15m,
         if t >= 14 * 60:
             _late_session = True
 
+    # ── Lot size enforcement ──────────────────────────────────────────────────
+    # Resolve effective lot size: caller-supplied → config default → 1 (safe fallback).
+    try:
+        import config as _cfg
+        _config_lot = _cfg.DEFAULT_LOT_SIZE
+    except Exception:
+        _config_lot = None
+
+    _effective_lot = lot_size if lot_size is not None else (_config_lot or 1)
+    _sym_label = symbol or "NIFTY"
+    logging.debug(
+        f"[LOT_SIZE] symbol={_sym_label} applied={_effective_lot} "
+        f"source={'caller' if lot_size is not None else 'config'}"
+    )
+    result["lot_size"] = _effective_lot
+
     # ── Per-side scoring loop ─────────────────────────────────────────────────
     best_score, best_side, best_bd, best_threshold = -1, "CALL", {}, threshold
 
@@ -622,7 +672,13 @@ def check_entry_condition(candle, indicators, bias_15m,
         # ── 5. RSI directional hard filter ────────────────────────────────────
         # Spec: RSI > 55 rising for CALL, RSI < 45 falling for PUT.
         # Hard boundary at 50: RSI > 50 → no bearish momentum for PUT.
-        if _rsi_3m is not None:
+        # Exception: when reversal_signal is active and matches this side,
+        # the extreme RSI is a CONFIRMATION — bypass the directional filter.
+        _rev_matches_side = (
+            _reversal_override_active
+            and reversal_signal.get("side") == side
+        )
+        if _rsi_3m is not None and not _rev_matches_side:
             if side == "PUT"  and _rsi_3m > 50:
                 logging.debug(
                     f"[DEBUG SIDE][PUT BLOCKED] RSI_DIRECTIONAL: RSI={_rsi_3m:.1f}>50 (no bearish momentum)"
@@ -704,7 +760,112 @@ def check_entry_condition(candle, indicators, bias_15m,
             "adx_strength":     _score_adx(indicators),
             "open_bias_score":  _score_open_bias(indicators, side),
         }
+
+        # Reversal bonus: HIGH-strength reversal signal aligned with this side
+        # adds up to 15 pts to confirm the mean-reversion conviction.
+        if _rev_matches_side:
+            rev_score  = reversal_signal.get("score", 0)
+            rev_bonus  = 15 if rev_score >= 75 else (10 if rev_score >= 50 else 5)
+            bd["reversal_override"] = rev_bonus
+            logging.debug(
+                f"[REVERSAL_OVERRIDE][{side}] bonus={rev_bonus} "
+                f"reversal_score={rev_score} pivot={reversal_signal.get('pivot_zone')}"
+            )
+        else:
+            bd["reversal_override"] = 0
+
+        # Expiry roll bonus: +5 pts when position is rolled into next expiry contract
+        # Confirms the trader has correctly identified and applied contract roll logic.
+        if is_expiry_roll:
+            bd["expiry_roll"] = 5
+            logging.debug(
+                f"[EXPIRY_ROLL][SCORE_BONUS][{side}] +5 pts "
+                f"lot_size={lot_size} expiry={expiry} "
+                "reason=position rolled to next expiry with valid intrinsic"
+            )
+        else:
+            bd["expiry_roll"] = 0
+
+        # OSC relief bonus: +10 pts when S4/R4 breakout relief applied
+        # Price has traded decisively outside Camarilla extremes — continuation likely.
+        if osc_relief_active:
+            bd["relief_override"] = 10
+            logging.debug(
+                f"[OSC_RELIEF][SCORE_BONUS][{side}] +10 pts "
+                "reason=S4/R4 breakout relief applied, oscillator exhaustion bypassed"
+            )
+        else:
+            bd["relief_override"] = 0
+
+        # Volatility context score adjustment (VIX tier)
+        # CALM   VIX (<15): low vol → false signals more common; suppress marginal entries
+        # HIGH   VIX (≥20): high vol → conviction signals carry more premium value
+        # NEUTRAL VIX:      no adjustment
+        _vol_adj = 0
+        if vix_tier == "HIGH":
+            _vol_adj = 5
+        elif vix_tier == "CALM":
+            _vol_adj = -5
+        bd["vol_context"] = _vol_adj
+
+        # Indicator–Volatility alignment: log how VIX tier shapes gating + ATR stops
+        if vix_tier is not None:
+            _atr_stops = "TIGHTER" if vix_tier == "CALM" else ("WIDER" if vix_tier == "HIGH" else "NORMAL")
+            _osc_gate  = "STRICTER" if vix_tier == "CALM" else ("RELAXED" if vix_tier == "HIGH" else "NORMAL")
+            _adx_log   = str(_safe_float(indicators.get("adx14")) or "?")
+            _rsi_log_a = f"{_rsi_3m:.1f}" if _rsi_3m is not None else "?"
+            logging.debug(
+                f"[VOL_CONTEXT][ALIGN][{side}] "
+                f"indicators=RSI:{_rsi_log_a}_ADX:{_adx_log} "
+                f"vix_tier={vix_tier} "
+                f"adj=score:{_vol_adj:+d}_osc:{_osc_gate}_atr:{_atr_stops}"
+            )
+
+        # Theta decay penalty: penalise entries with high daily theta decay
+        # High theta erodes premium quickly — reduces expected holding value
+        _theta_adj = 0
+        _theta_val = getattr(greeks, "theta", None) if greeks is not None else None
+        _vega_val  = getattr(greeks, "vega",  None) if greeks is not None else None
+        if _theta_val is not None and abs(_theta_val) > _THETA_PENALTY_THRESHOLD:
+            _theta_adj = -8
+        bd["theta_penalty"] = _theta_adj
+
+        # Indicator–Greeks alignment: log theta/vega risk characterisation
+        if greeks is not None:
+            _vega_risk = (
+                "HIGH" if (_vega_val is not None and abs(_vega_val) > _VEGA_RISK_HIGH) else "NORMAL"
+            )
+            logging.debug(
+                f"[GREEKS_ALIGN][{side}] "
+                f"symbol={symbol or 'N/A'} "
+                f"theta={_theta_val if _theta_val is not None else 'N/A'} "
+                f"vega={_vega_val if _vega_val is not None else 'N/A'} "
+                f"adj=theta:{_theta_adj:+d}_vega_risk:{_vega_risk}"
+            )
+
+        # Log combined vol-context adjustment once per side when any adjustment applies
+        if vix_tier is not None or greeks is not None:
+            logging.debug(
+                f"[VOL_CONTEXT][SCORE_ADJUST][{side}] "
+                f"vix_tier={vix_tier or 'N/A'} "
+                f"vol_adj={_vol_adj} "
+                f"theta={_theta_val if _theta_val is not None else 'N/A'} "
+                f"theta_adj={_theta_adj} "
+                f"vega={_vega_val if _vega_val is not None else 'N/A'}"
+            )
+
         total = sum(bd.values())
+
+        # Scoring matrix audit: log base + each vol adjustment + final vs threshold
+        if _vol_adj != 0 or _theta_adj != 0:
+            _base_score = total - _vol_adj - _theta_adj
+            logging.debug(
+                f"[SCORE_MATRIX][{side}] "
+                f"base={_base_score} "
+                f"vol_adj={_vol_adj:+d} "
+                f"theta_adj={_theta_adj:+d} "
+                f"final={total}/{side_threshold}"
+            )
 
         # Enhanced logging: show indicator availability + scorer breakdown
         _mom_state = "OK" if indicators.get("momentum_ok_" + side.lower()) else "NO"
@@ -774,6 +935,28 @@ def check_entry_condition(candle, indicators, bias_15m,
             reason=f"Score={best_score}/{best_threshold} ({regime}) side={best_side}"
         )
 
+        # ── Volatility-adjusted position sizing ───────────────────────────────
+        # Scale lots by: confidence, ATR, VIX tier, Vega risk.
+        # Floor at 1 lot; cap at config default (already resolved as _effective_lot).
+        _vix_reduce  = (vix_tier in ("HIGH", "CALM"))  # both vol extremes reduce lots
+        _vega_reduce = (
+            greeks is not None
+            and abs(getattr(greeks, "vega", 0.0)) > _VEGA_RISK_HIGH
+        )
+        _conf_low    = (best_score < best_threshold + 5)   # marginal entry
+        # Each active risk flag reduces by 1 lot (cumulative, floored at 1)
+        _lot_cuts  = sum([bool(_vix_reduce), bool(_vega_reduce), bool(_conf_low)])
+        _sized_lots = max(1, _effective_lot - _lot_cuts)
+        _sized_lots = min(_sized_lots, _effective_lot)    # hard cap at config lot
+        result["lot_size"] = _sized_lots
+
+        logging.info(
+            f"[POSITION_SIZE] equity=N/A score={best_score} atr={atr:.1f} "
+            f"vix_tier={vix_tier or 'N/A'} "
+            f"vega_high={_vega_reduce} conf_low={_conf_low} "
+            f"lots={_sized_lots}"
+        )
+
         # ── Audit annotation ──────────────────────────────────────────────────
         surcharge_flags = []
         if (best_side == "CALL" and st_bias_3m == "BEARISH") or \
@@ -810,6 +993,8 @@ def check_entry_condition(candle, indicators, bias_15m,
         _ob_val  = indicators.get("open_bias", "NONE")
         _ob_pts  = best_bd.get("open_bias_score", 0)
         _ob_s    = f" OB={_ob_val}({_ob_pts:+d})" if _ob_val != "NONE" else ""
+        _rev_pts = best_bd.get("reversal_override", 0)
+        _rev_s   = f" [REVERSAL_OVERRIDE+{_rev_pts}]" if _rev_pts > 0 else ""
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
             f"{surcharge_note} {regime} {strength}"
@@ -818,7 +1003,7 @@ def check_entry_condition(candle, indicators, bias_15m,
             f" VWAP={best_bd.get('vwap_position',0)}/5"
             f" PIV={best_bd.get('pivot_structure',0)}/15"
             f" {_mom_s} {_cpr_s} {_adx_s}"
-            f"{_ob_s}{_piv_s}{RESET}"
+            f"{_ob_s}{_rev_s}{_piv_s}{RESET}"
         )
     else:
         result["reason"] = (

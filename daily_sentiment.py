@@ -835,11 +835,169 @@ def get_daily_sentiment_from_candles(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DAY TYPE CLASSIFICATION  (TREND_DAY / RANGE_DAY / GAP_DAY / BALANCE_DAY)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_day_type(
+    day_type_pred: str,
+    gap_tag: str,
+    balance_tag: str,
+) -> str:
+    """Map internal day-type prediction + open tags to a canonical day-type label.
+
+    Priority:
+      1. GAP_UP / GAP_DOWN → GAP_DAY   (gap always overrides)
+      2. BALANCE_OPEN       → BALANCE_DAY
+      3. TRENDING           → TREND_DAY
+      4. RANGE              → RANGE_DAY
+      5. Fallback           → NEUTRAL_DAY
+
+    Parameters
+    ----------
+    day_type_pred : "TRENDING" | "RANGE" | "NEUTRAL"  (from _predict_cpr_day_type)
+    gap_tag       : "GAP_UP" | "GAP_DOWN" | "NO_GAP"
+    balance_tag   : "BALANCE_OPEN" | "OUTSIDE_BALANCE"
+
+    Returns
+    -------
+    "TREND_DAY" | "RANGE_DAY" | "GAP_DAY" | "BALANCE_DAY" | "NEUTRAL_DAY"
+    """
+    if gap_tag in ("GAP_UP", "GAP_DOWN"):
+        return "GAP_DAY"
+    if balance_tag == "BALANCE_OPEN":
+        return "BALANCE_DAY"
+    if day_type_pred == "TRENDING":
+        return "TREND_DAY"
+    if day_type_pred == "RANGE":
+        return "RANGE_DAY"
+    return "NEUTRAL_DAY"
+
+
+def compute_intraday_sentiment(
+    today_open: float,
+    today_high: float,
+    today_low: float,
+    prev_close: float,
+    prev_high: float,
+    prev_low: float,
+    cpr_levels: dict,
+    camarilla_levels: dict,
+    compression_state_at_close: str = "NEUTRAL",
+    atr_value: float = None,
+    timestamp_label: str = "",
+) -> dict:
+    """Compute and log comprehensive intraday sentiment after the first 15m bar.
+
+    Combines pre-session daily sentiment with live opening bias tags.
+    Should be called:
+      - At 09:30 after the first 15m bar closes.
+      - At 09:45 for re-evaluation.
+      - Periodically thereafter for monitoring.
+
+    All classification tags (day_type_tag, open_bias_tag, gap_tag, balance_tag,
+    cpr_width) are computed and logged immediately.
+
+    Parameters
+    ----------
+    today_open, today_high, today_low:
+        First intraday candle OHLC (e.g. first 3m bar).
+    prev_close, prev_high, prev_low:
+        Prior-day OHLC for the underlying.
+    cpr_levels, camarilla_levels:
+        Pivot level dicts.
+    compression_state_at_close:
+        Prior-day compression state string.
+    atr_value:
+        ATR(14) value (prior-day 15m).
+    timestamp_label:
+        Human-readable label for log context (e.g. "09:30", "09:45").
+
+    Returns
+    -------
+    dict with all keys from get_daily_sentiment() plus:
+        day_type_tag   : "TREND_DAY" | "RANGE_DAY" | "GAP_DAY" | "BALANCE_DAY" | "NEUTRAL_DAY"
+        open_bias_tag  : "OPEN_HIGH" | "OPEN_LOW" | "NONE"
+        gap_tag        : "GAP_UP" | "GAP_DOWN" | "NO_GAP"
+        balance_tag    : "BALANCE_OPEN" | "OUTSIDE_BALANCE"
+        vs_close_tag   : "OPEN_ABOVE_CLOSE" | "OPEN_BELOW_CLOSE" | "OPEN_CLOSE_EQUAL"
+        cpr_width      : "NARROW" | "NORMAL" | "WIDE"
+    """
+    # Pre-session base sentiment
+    ds = get_daily_sentiment(
+        prev_high=prev_high,
+        prev_low=prev_low,
+        prev_close=prev_close,
+        cpr_levels=cpr_levels,
+        camarilla_levels=camarilla_levels,
+        compression_state_at_close=compression_state_at_close,
+        atr_value=atr_value,
+    )
+
+    # Opening bias (post-open tags)
+    opening = get_opening_bias(
+        today_open=today_open,
+        today_high=today_high,
+        today_low=today_low,
+        prev_close=prev_close,
+        prev_high=prev_high,
+        prev_low=prev_low,
+        cpr_bc=_safe_float(cpr_levels.get("bc")),
+        cpr_tc=_safe_float(cpr_levels.get("tc")),
+    )
+
+    open_bias_tag = opening["open_pos_tag"]
+    gap_tag       = opening["gap_tag"]
+    vs_close_tag  = opening["vs_close_tag"]
+    balance_tag   = opening["balance_tag"]
+
+    # CPR width classification
+    tc = _safe_float(cpr_levels.get("tc"))
+    bc = _safe_float(cpr_levels.get("bc"))
+    ref = float(atr_value) if atr_value and float(atr_value) > 0 else None
+    if tc is not None and bc is not None and ref:
+        ratio = (tc - bc) / ref
+        cpr_width = "NARROW" if ratio < 0.25 else ("WIDE" if ratio > 0.80 else "NORMAL")
+    else:
+        cpr_width = "NORMAL"
+
+    # Canonical day type tag
+    day_type_tag = classify_day_type(
+        day_type_pred=ds.get("day_type_pred", "NEUTRAL"),
+        gap_tag=gap_tag,
+        balance_tag=balance_tag,
+    )
+
+    label = f"[{timestamp_label}] " if timestamp_label else ""
+    logging.info(
+        f"{CYAN}[DAY_TYPE]{label} "
+        f"day_type_tag={day_type_tag} "
+        f"open_bias={open_bias_tag} "
+        f"gap={gap_tag} "
+        f"balance={balance_tag} "
+        f"vs_close={vs_close_tag} "
+        f"cpr_width={cpr_width} "
+        f"sentiment={ds['sentiment']} "
+        f"preferred_side={ds['preferred_side']}{RESET}"
+    )
+
+    result = {**ds}
+    result["day_type_tag"]  = day_type_tag
+    result["open_bias_tag"] = open_bias_tag
+    result["gap_tag"]       = gap_tag
+    result["balance_tag"]   = balance_tag
+    result["vs_close_tag"]  = vs_close_tag
+    result["cpr_width"]     = cpr_width
+    return result
+
+
 __all__ = [
     "get_daily_sentiment",
     "get_daily_sentiment_from_candles",
     "get_open_position_bias",
     "get_opening_bias",
+    "classify_day_type",
+    "compute_intraday_sentiment",
     "_score_open_vs_prev_close",
     "_score_gap",
     "_score_balance_zone_open",

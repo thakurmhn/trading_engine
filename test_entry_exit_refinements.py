@@ -14,6 +14,9 @@ class DummyLogger:
     def __init__(self) -> None:
         self.messages: list[str] = []
 
+    def debug(self, msg: str) -> None:
+        pass
+
     def info(self, msg: str) -> None:
         self.messages.append(str(msg))
 
@@ -101,7 +104,7 @@ class EntryQualityGateTests(unittest.TestCase):
     def test_weak_adx_blocks_entry(self):
         funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
         gate = funcs["_trend_entry_quality_gate"]
-        c3 = _mk_df("UP", "UP", 20.0, 50.0, 0.0)
+        c3 = _mk_df("UP", "UP", 15.0, 50.0, 0.0)
         c15 = _mk_df("UP", "UP", 30.0, 50.0, 0.0)
         ok, _side, reason, _details = gate(c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY")
         self.assertFalse(ok)
@@ -110,25 +113,98 @@ class EntryQualityGateTests(unittest.TestCase):
     def test_osc_extreme_blocks_entry(self):
         funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
         gate = funcs["_trend_entry_quality_gate"]
-        c3 = _mk_df("UP", "UP", 30.0, 70.0, 0.0)
+        c3 = _mk_df("UP", "UP", 30.0, 72.0, 0.0)
         c15 = _mk_df("UP", "UP", 30.0, 50.0, 0.0)
         ok, _side, reason, _details = gate(c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY")
         self.assertFalse(ok)
         self.assertEqual(reason, "Oscillator extreme, entry suppressed.")
 
 
+class TestTimeSlopeOverride(unittest.TestCase):
+    def test_time_slope_override_allows_flat_after_11(self):
+        funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
+        gate = funcs["_trend_entry_quality_gate"]
+        c3 = _mk_df("UP", "FLAT", 22.0, 50.0, 0.0)
+        c15 = _mk_df("UP", "UP", 30.0, 50.0, 0.0)
+        ok, _side, reason, details = gate(
+            c3, c15, "2026-02-26T11:30:00", "NSE:NIFTY", adx_min=18.0
+        )
+        self.assertTrue(ok)
+        self.assertIn("TIME_SLOPE_OVERRIDE", str(details.get("slope_override_reason", "")))
+
+
+class TestEMAStretchGate(unittest.TestCase):
+    def _mk_trend_df(self, st_bias: str, st_slope: str, close_vals, adx=30.0, atr=10.0):
+        rows = len(close_vals)
+        return pd.DataFrame(
+            {
+                "open": [close_vals[0]] * rows,
+                "high": [v + 1.0 for v in close_vals],
+                "low": [v - 1.0 for v in close_vals],
+                "close": close_vals,
+                "supertrend_bias": [st_bias] * rows,
+                "supertrend_slope": [st_slope] * rows,
+                "supertrend_line": [close_vals[0]] * rows,
+                "adx14": [adx] * rows,
+                "rsi14": [50.0] * rows,
+                "cci20": [0.0] * rows,
+                "atr14": [atr] * rows,
+            }
+        )
+
+    def test_ema_stretch_blocks_entry(self):
+        funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
+        gate = funcs["_trend_entry_quality_gate"]
+        c3 = self._mk_trend_df("UP", "UP", [80, 85, 90, 140], adx=30.0, atr=10.0)
+        c15 = self._mk_trend_df("UP", "UP", [80, 85, 90, 140], adx=30.0, atr=10.0)
+        ok, _side, reason, _details = gate(c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "EMA stretch gate, entry suppressed.")
+
+    def test_ema_stretch_allows_with_reversal_override(self):
+        funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
+        gate = funcs["_trend_entry_quality_gate"]
+        c3 = self._mk_trend_df("UP", "UP", [80, 85, 90, 140], adx=30.0, atr=10.0)
+        c15 = self._mk_trend_df("UP", "UP", [80, 85, 90, 140], adx=30.0, atr=10.0)
+        ok, _side, _reason, details = gate(
+            c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY",
+            reversal_signal={"side": "CALL", "score": 70}
+        )
+        self.assertTrue(ok)
+        self.assertTrue(details.get("ema_stretch_override", False))
+
+    def test_ema_stretch_tags_trade_in_tag_zone(self):
+        funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
+        gate = funcs["_trend_entry_quality_gate"]
+        c3 = self._mk_trend_df("UP", "UP", [100, 100, 100, 125], adx=30.0, atr=10.0)
+        c15 = self._mk_trend_df("UP", "UP", [100, 100, 100, 125], adx=30.0, atr=10.0)
+        ok, _side, _reason, details = gate(c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY")
+        self.assertTrue(ok)
+        self.assertTrue(details.get("ema_stretch_tagged", False))
+        self.assertTrue(np.isfinite(float(details.get("ema_stretch_mult"))))
+
+    def test_ema_stretch_gate_put_direction(self):
+        funcs, _logger = _load_functions("_supertrend_alignment_gate", "_trend_entry_quality_gate")
+        gate = funcs["_trend_entry_quality_gate"]
+        c3 = self._mk_trend_df("DOWN", "DOWN", [140, 130, 120, 70], adx=30.0, atr=10.0)
+        c15 = self._mk_trend_df("DOWN", "DOWN", [140, 130, 120, 70], adx=30.0, atr=10.0)
+        ok, _side, reason, _details = gate(c3, c15, "2026-02-26T10:00:00", "NSE:NIFTY")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "EMA stretch gate, entry suppressed.")
+
+
 class ExitPrematureSafeguardTests(unittest.TestCase):
-    def test_momentum_exhaustion_suppressed_before_two_bars(self):
+    def test_momentum_exhaustion_suppressed_before_three_bars(self):
         funcs, logger = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
         df_slice = pd.DataFrame(
             {
-                "open": [99.0, 100.0, 101.0],
-                "high": [101.0, 102.0, 103.0],
-                "low": [98.0, 99.0, 100.0],
-                "close": [100.0, 101.0, 102.0],
-                "supertrend_bias": ["UP"] * 3,
-                "rsi14": [50.0] * 3,
+                "open": [99.0, 100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0, 104.0],
+                "low": [98.0, 99.0, 100.0, 101.0],
+                "close": [100.0, 101.0, 102.0, 103.0],
+                "supertrend_bias": ["UP"] * 4,
+                "rsi14": [50.0] * 4,
             }
         )
         state = {
@@ -138,7 +214,7 @@ class ExitPrematureSafeguardTests(unittest.TestCase):
             "position_id": "POS1",
             "is_open": True,
             "buy_price": 200.0,
-            "entry_candle": len(df_slice) - 2,  # bars_held=1
+            "entry_candle": len(df_slice) - 3,  # bars_held=2
             "stop": 150.0,
             "pt": 210.0,
             "tg": 215.0,
@@ -151,7 +227,7 @@ class ExitPrematureSafeguardTests(unittest.TestCase):
         triggered, reason = fn(df_slice, state, option_price=206.0, option_volume=0.0, timestamp="2026-02-26T10:00:00")
         self.assertFalse(triggered)
         self.assertIsNone(reason)
-        self.assertTrue(any("Premature exit suppressed, minimum hold enforced." in m for m in logger.messages))
+        self.assertTrue(any("Premature exit suppressed (MOMENTUM_EXHAUSTION), minimum hold enforced." in m for m in logger.messages))
 
 
 if __name__ == "__main__":

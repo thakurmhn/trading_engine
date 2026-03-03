@@ -1962,5 +1962,460 @@ class TestOpenBiasScoringExtended(unittest.TestCase):
         self.assertEqual(pts, 0)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OSCILLATOR GATE TUNING TESTS (governance fix — Mar 2026)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOscillatorGateTuning(unittest.TestCase):
+    """Validate all 5 oscillator gate tuning changes in _trend_entry_quality_gate."""
+
+    @classmethod
+    def setUpClass(cls):
+        stubs = {
+            "fyers_apiv3": MagicMock(),
+            "fyers_apiv3.fyersModel": MagicMock(),
+            "setup": MagicMock(
+                df=pd.DataFrame(),
+                fyers=MagicMock(),
+                ticker="NSE:NIFTY50-INDEX",
+                option_chain=pd.DataFrame(columns=["strike_price", "option_type", "symbol"]),
+                spot_price=21000.0,
+                start_time=datetime(2026, 2, 28, 9, 30),
+                end_time=datetime(2026, 2, 28, 15, 15),
+                hist_data=None,
+            ),
+        }
+        for name, stub in stubs.items():
+            sys.modules.setdefault(name, stub)
+        # day_type is stubbed by test_exit_logic.py; provide the names execution.py needs
+        _day_type_stub = sys.modules.get("day_type")
+        if _day_type_stub is not None and not hasattr(_day_type_stub, "make_day_type_classifier"):
+            _day_type_stub.make_day_type_classifier = MagicMock(return_value=MagicMock())
+            _day_type_stub.apply_day_type_to_pm = MagicMock()
+            _day_type_stub.DayType = MagicMock()
+            _day_type_stub.DayTypeResult = MagicMock()
+        # DayTypeClassifier is always required (added in item #6 DTC integration)
+        if _day_type_stub is not None and not hasattr(_day_type_stub, "DayTypeClassifier"):
+            _day_type_stub.DayTypeClassifier = MagicMock()
+        # Force fresh import (TestExecutionConstants may have caught a prior failure)
+        sys.modules.pop("execution", None)
+        try:
+            import execution as ex
+            cls.ex = ex
+        except Exception:
+            cls.ex = None
+
+    def _make_candles(self, rsi=50.0, cci=0.0, adx=15.0, close=24800.0, atr=80.0, n=15):
+        """Minimal candles_3m DataFrame with required indicator columns."""
+        data = {
+            "open":  [close] * n,
+            "high":  [close + 5] * n,
+            "low":   [close - 5] * n,
+            "close": [close] * n,
+            "volume":[1000] * n,
+            "adx14": [adx] * n,
+            "rsi14": [rsi] * n,
+            "cci20": [cci] * n,
+            "atr14": [atr] * n,
+        }
+        return pd.DataFrame(data)
+
+    def _cam(self, close=24800.0, atr=80.0):
+        """Camarilla levels where S4 = close - 3*atr, R4 = close + 3*atr."""
+        return {
+            "r3": close + 2 * atr,
+            "r4": close + 3 * atr,
+            "s3": close - 2 * atr,
+            "s4": close - 3 * atr,
+        }
+
+    def _aligned_st(self, side="PUT", slope_matches=True):
+        """Return a mocked _supertrend_alignment_gate result."""
+        bias = "BEARISH" if side == "PUT" else "BULLISH"
+        slope = "DOWN" if side == "PUT" else "UP"
+        if not slope_matches:
+            slope = "UP" if side == "PUT" else "DOWN"
+        return (True, side, {
+            "ST3m_bias":  bias,
+            "ST3m_slope": slope,
+            "ST15m_bias": bias,
+        })
+
+    def _run_gate(self, candles_3m, side="PUT", cam=None, adx_min=14.0,
+                  rsi_min=30.0, rsi_max=70.0, cci_min=-150.0, cci_max=150.0,
+                  slope_matches=True, reversal_signal=None):
+        ex = self.ex
+        if ex is None:
+            self.skipTest("execution.py could not be imported")
+        aligned_result = self._aligned_st(side, slope_matches)
+        cam = cam or self._cam()
+        with patch.object(ex, "_supertrend_alignment_gate", return_value=aligned_result):
+            return ex._trend_entry_quality_gate(
+                candles_3m=candles_3m,
+                candles_15m=pd.DataFrame(),
+                timestamp="2026-03-02 10:00:00",
+                symbol="NIFTY",
+                adx_min=adx_min,
+                rsi_min=rsi_min,
+                rsi_max=rsi_max,
+                cci_min=cci_min,
+                cci_max=cci_max,
+                camarilla_levels=cam,
+                reversal_signal=reversal_signal,
+            )
+
+    # ── Change 1: Default thresholds widened ─────────────────────────────────
+
+    def test_rsi_32_passes_widened_default_put(self):
+        """RSI=32 was blocked at [35,65]; now passes widened [30,70] default."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        candles = self._make_candles(rsi=32.0, cci=0.0, adx=15.0)
+        ok, side, reason, _ = self._run_gate(candles, side="PUT")
+        self.assertTrue(ok, f"RSI=32 should pass widened default gate; reason={reason}")
+
+    def test_rsi_68_passes_widened_default_call(self):
+        """RSI=68 was blocked at [35,65]; now passes widened [30,70] default."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        candles = self._make_candles(rsi=68.0, cci=0.0, adx=15.0)
+        ok, side, reason, _ = self._run_gate(candles, side="CALL")
+        self.assertTrue(ok, f"RSI=68 should pass widened default gate; reason={reason}")
+
+    def test_cci_140_passes_widened_default(self):
+        """CCI=140 was blocked at [-120,120]; passes widened [-150,150]."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        candles = self._make_candles(rsi=50.0, cci=140.0, adx=15.0)
+        ok, side, reason, _ = self._run_gate(candles, side="CALL")
+        self.assertTrue(ok, f"CCI=140 should pass widened default gate; reason={reason}")
+
+    def test_rsi_25_still_blocked_at_default(self):
+        """RSI=25 is below new default [30,70] — should still be blocked (unless relief fires)."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        # Use non-extreme close so S4/R4 relief doesn't fire
+        cam = {"r3": 30000.0, "r4": 32000.0, "s3": 20000.0, "s4": 18000.0}
+        candles = self._make_candles(rsi=25.0, cci=0.0, adx=15.0, close=24800.0)
+        ok, side, reason, _ = self._run_gate(candles, side="PUT", cam=cam)
+        self.assertFalse(ok, "RSI=25 below [30] default should be blocked")
+
+    # ── Change 2: ATR expansion tier ────────────────────────────────────────
+
+    def test_atr_expand_tier_default_normal_atr(self):
+        """Normal ATR (not elevated) → atr_expand_tier=ATR_DEFAULT."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        candles = self._make_candles(rsi=50.0, cci=0.0, adx=15.0, atr=80.0)
+        ok, side, reason, details = self._run_gate(candles)
+        self.assertEqual(details.get("atr_expand_tier"), "ATR_DEFAULT")
+
+    def test_atr_high_expands_thresholds(self):
+        """ATR 1.6× 10-bar MA → atr_expand_tier=ATR_HIGH, thresholds expand by 5/30."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        # Build candles where last ATR is 1.6× MA of previous 10
+        atr_base = 80.0
+        atr_values = [atr_base] * 14 + [atr_base * 1.6]   # 15 rows, last one high
+        close = 24800.0
+        data = {
+            "open":  [close] * 15, "high": [close+5]*15, "low": [close-5]*15,
+            "close": [close]*15, "volume": [1000]*15,
+            "adx14": [15.0]*15, "rsi14": [50.0]*15, "cci20": [0.0]*15,
+            "atr14": atr_values,
+        }
+        candles = pd.DataFrame(data)
+        ok, side, reason, details = self._run_gate(candles)
+        self.assertEqual(details.get("atr_expand_tier"), "ATR_HIGH")
+        eff_rsi = details.get("eff_rsi_range", [None, None])
+        # RSI max should be widened to >= 75 (70 + 5)
+        self.assertGreaterEqual(eff_rsi[1], 75.0)
+
+    def test_atr_high_expansion_survives_zone_a_clamp(self):
+        """BUG-3 regression: ATR_HIGH expansion (+5 RSI) must NOT be clamped back to 70
+        by ZoneA classification (price inside S3–R3).
+
+        Before the fix: ZoneA did `rsi_hi = min(rsi_hi, 70.0)` which discarded the +5.
+        After the fix : ZoneA does `rsi_hi = min(rsi_hi, max(70.0, rsi_bounds[1]))` so
+        ATR expansion is preserved.  eff_rsi[1] must be >= 75.0.
+        """
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        atr_base = 80.0
+        # Last bar ATR is 1.6× MA → triggers ATR_HIGH tier (+5 RSI / +30 CCI)
+        atr_values = [atr_base] * 14 + [atr_base * 1.6]
+        close = 24800.0
+        # Explicit ZoneA: close is squarely between S3 and R3 → ZoneA branch runs
+        cam = {
+            "r3": close + 2 * atr_base,   # 24960
+            "r4": close + 3 * atr_base,   # 25040
+            "s3": close - 2 * atr_base,   # 24640
+            "s4": close - 3 * atr_base,   # 24560
+        }
+        data = {
+            "open":  [close] * 15, "high": [close + 5] * 15, "low": [close - 5] * 15,
+            "close": [close] * 15, "volume": [1000] * 15,
+            "adx14": [15.0] * 15, "rsi14": [50.0] * 15, "cci20": [0.0] * 15,
+            "atr14": atr_values,
+        }
+        candles = pd.DataFrame(data)
+        ok, side, reason, details = self._run_gate(candles, cam=cam)
+        # Tier must be ATR_HIGH
+        self.assertEqual(details.get("atr_expand_tier"), "ATR_HIGH",
+                         "Expected ATR_HIGH tier when last ATR is 1.6× MA")
+        eff_rsi = details.get("eff_rsi_range", [None, None])
+        self.assertIsNotNone(eff_rsi[1], "eff_rsi_range upper bound must be returned")
+        # BUG-3 fix: ZoneA clamp must preserve ATR_HIGH expansion to 75.0
+        self.assertGreaterEqual(
+            eff_rsi[1], 75.0,
+            f"ZoneA clamp discarded ATR_HIGH expansion: eff_rsi[1]={eff_rsi[1]} < 75.0"
+        )
+
+    # ── Change 3: Block log placed after relief ──────────────────────────────
+
+    def test_osc_extreme_block_not_logged_when_s4_relief_fires(self):
+        """When S4/R4 relief fires (Case 4), [ENTRY BLOCKED][OSC_EXTREME] must NOT be logged."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        # RSI=20 (extreme PUT), close below S4-ATR so relief fires
+        close = 24000.0
+        atr = 80.0
+        cam = {"r3": 25000.0, "r4": 25200.0, "s3": 23600.0, "s4": 23800.0}
+        # close < s4 - atr = 23800 - 80 = 23720
+        candles = self._make_candles(rsi=20.0, cci=-200.0, adx=15.0, close=23700.0, atr=atr)
+        with self.assertLogs("root", level="INFO") as cm:
+            ok, side, reason, details = self._run_gate(candles, side="PUT", cam=cam)
+        log_text = "\n".join(cm.output)
+        self.assertTrue(ok, "S4/R4 relief should allow entry")
+        self.assertNotIn("[ENTRY BLOCKED][OSC_EXTREME]", log_text,
+                         "Block must NOT be logged when S4/R4 relief fires")
+        self.assertIn("OSC_RELIEF", log_text)
+
+    def test_osc_extreme_block_logged_when_truly_blocked(self):
+        """When genuinely blocked (no relief), [ENTRY BLOCKED][OSC_EXTREME] IS logged."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        # RSI=20 (extreme), close far from S4 so no relief
+        cam = {"r3": 30000.0, "r4": 32000.0, "s3": 20000.0, "s4": 18000.0}
+        candles = self._make_candles(rsi=20.0, cci=-200.0, adx=15.0, close=24800.0)
+        with self.assertLogs("root", level="INFO") as cm:
+            ok, side, reason, details = self._run_gate(candles, side="PUT", cam=cam)
+        log_text = "\n".join(cm.output)
+        self.assertFalse(ok, "Truly blocked signal should return False")
+        self.assertIn("[ENTRY BLOCKED][OSC_EXTREME]", log_text)
+
+    # ── Change 4: osc_override without NARROW CPR ────────────────────────────
+
+    def test_osc_override_fires_without_narrow_cpr(self):
+        """RSI<30 + close_below_s4 + compressed_cam → override fires on any CPR width."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        # Build compressed Camarilla: cam_span = |R4-R3| = 5 ≤ max(0.20*80, 5) = 16
+        atr = 80.0
+        close = 23700.0  # below s4 threshold (s4=23800, thr=s4-0.01*atr=23799.2)
+        cam = {
+            "r3": 25000.0, "r4": 25005.0,  # span=5 → compressed
+            "s3": 23500.0, "s4": 23800.0,
+        }
+        # RSI=25 < 30, close < s4 threshold, cam compressed
+        candles = self._make_candles(rsi=25.0, cci=-250.0, adx=15.0, close=close, atr=atr)
+        with self.assertLogs("root", level="INFO") as cm:
+            ok, side, reason, details = self._run_gate(candles, side="PUT", cam=cam)
+        log_text = "\n".join(cm.output)
+        self.assertTrue(ok, "osc_override should fire; reason=" + reason)
+        self.assertIn("OSC_OVERRIDE_PIVOT_BREAK", log_text)
+
+    # ── Change 5: Slope conflict ADX gate (Path C) ───────────────────────────
+
+    def test_slope_conflict_bypassed_when_adx_below_gate(self):
+        """ADX < SLOPE_ADX_GATE (20) → slope conflict suppressed via Path C."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        import config
+        gate = config.SLOPE_ADX_GATE
+        adx = gate - 3.0   # clearly below gate (17.0)
+        # adx_min must be < adx so the WEAK_ADX gate doesn't block first
+        candles = self._make_candles(rsi=50.0, cci=0.0, adx=adx)
+        with self.assertLogs("root", level="INFO") as cm:
+            ok, side, reason, details = self._run_gate(
+                candles, side="PUT", slope_matches=False, adx_min=adx - 2.0
+            )
+        log_text = "\n".join(cm.output)
+        self.assertTrue(ok, f"ADX={adx} < gate={gate} should bypass slope conflict")
+        self.assertIn("ADX_WEAK_SLOPE_GATE", log_text)
+        self.assertIn("ST_SLOPE_OVERRIDE", log_text)
+
+    def test_slope_conflict_enforced_when_adx_above_gate(self):
+        """ADX >= SLOPE_ADX_GATE → Path C does NOT fire; slope conflict is enforced."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        import config
+        gate = config.SLOPE_ADX_GATE
+        adx = gate + 5.0   # clearly above gate (25.0)
+        candles = self._make_candles(rsi=50.0, cci=0.0, adx=adx)
+        with self.assertLogs("root", level="INFO") as cm:
+            ok, side, reason, details = self._run_gate(
+                candles, side="PUT", slope_matches=False, adx_min=gate - 1.0
+            )
+        log_text = "\n".join(cm.output)
+        self.assertFalse(ok, f"ADX={adx} >= gate={gate} should enforce slope conflict block")
+        self.assertIn("ST_SLOPE_CONFLICT", log_text)
+        self.assertNotIn("ADX_WEAK_SLOPE_GATE", log_text)
+
+    def test_slope_adx_gate_config_exists(self):
+        """SLOPE_ADX_GATE constant must exist in config with default 20.0."""
+        import config
+        self.assertTrue(hasattr(config, "SLOPE_ADX_GATE"),
+                        "config.SLOPE_ADX_GATE must be defined")
+        self.assertAlmostEqual(config.SLOPE_ADX_GATE, 20.0, places=1)
+
+
+class TestATRScaledSLTuning(unittest.TestCase):
+    """
+    Validate ATR expansion logic inserted in build_dynamic_levels().
+
+    Strategy: candles_df with 10 uniform atr14 rows (base ATR = 7.0 pts).
+    The current `atr` parameter drives the tier:
+      - ATR_DEFAULT  : current_atr ≤ 1.3 × 7.0  → no expansion
+      - ATR_ELEVATED : 1.3 × 7.0 < current_atr ≤ 1.5 × 7.0 → ×1.35 (survivability tuning P6-E)
+      - ATR_HIGH     : current_atr > 1.5 × 7.0  → ×1.75, capped at 3.5  (survivability tuning P6-E)
+    """
+
+    _BASE_ATR_MA = 7.0   # mean of the synthetic atr14 series
+
+    @classmethod
+    def setUpClass(cls):
+        stubs = {
+            "fyers_apiv3": MagicMock(),
+            "fyers_apiv3.fyersModel": MagicMock(),
+            "setup": MagicMock(
+                df=pd.DataFrame(),
+                fyers=MagicMock(),
+                ticker="NSE:NIFTY50-INDEX",
+                option_chain=pd.DataFrame(columns=["strike_price", "option_type", "symbol"]),
+                spot_price=21000.0,
+                start_time=datetime(2026, 2, 28, 9, 30),
+                end_time=datetime(2026, 2, 28, 15, 15),
+                hist_data=None,
+            ),
+        }
+        for name, stub in stubs.items():
+            sys.modules.setdefault(name, stub)
+        _day_type_stub = sys.modules.get("day_type")
+        if _day_type_stub is not None and not hasattr(_day_type_stub, "make_day_type_classifier"):
+            _day_type_stub.make_day_type_classifier = MagicMock(return_value=MagicMock())
+            _day_type_stub.apply_day_type_to_pm = MagicMock()
+            _day_type_stub.DayType = MagicMock()
+            _day_type_stub.DayTypeResult = MagicMock()
+        # DayTypeClassifier is always required (added in item #6 DTC integration)
+        if _day_type_stub is not None and not hasattr(_day_type_stub, "DayTypeClassifier"):
+            _day_type_stub.DayTypeClassifier = MagicMock()
+        sys.modules.pop("execution", None)
+        try:
+            import execution as ex
+            cls.ex = ex
+        except Exception:
+            cls.ex = None
+
+    def _make_candles_df(self, atr14_value=7.0, n=10):
+        """Synthetic candles_df with uniform atr14 column (n ≥ 10 rows)."""
+        return pd.DataFrame({
+            "open":  [100.0] * n,
+            "high":  [105.0] * n,
+            "low":   [95.0] * n,
+            "close": [100.0] * n,
+            "atr14": [atr14_value] * n,
+        })
+
+    def _call_levels(self, current_atr, adx_value=25.0, entry_price=100.0, side="PUT"):
+        """Call build_dynamic_levels() with synthetic data, returns result dict."""
+        if self.ex is None:
+            self.skipTest("execution.py could not be imported")
+        candles_df = self._make_candles_df(atr14_value=self._BASE_ATR_MA)
+        return self.ex.build_dynamic_levels(
+            entry_price=entry_price,
+            atr=current_atr,
+            side=side,
+            entry_candle=0,
+            candles_df=candles_df,
+            adx_value=adx_value,
+        )
+
+    # ── Tier detection ────────────────────────────────────────────────────────
+
+    def test_atr_default_no_expansion(self):
+        """ATR at MA level → ATR_DEFAULT → sl_mult unchanged (ADX_DEFAULT=2.0)."""
+        current_atr = self._BASE_ATR_MA          # exactly at MA, well below 1.3×
+        result = self._call_levels(current_atr, adx_value=25.0)
+        self.assertTrue(result.get("valid"), "build_dynamic_levels must return valid=True")
+        self.assertEqual(result.get("sl_atr_tier"), "ATR_DEFAULT")
+        self.assertAlmostEqual(result.get("sl_mult"), 2.0, places=3,
+                               msg="sl_mult must be unchanged at ADX_DEFAULT + ATR_DEFAULT")
+
+    def test_atr_elevated_expands_sl_mult(self):
+        """ATR = 1.4× MA → ATR_ELEVATED → sl_mult = ADX_DEFAULT × 1.35 = 2.7 (P6-E)."""
+        current_atr = round(self._BASE_ATR_MA * 1.4, 4)   # 9.8 pts  (> 1.3× but ≤ 1.5×)
+        result = self._call_levels(current_atr, adx_value=25.0)
+        self.assertTrue(result.get("valid"))
+        self.assertEqual(result.get("sl_atr_tier"), "ATR_ELEVATED")
+        expected_mult = round(min(2.0 * 1.35, 3.5), 3)    # 2.7
+        self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
+                               msg=f"sl_mult must be {expected_mult} for ATR_ELEVATED+ADX_DEFAULT")
+
+    def test_atr_high_expands_sl_mult(self):
+        """ATR = 1.6× MA → ATR_HIGH → sl_mult = ADX_DEFAULT × 1.75 = 3.5 (P6-E, capped)."""
+        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # 11.2 pts  (> 1.5×)
+        result = self._call_levels(current_atr, adx_value=25.0)
+        self.assertTrue(result.get("valid"))
+        self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
+        expected_mult = round(min(2.0 * 1.75, 3.5), 3)    # 3.5
+        self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
+                               msg=f"sl_mult must be {expected_mult} for ATR_HIGH+ADX_DEFAULT")
+
+    def test_atr_high_adx_weak_expands_sl_mult(self):
+        """ADX_WEAK_20 (sl_mult=1.2) + ATR_HIGH (×1.75 P6-E) → 2.1, not capped."""
+        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # ATR_HIGH
+        result = self._call_levels(current_atr, adx_value=15.0)  # ADX < 20 → WEAK
+        self.assertTrue(result.get("valid"))
+        self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
+        expected_mult = round(min(1.2 * 1.75, 3.5), 3)    # 2.1
+        self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
+                               msg=f"sl_mult must be {expected_mult} for ADX_WEAK_20+ATR_HIGH")
+
+    def test_cap_at_3_5(self):
+        """ADX_STRONG_40 (sl_mult=2.5) + ATR_HIGH (×1.75 P6-E) = 4.375 → capped at 3.5."""
+        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # ATR_HIGH
+        result = self._call_levels(current_atr, adx_value=45.0)  # ADX > 40 → STRONG
+        self.assertTrue(result.get("valid"))
+        self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
+        self.assertAlmostEqual(result.get("sl_mult"), 3.5, places=3,
+                               msg="sl_mult must be capped at 3.5 (2.5×1.75=4.375 → cap=3.5)")
+
+    # ── Return dict and log ───────────────────────────────────────────────────
+
+    def test_sl_atr_tier_in_return_dict(self):
+        """sl_atr_tier key must be present in result dict for all ATR tiers."""
+        for current_atr, expected_tier in [
+            (self._BASE_ATR_MA,                 "ATR_DEFAULT"),
+            (round(self._BASE_ATR_MA * 1.4, 4), "ATR_ELEVATED"),
+            (round(self._BASE_ATR_MA * 1.6, 4), "ATR_HIGH"),
+        ]:
+            with self.subTest(current_atr=current_atr):
+                result = self._call_levels(current_atr)
+                self.assertIn("sl_atr_tier", result,
+                              "Return dict must contain 'sl_atr_tier' key")
+                self.assertEqual(result["sl_atr_tier"], expected_tier)
+
+    def test_log_contains_sl_atr_tier(self):
+        """[LEVELS][ATR_SL] log line must include the sl_atr_tier string."""
+        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # ATR_HIGH
+        with self.assertLogs("root", level="INFO") as cm:
+            result = self._call_levels(current_atr, adx_value=25.0)
+        self.assertTrue(result.get("valid"))
+        log_text = "\n".join(cm.output)
+        self.assertIn("[LEVELS][ATR_SL]", log_text, "Log must include [LEVELS][ATR_SL] tag")
+        self.assertIn("ATR_HIGH", log_text, "Log must include ATR tier name")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -60,7 +60,8 @@ _RE_TRADE_OPEN = re.compile(
     r"(?:.*?pivot=(?P<pivot>\S+))?"
     r"(?:.*?cpr=(?P<cpr>\S+))?"
     r"(?:.*?day=(?P<day>[A-Z_]+))?"
-    r"(?:.*?lot=(?P<lot>\d+))?",
+    r"(?:.*?lot=(?P<lot>\d+))?"
+    r"(?:.*?option_name=(?P<option_name>\S+))?",
     re.IGNORECASE,
 )
 
@@ -82,9 +83,52 @@ _RE_TRADE_EXIT = re.compile(
     re.IGNORECASE,
 )
 
+# Structured: [TRADE OPEN] time=YYYY-MM-DD HH:MM:SS side=CALL|PUT option_name=... entry=... lots=...
+# Emitted by PositionManager.open() – no [MODE] bracket, no WIN/LOSS outcome
+_RE_TRADE_OPEN_STRUCT = re.compile(
+    r"\[TRADE OPEN\] time=(?P<bar_ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r" side=(?P<side>CALL|PUT)"
+    r" option_name=(?P<option_name>\S+)"
+    r" entry=(?P<entry>[\d.]+)"
+    r" lots=(?P<lots>\d+)",
+    re.IGNORECASE,
+)
+
+# Structured: [TRADE EXIT] time=... option_name=... exit=... pnl_pts=... pnl_rs=... bars=... reason=...
+# Emitted by PositionManager.close() – no WIN/LOSS, no prem A->B format
+_RE_TRADE_EXIT_STRUCT = re.compile(
+    r"\[TRADE EXIT\] time=(?P<bar_ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r" option_name=(?P<option_name>\S+)"
+    r" exit=(?P<exit_prem>[\d.]+)"
+    r" pnl_pts=(?P<pnl_pts>[+-][\d.]+)"
+    r" pnl_rs=(?P<pnl_rs>[+-][\d.]+)"
+    r" bars=(?P<bars_held>\d+)"
+    r" reason=(?P<exit_reason>\S+)",
+    re.IGNORECASE,
+)
+
+# [EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630225000PE Entry=102.50 Exit=94.25 Qty=130 PnL=-1072.50 (points=-8.25) BarsHeld=0 ...
+# [EXIT][LIVE SCALP_PT_HIT] CALL NSE:NIFTY2630224700CE Entry=137.15 Exit=140.55 Qty=130 PnL=442.00 (points=3.40) BarsHeld=0 ...
+# Emitted by execution.py cleanup_trade_exit — self-contained record with all trade details.
+_RE_EXIT_RICH = re.compile(
+    r"\[EXIT\]\[(?P<session_mode>PAPER|LIVE)\s+(?P<exit_reason>[\w]+)\]"
+    r"\s+(?P<side>CALL|PUT)"
+    r"\s+(?P<option_name>\S+)"
+    r"\s+Entry=(?P<entry_prem>[\d.]+)"
+    r"\s+Exit=(?P<exit_prem>[\d.]+)"
+    r"\s+Qty=(?P<qty>\d+)"
+    r"\s+PnL=(?P<pnl_rs>[+-]?[\d.]+)"
+    r"\s+\(points=(?P<pnl_pts>[+-]?[\d.]+)\)"
+    r"\s+BarsHeld=(?P<bars_held>\d+)",
+    re.IGNORECASE,
+)
+
 # [ENTRY BLOCKED][ST_CONFLICT] ...
 # [ENTRY BLOCKED][COOLDOWN] 0s < 120s
 _RE_ENTRY_BLOCKED = re.compile(r"\[ENTRY BLOCKED\]\[(?P<subtype>\w+)\]")
+
+# [SLOPE_CONFLICT][3m] — renamed tag (P6); maps to blocked["ST_SLOPE_CONFLICT"]
+_RE_SLOPE_CONFLICT_3M = re.compile(r"\[SLOPE_CONFLICT\]\[3m\]")
 
 # [ENTRY OK] CALL score=83/50 NORMAL HIGH | ST=20/20 RSI=61.7...
 _RE_ENTRY_OK = re.compile(
@@ -140,8 +184,38 @@ _P_TAGS = [
     "NO_GAP",              # P5-C
     "BALANCE_OPEN",        # P5-D
     "OUTSIDE_BALANCE",     # P5-D
+    # Reversal detector tags
+    "REVERSAL_SIGNAL",
+    "REVERSAL_OVERRIDE",
+    "ST_SLOPE_OVERRIDE",
+    # Day type tag
+    "DAY_TYPE",
+    # Trend-aware oscillator gating
+    "OSC_OVERRIDE_PIVOT_BREAK",
+    # S4/R4 breakout OSC relief
+    "OSC_RELIEF",
+    # Governance tags
+    "OPEN_BIAS",
+    "OSC_CONTEXT",
+    "OSC_EXTREME",
+    "OSC_REVERSAL",
+    "OSC_CONTINUATION",
+    "DAY_BIAS_ALIGN",
+    "DAY_BIAS_MISALIGN",
+    "ENTRY_GATE_CONTEXT",
+    "FAILED_BREAKOUT",
+    "EMA_STRETCH",
+    "ZONE_REVISIT",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
+
+# [OSC_OVERRIDE][TREND_CONFIRMED] ADX=38.2 tier=ADX_MOD_30 RSI=... CCI=...
+_RE_OSC_TREND_OVERRIDE = re.compile(
+    r"\[OSC_OVERRIDE\]\[TREND_CONFIRMED\]"
+    r"(?:.*?ADX=(?P<adx>[\d.]+))?"
+    r"(?:.*?tier=(?P<tier>\w+))?",
+    re.IGNORECASE,
+)
 
 # [OPEN_POSITION] tag=OPEN_HIGH open=25000.00 high=25000.00 low=24850.00 ...
 _RE_OPEN_POSITION = re.compile(
@@ -178,6 +252,102 @@ _RE_BALANCE_OPEN = re.compile(
     re.IGNORECASE,
 )
 
+# [DAY_TYPE] day_type_tag=TREND_DAY open_bias=OPEN_LOW gap=NO_GAP balance=OUTSIDE_BALANCE
+# vs_close=OPEN_ABOVE_CLOSE cpr_width=NARROW ...
+_RE_DAY_TYPE = re.compile(
+    r"\[DAY_TYPE\](?:\[\S+\])?\s+"
+    r"day_type_tag=(?P<day_type_tag>\w+)"
+    r"(?:.*?cpr_width=(?P<cpr_width_tag>NARROW|NORMAL|WIDE))?",
+    re.IGNORECASE,
+)
+
+# [DAY TYPE] TRENDING   confidence=HIGH   modifier=-8pts threshold | CPR_width=25.2 ...
+# Emitted by replay DTC .log() / lock_classification() — no 'day_type_tag=' prefix.
+# DayType enum values: TRENDING RANGE REVERSAL DOUBLE_DIST NEUTRAL NON_TREND UNKNOWN
+_RE_DAY_TYPE_DTC = re.compile(
+    r"\[DAY TYPE\]\s+(?P<dtc_name>TRENDING|RANGE|REVERSAL|DOUBLE_DIST|NEUTRAL|NON_TREND|UNKNOWN)"
+    r".*?confidence=(?P<dtc_conf>LOW|MEDIUM|HIGH)"
+    r"(?:.*?CPR_width=(?P<dtc_cpr>[\d.]+))?",
+    re.IGNORECASE,
+)
+# Replay opening format: [DAY_TYPE] GAP_UP bias=Positive open=+0.80% vs prev close
+_RE_DAY_TYPE_OPENING = re.compile(
+    r"\[DAY_TYPE\]\s+(?P<gap_tag>GAP_UP|GAP_DOWN|NEUTRAL|UNKNOWN)\s+bias=(?P<bias>\w+)",
+    re.IGNORECASE,
+)
+
+# [OSC_RELIEF][S4/R4_BREAK] side=PUT reason=... close=... s4=... s4_relief_thr=... atr=...
+_RE_OSC_RELIEF = re.compile(r"\[OSC_RELIEF\]\[S4/R4_BREAK\]", re.IGNORECASE)
+
+# [CONTRACT_ROLL] symbol=NIFTY old_expiry=2026-03-06 new_expiry=2026-03-13
+_RE_CONTRACT_ROLL = re.compile(r"\[CONTRACT_ROLL\]", re.IGNORECASE)
+
+# [CONTRACT_FILTER] symbol=... strike=... intrinsic=0.00 → SKIPPED
+_RE_CONTRACT_FILTER_SKIP = re.compile(
+    r"\[CONTRACT_FILTER\].*intrinsic=0\.00.*SKIPPED", re.IGNORECASE
+)
+
+# [EXPIRY_ROLL][SCORE_BONUS]  — emitted by entry_logic per side per bar
+_RE_EXPIRY_ROLL_BONUS = re.compile(r"\[EXPIRY_ROLL\]\[SCORE_BONUS\]", re.IGNORECASE)
+
+# [CONTRACT_METADATA][LOT_MISMATCH]
+_RE_LOT_MISMATCH = re.compile(
+    r"\[CONTRACT_METADATA\]\[LOT_MISMATCH\]", re.IGNORECASE
+)
+
+# [LOT_SIZE] symbol=NIFTY applied=2 source=config
+_RE_LOT_SIZE = re.compile(r"\[LOT_SIZE\]", re.IGNORECASE)
+
+# [VIX_CONTEXT] symbol=NSE:INDIAVIX-INDEX value=13.50 tier=CALM
+_RE_VIX_CONTEXT = re.compile(r"\[VIX_CONTEXT\]", re.IGNORECASE)
+
+# [GREEKS] symbol=... delta=... gamma=... theta=... vega=... iv=...
+_RE_GREEKS = re.compile(r"\[GREEKS\]", re.IGNORECASE)
+
+# [VOL_CONTEXT][SCORE_ADJUST][CALL/PUT] vix_tier=... vol_adj=... theta=... theta_adj=... vega=...
+# theta_penalty fires when theta_adj is negative (e.g. theta_adj=-8)
+_RE_VOL_CONTEXT_ADJUST = re.compile(
+    r"\[VOL_CONTEXT\]\[SCORE_ADJUST\]"
+    r"(?:.*?theta_adj=(?P<theta_adj>-?\d+))?",
+    re.IGNORECASE,
+)
+
+# [POSITION_SIZE] equity=N/A score=... atr=... vix_tier=... vega_high=True/False lots=...
+_RE_POSITION_SIZE_VOL = re.compile(
+    r"\[POSITION_SIZE\]"
+    r"(?:.*?vega_high=(?P<vega_high>True|False))?",
+    re.IGNORECASE,
+)
+
+# [VOL_CONTEXT][ALIGN][CALL/PUT] indicators=RSI:... vix_tier=... adj=score:...
+_RE_VOL_CONTEXT_ALIGN = re.compile(r"\[VOL_CONTEXT\]\[ALIGN\]", re.IGNORECASE)
+
+# [GREEKS_ALIGN][CALL/PUT] symbol=... theta=... vega=... adj=theta:..._vega_risk:...
+_RE_GREEKS_ALIGN = re.compile(r"\[GREEKS_ALIGN\]", re.IGNORECASE)
+
+# [SCORE_MATRIX][CALL/PUT] base=... vol_adj=... theta_adj=... final=.../...
+_RE_SCORE_MATRIX = re.compile(r"\[SCORE_MATRIX\]", re.IGNORECASE)
+
+# [REVERSAL_SIGNAL] CALL score=72 strength=HIGH stretch=-1.87x ATR pivot=S4 ...
+_RE_REVERSAL_SIGNAL = re.compile(
+    r"\[REVERSAL_SIGNAL\] (?P<rev_side>CALL|PUT) "
+    r"score=(?P<rev_score>\d+) "
+    r"strength=(?P<rev_strength>\w+)",
+    re.IGNORECASE,
+)
+
+# [ENTRY ALLOWED][ST_BIAS_OK] ... osc_context=ZoneA-Blocker ...
+_RE_ENTRY_ALLOWED_ZONE = re.compile(
+    r"\[ENTRY ALLOWED\]\[ST_BIAS_OK\].*?osc_context=(?P<zone>ZoneA|ZoneB|ZoneC)",
+    re.IGNORECASE,
+)
+
+# [REVERSAL_OVERRIDE] RSI=22.3 oscillator extreme flipped ...
+_RE_REVERSAL_OVERRIDE = re.compile(r"\[REVERSAL_OVERRIDE\]", re.IGNORECASE)
+
+# [ENTRY ALLOWED][ST_SLOPE_OVERRIDE]
+_RE_ST_SLOPE_OVERRIDE = re.compile(r"\[ENTRY ALLOWED\]\[ST_SLOPE_OVERRIDE\]", re.IGNORECASE)
+
 
 # ── SessionSummary dataclass ──────────────────────────────────────────────────
 
@@ -194,10 +364,34 @@ class SessionSummary:
     tag_counts:     Dict[str, int] = field(default_factory=dict)
     signals_fired:  int = 0
     entry_ok_count: int = 0
-    open_bias_tag:  str = "NONE"          # P5-A: OPEN_HIGH | OPEN_LOW | NONE
-    vs_close_tag:   str = "OPEN_CLOSE_EQUAL"   # P5-B: OPEN_ABOVE_CLOSE | OPEN_BELOW_CLOSE | OPEN_CLOSE_EQUAL
-    gap_tag:        str = "NO_GAP"        # P5-C: GAP_UP | GAP_DOWN | NO_GAP
-    balance_tag:    str = "OUTSIDE_BALANCE"    # P5-D: BALANCE_OPEN | OUTSIDE_BALANCE
+    open_bias_tag:  str = "NONE"               # P5-A: OPEN_HIGH | OPEN_LOW | NONE
+    vs_close_tag:   str = "OPEN_CLOSE_EQUAL"  # P5-B: OPEN_ABOVE_CLOSE | OPEN_BELOW_CLOSE | OPEN_CLOSE_EQUAL
+    gap_tag:        str = "NO_GAP"            # P5-C: GAP_UP | GAP_DOWN | NO_GAP
+    balance_tag:    str = "OUTSIDE_BALANCE"   # P5-D: BALANCE_OPEN | OUTSIDE_BALANCE
+    day_type_tag:   str = "NEUTRAL_DAY"       # TREND_DAY | RANGE_DAY | GAP_DAY | BALANCE_DAY | NEUTRAL_DAY
+    cpr_width_tag:  str = "NORMAL"            # NARROW | NORMAL | WIDE
+    reversal_trades_count: int = 0            # trades opened via REVERSAL_OVERRIDE path
+    reversal_signal_count: int = 0           # [REVERSAL_SIGNAL] detector firings
+    st_slope_override_count: int = 0         # ST_SLOPE_CONFLICT → OVERRIDE count
+    oscillator_blocks: int = 0               # [OSC_EXTREME] blocked entries
+    oscillator_overrides: int = 0            # [OSC_OVERRIDE][TREND_CONFIRMED] allowed entries
+    oscillator_relief_count: int = 0         # [OSC_RELIEF][S4/R4_BREAK] relief overrides
+    trend_loss_count: int = 0               # [TREND_LOSS] — trend trade stopped out prematurely
+    zone_entry_counts: Dict[str, int] = field(default_factory=dict)  # ZoneA/B/C allowed entries
+
+    # ── Contract / expiry tracking ────────────────────────────────────────────
+    expiry_roll_count:       int = 0   # [CONTRACT_ROLL] events
+    lot_size_mismatch_count: int = 0   # [CONTRACT_METADATA][LOT_MISMATCH] events
+    intrinsic_filter_count:  int = 0   # [CONTRACT_FILTER]...SKIPPED events
+
+    # ── Volatility context tracking ───────────────────────────────────────────
+    vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
+    greeks_usage_count: int = 0   # [GREEKS] computations logged
+    theta_penalty_count: int = 0  # [VOL_CONTEXT][SCORE_ADJUST] with theta_adj < 0
+    vega_penalty_count:  int = 0  # [POSITION_SIZE] entries with vega_high=True
+    vol_context_align_count:  int = 0  # [VOL_CONTEXT][ALIGN] per-side events
+    greeks_align_count:       int = 0  # [GREEKS_ALIGN] per-side events
+    score_matrix_usage_count: int = 0  # [SCORE_MATRIX] per-side audit events
 
     # Computed on demand
     @property
@@ -249,6 +443,16 @@ class SessionSummary:
         return dict(counts)
 
     @property
+    def reversal_pnl_attribution(self) -> float:
+        """Net P&L (pts) from trades opened via the reversal override path."""
+        return round(
+            sum(t.get("pnl_pts", 0.0) for t in self.trades
+                if t.get("src", "").upper() == "REVERSAL_OVERRIDE"
+                or t.get("reversal_override", False)),
+            2,
+        )
+
+    @property
     def open_bias_stats(self) -> dict:
         """P5-F: Alignment of executed trades vs. session open bias (all P5 tags)."""
         aligned    = [t for t in self.trades if t.get("open_bias_aligned") == "ALIGNED"]
@@ -277,6 +481,32 @@ class SessionSummary:
             "balance_day_pnl":  all_pnl if is_balance_day else 0.0,
         }
 
+    @property
+    def lot_cap_count(self) -> int:
+        """Trades blocked (or capped) by MAX_TRADES_CAP gate."""
+        return self.tag_counts.get("MAX_TRADES_CAP", 0)
+
+    @property
+    def survivability_count(self) -> int:
+        """Trades that held for >= 3 bars (9 min on 3m chart)."""
+        return sum(1 for t in self.trades if (t.get("bars_held") or 0) >= 3)
+
+    @property
+    def survivability_ratio(self) -> float:
+        """Percentage of trades that survived >= 3 bars."""
+        return (
+            round(self.survivability_count / self.total_trades * 100, 1)
+            if self.total_trades else 0.0
+        )
+
+    @property
+    def avg_pnl_pts(self) -> float:
+        """Average P&L per trade in points."""
+        return (
+            round(self.net_pnl_pts / self.total_trades, 2)
+            if self.total_trades else 0.0
+        )
+
     def to_dict(self) -> dict:
         return {
             "log_path":        self.log_path,
@@ -297,11 +527,36 @@ class SessionSummary:
             "blocked_counts":  self.blocked_counts,
             "tag_counts":      self.tag_counts,
             "exit_reasons":    self.exit_reason_counts,
-            "open_bias_tag":   self.open_bias_tag,
-            "vs_close_tag":    self.vs_close_tag,
-            "gap_tag":         self.gap_tag,
-            "balance_tag":     self.balance_tag,
-            "open_bias_stats": self.open_bias_stats,
+            "open_bias_tag":            self.open_bias_tag,
+            "vs_close_tag":             self.vs_close_tag,
+            "gap_tag":                  self.gap_tag,
+            "balance_tag":              self.balance_tag,
+            "day_type_tag":             self.day_type_tag,
+            "cpr_width_tag":            self.cpr_width_tag,
+            "reversal_trades_count":    self.reversal_trades_count,
+            "reversal_signal_count":    self.reversal_signal_count,
+            "reversal_pnl_attribution": self.reversal_pnl_attribution,
+            "st_slope_override_count":  self.st_slope_override_count,
+            "oscillator_blocks":        self.oscillator_blocks,
+            "oscillator_overrides":     self.oscillator_overrides,
+            "oscillator_relief_count":   self.oscillator_relief_count,
+            "trend_loss_count":          self.trend_loss_count,
+            "zone_entry_counts":         self.zone_entry_counts,
+            "open_bias_stats":           self.open_bias_stats,
+            "expiry_roll_count":         self.expiry_roll_count,
+            "lot_size_mismatch_count":   self.lot_size_mismatch_count,
+            "intrinsic_filter_count":    self.intrinsic_filter_count,
+            "vix_tier_count":            self.vix_tier_count,
+            "greeks_usage_count":        self.greeks_usage_count,
+            "theta_penalty_count":       self.theta_penalty_count,
+            "vega_penalty_count":        self.vega_penalty_count,
+            "vol_context_align_count":   self.vol_context_align_count,
+            "greeks_align_count":        self.greeks_align_count,
+            "score_matrix_usage_count":  self.score_matrix_usage_count,
+            "lot_cap_count":             self.lot_cap_count,
+            "survivability_count":       self.survivability_count,
+            "survivability_ratio":       self.survivability_ratio,
+            "avg_pnl_pts":               self.avg_pnl_pts,
         }
 
 
@@ -334,7 +589,14 @@ class LogParser:
 
         date_tag = self._extract_date_tag()
         (trades, session_types, blocked, tags, signals, ok_count,
-         open_bias_tag, vs_close_tag, gap_tag, balance_tag) = self._scan_file()
+         open_bias_tag, vs_close_tag, gap_tag, balance_tag,
+         day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
+         osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,
+         expiry_roll_count, lot_size_mismatch_count, intrinsic_filter_count,
+         vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
+         vol_context_align_count, greeks_align_count, score_matrix_usage_count,
+         reversal_signal_count, zone_entry_counts,
+         ) = self._scan_file()
 
         if session_types:
             session_type = session_types.pop() if len(session_types) == 1 else "MIXED"
@@ -354,6 +616,26 @@ class LogParser:
             vs_close_tag=vs_close_tag,
             gap_tag=gap_tag,
             balance_tag=balance_tag,
+            day_type_tag=day_type_tag,
+            cpr_width_tag=cpr_width_tag,
+            reversal_trades_count=reversal_count,
+            reversal_signal_count=reversal_signal_count,
+            st_slope_override_count=slope_override_count,
+            oscillator_blocks=osc_blocks,
+            oscillator_overrides=osc_overrides,
+            oscillator_relief_count=osc_relief_count,
+            trend_loss_count=trend_loss_count,
+            expiry_roll_count=expiry_roll_count,
+            lot_size_mismatch_count=lot_size_mismatch_count,
+            intrinsic_filter_count=intrinsic_filter_count,
+            vix_tier_count=vix_tier_count,
+            greeks_usage_count=greeks_usage_count,
+            theta_penalty_count=theta_penalty_count,
+            vega_penalty_count=vega_penalty_count,
+            vol_context_align_count=vol_context_align_count,
+            greeks_align_count=greeks_align_count,
+            score_matrix_usage_count=score_matrix_usage_count,
+            zone_entry_counts=zone_entry_counts,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -369,26 +651,132 @@ class LogParser:
         Returns
         -------
         (trades, session_types, blocked, tags, signals_fired, entry_ok_count,
-         open_bias_tag)
+         open_bias_tag, vs_close_tag, gap_tag, balance_tag,
+         day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
+         osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,
+         expiry_roll_count, lot_size_mismatch_count, intrinsic_filter_count,
+         vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
+         vol_context_align_count, greeks_align_count, score_matrix_usage_count,
+         reversal_signal_count, zone_entry_counts)
         """
         trades: List[dict] = []
         open_queue: List[dict] = []   # pending TRADE OPEN records (FIFO)
+        # Structured format queues (keyed by option_name for exact matching)
+        open_queue_struct: Dict[str, dict] = {}
+        trades_struct: List[dict] = []
         session_types: set = set()
         blocked: Dict[str, int] = defaultdict(int)
         tags: Dict[str, int] = defaultdict(int)
         signals_fired: int = 0
         entry_ok_count: int = 0
-        open_bias_tag: str = "NONE"          # P5-A: OPEN_HIGH | OPEN_LOW | NONE
-        vs_close_tag:  str = "OPEN_CLOSE_EQUAL"  # P5-B: OPEN_ABOVE_CLOSE | OPEN_BELOW_CLOSE | OPEN_CLOSE_EQUAL
-        gap_tag:       str = "NO_GAP"        # P5-C: GAP_UP | GAP_DOWN | NO_GAP
-        balance_tag:   str = "OUTSIDE_BALANCE"   # P5-D: BALANCE_OPEN | OUTSIDE_BALANCE
+        open_bias_tag: str = "NONE"               # P5-A: OPEN_HIGH | OPEN_LOW | NONE
+        vs_close_tag:  str = "OPEN_CLOSE_EQUAL"   # P5-B
+        gap_tag:       str = "NO_GAP"             # P5-C: GAP_UP | GAP_DOWN | NO_GAP
+        balance_tag:   str = "OUTSIDE_BALANCE"    # P5-D: BALANCE_OPEN | OUTSIDE_BALANCE
+        day_type_tag:  str = "NEUTRAL_DAY"        # TREND_DAY | RANGE_DAY | GAP_DAY | BALANCE_DAY
+        cpr_width_tag: str = "NORMAL"             # NARROW | NORMAL | WIDE
+        reversal_count: int = 0                   # [REVERSAL_OVERRIDE] fired count
+        slope_override_count: int = 0             # [ST_SLOPE_OVERRIDE] fired count
+        osc_blocks: int = 0                       # [ENTRY BLOCKED][OSC_EXTREME] count
+        osc_overrides: int = 0                    # [OSC_OVERRIDE][TREND_CONFIRMED] count
+        osc_relief_count: int = 0                 # [OSC_RELIEF][S4/R4_BREAK] count
+        trend_loss_count: int = 0                 # [TREND_LOSS] trend trade SL count
+        expiry_roll_count: int = 0                # [CONTRACT_ROLL] events
+        lot_size_mismatch_count: int = 0          # [CONTRACT_METADATA][LOT_MISMATCH] events
+        intrinsic_filter_count: int = 0           # [CONTRACT_FILTER]...SKIPPED events
+        vix_tier_count: int = 0                   # [VIX_CONTEXT] refreshes
+        greeks_usage_count: int = 0               # [GREEKS] computations
+        theta_penalty_count: int = 0              # [VOL_CONTEXT][SCORE_ADJUST] theta_adj < 0
+        vega_penalty_count: int = 0               # [POSITION_SIZE] vega_high=True
+        vol_context_align_count: int = 0          # [VOL_CONTEXT][ALIGN] per-side events
+        greeks_align_count: int = 0               # [GREEKS_ALIGN] per-side events
+        score_matrix_usage_count: int = 0         # [SCORE_MATRIX] per-side events
+        reversal_signal_count: int = 0            # [REVERSAL_SIGNAL] detector firings
+        zone_entry_counts: Dict[str, int] = defaultdict(int)  # ZoneA/B/C allowed entries
 
         # Keep EXIT AUDIT records as fallback when no TRADE OPEN+EXIT pairs found
         audit_records: List[dict] = []
+        # [EXIT][PAPER/LIVE ...] rich records — self-contained with all trade fields
+        rich_exit_trades: List[dict] = []
 
         with self.log_path.open(encoding="utf-8", errors="replace") as fh:
             for raw_line in fh:
                 line = _strip(raw_line)
+
+                # ── [TRADE OPEN][STRUCT] — structured format, exact option_name key ──
+                m = _RE_TRADE_OPEN_STRUCT.search(line)
+                if m:
+                    d = m.groupdict()
+                    log_ts = self._log_ts(line)
+                    _oba = re.search(r"open_bias_aligned=(ALIGNED|MISALIGNED|NEUTRAL)", line)
+                    _fb = re.search(r"\bfb=(0|1)\b", line)
+                    _ema = re.search(r"\bema_stretch=(0|1)\b", line)
+                    _zr = re.search(r"\bzone_revisit=(0|1)\b", line)
+                    _zt = re.search(r"\bzone_type=([A-Z_]+)\b", line)
+                    _za = re.search(r"\bzone_action=([A-Z_]+)\b", line)
+                    _zage = re.search(r"\bzone_age=(\d+)\b", line)
+                    open_queue_struct[d["option_name"]] = {
+                        "side":        d["side"].upper(),
+                        "bar_ts":      d["bar_ts"],
+                        "log_ts":      log_ts,
+                        "entry_prem":  float(d["entry"]),
+                        "lot":         int(d["lots"]),
+                        "option_name": d["option_name"],
+                        "open_bias_aligned": _oba.group(1).upper() if _oba else "NEUTRAL",
+                        "failed_breakout": bool(int(_fb.group(1))) if _fb else False,
+                        "ema_stretch": bool(int(_ema.group(1))) if _ema else False,
+                        "zone_revisit": bool(int(_zr.group(1))) if _zr else False,
+                        "zone_revisit_type": _zt.group(1).upper() if _zt else "NONE",
+                        "zone_revisit_action": _za.group(1).upper() if _za else "NONE",
+                        "zone_age_bars": int(_zage.group(1)) if _zage else 0,
+                    }
+                    continue
+
+                # ── [TRADE EXIT][STRUCT] — structured format, matched by option_name ──
+                m = _RE_TRADE_EXIT_STRUCT.search(line)
+                if m:
+                    d = m.groupdict()
+                    log_ts = self._log_ts(line)
+                    exit_rec = {
+                        "exit_bar_ts": d["bar_ts"],
+                        "log_ts":      log_ts,
+                        "option_name": d["option_name"],
+                        "exit_prem":   float(d["exit_prem"]),
+                        "pnl_pts":     float(d["pnl_pts"]),
+                        "pnl_rs":      float(d["pnl_rs"]),
+                        "bars_held":   int(d["bars_held"]),
+                        "exit_reason": d["exit_reason"].upper(),
+                    }
+                    matched_open = open_queue_struct.pop(d["option_name"], None)
+                    if matched_open:
+                        trade = {**matched_open, **exit_rec}
+                    else:
+                        trade = exit_rec
+                    trades_struct.append(trade)
+                    continue
+
+                # ── [EXIT][PAPER/LIVE ...] — rich self-contained record ───
+                m = _RE_EXIT_RICH.search(line)
+                if m:
+                    d = m.groupdict()
+                    log_ts = self._log_ts(line)
+                    _mode = d.get("session_mode", "PAPER").upper()
+                    session_types.add(_mode)
+                    rich_exit_trades.append({
+                        "session_type": _mode,
+                        "side":         d["side"].upper(),
+                        "bar_ts":       log_ts,
+                        "log_ts":       log_ts,
+                        "option_name":  d["option_name"],
+                        "entry_prem":   float(d["entry_prem"]),
+                        "exit_prem":    float(d["exit_prem"]),
+                        "lot":          int(d["qty"]),
+                        "pnl_pts":      float(d["pnl_pts"]),
+                        "pnl_rs":       float(d["pnl_rs"]),
+                        "bars_held":    int(d["bars_held"]),
+                        "exit_reason":  d["exit_reason"].upper(),
+                    })
+                    continue
 
                 # ── [TRADE OPEN] ──────────────────────────────────────────
                 m = _RE_TRADE_OPEN.search(line)
@@ -409,6 +797,7 @@ class LogParser:
                         "cpr":          d.get("cpr") or "",
                         "day_type":     d.get("day") or "",
                         "lot":          int(d["lot"]) if d.get("lot") else 0,
+                        "option_name":  d.get("option_name") or "",
                     })
                     session_types.add(d["session_type"].upper())
                     continue
@@ -447,7 +836,15 @@ class LogParser:
                 # ── [ENTRY BLOCKED] ───────────────────────────────────────
                 m = _RE_ENTRY_BLOCKED.search(line)
                 if m:
-                    blocked[m.group("subtype").upper()] += 1
+                    _subtype = m.group("subtype").upper()
+                    blocked[_subtype] += 1
+                    if _subtype == "OSC_EXTREME":
+                        osc_blocks += 1
+                    continue
+
+                # ── [SLOPE_CONFLICT][3m] (P6 renamed tag) ─────────────────
+                if _RE_SLOPE_CONFLICT_3M.search(line):
+                    blocked["ST_SLOPE_CONFLICT"] += 1
                     continue
 
                 # ── [ENTRY OK] ────────────────────────────────────────────
@@ -490,6 +887,174 @@ class LogParser:
                     tags[balance_tag] += 1
                     continue
 
+                # ── [DAY_TYPE] / [DAY TYPE] (DTC locked) ─────────────────
+                m = _RE_DAY_TYPE_OPENING.search(line)
+                if m:
+                    _gap = m.group("gap_tag").upper()
+                    gap_tag = _gap if _gap in {"GAP_UP", "GAP_DOWN"} else "NO_GAP"
+                    if day_type_tag in {"NEUTRAL_DAY", "UNKNOWN"}:
+                        day_type_tag = "GAP_DAY" if _gap in {"GAP_UP", "GAP_DOWN"} else "NEUTRAL_DAY"
+                    tags["DAY_TYPE"] += 1
+                    continue
+                m = _RE_DAY_TYPE.search(line)
+                if m:
+                    day_type_tag = m.group("day_type_tag").upper()
+                    _cw = m.group("cpr_width_tag")
+                    if _cw:
+                        cpr_width_tag = _cw.upper()
+                    tags["DAY_TYPE"] += 1
+                    continue
+                # Replay DTC locked format: [DAY TYPE] TRENDING confidence=HIGH ...
+                m = _RE_DAY_TYPE_DTC.search(line)
+                if m:
+                    _dtc_name = m.group("dtc_name").upper()
+                    if _dtc_name != "UNKNOWN":
+                        day_type_tag = _dtc_name + "_DAY"
+                    tags["DAY_TYPE"] += 1
+                    continue
+
+                # ── [REVERSAL_SIGNAL] ─────────────────────────────────────
+                m = _RE_REVERSAL_SIGNAL.search(line)
+                if m:
+                    reversal_signal_count += 1
+                    tags["REVERSAL_SIGNAL"] += 1
+                    continue
+
+                # ── [REVERSAL_OVERRIDE] ───────────────────────────────────
+                m = _RE_REVERSAL_OVERRIDE.search(line)
+                if m:
+                    reversal_count += 1
+                    tags["REVERSAL_OVERRIDE"] += 1
+                    blocked["REVERSAL_OVERRIDE"] = blocked.get("REVERSAL_OVERRIDE", 0)  # ensure key exists
+                    continue
+
+                # ── [ENTRY ALLOWED][ST_SLOPE_OVERRIDE] ───────────────────
+                m = _RE_ST_SLOPE_OVERRIDE.search(line)
+                if m:
+                    slope_override_count += 1
+                    tags["ST_SLOPE_OVERRIDE"] += 1
+                    continue
+
+                # ── [ENTRY ALLOWED][ST_BIAS_OK] ... osc_context=ZoneX ─────
+                m = _RE_ENTRY_ALLOWED_ZONE.search(line)
+                if m:
+                    zone = m.group("zone")
+                    zone_entry_counts[zone] = zone_entry_counts.get(zone, 0) + 1
+                    continue
+
+                # ── [OSC_OVERRIDE][TREND_CONFIRMED] ──────────────────────
+                m = _RE_OSC_TREND_OVERRIDE.search(line)
+                if m:
+                    osc_overrides += 1
+                    tags["OSC_OVERRIDE"] = tags.get("OSC_OVERRIDE", 0) + 1
+                    continue
+
+                # ── [OSC_RELIEF][S4/R4_BREAK] ────────────────────────────
+                m = _RE_OSC_RELIEF.search(line)
+                if m:
+                    osc_relief_count += 1
+                    tags["OSC_RELIEF"] = tags.get("OSC_RELIEF", 0) + 1
+                    continue
+
+                # ── [TREND_LOSS] ──────────────────────────────────────────
+                if "[TREND_LOSS]" in line:
+                    trend_loss_count += 1
+                    continue
+
+                # ── [CONTRACT_ROLL] ───────────────────────────────────────
+                m = _RE_CONTRACT_ROLL.search(line)
+                if m:
+                    expiry_roll_count += 1
+                    tags["CONTRACT_ROLL"] = tags.get("CONTRACT_ROLL", 0) + 1
+                    continue
+
+                # ── [CONTRACT_METADATA][LOT_MISMATCH] ─────────────────────
+                m = _RE_LOT_MISMATCH.search(line)
+                if m:
+                    lot_size_mismatch_count += 1
+                    tags["LOT_MISMATCH"] = tags.get("LOT_MISMATCH", 0) + 1
+                    continue
+
+                # ── [CONTRACT_FILTER] ... SKIPPED ─────────────────────────
+                m = _RE_CONTRACT_FILTER_SKIP.search(line)
+                if m:
+                    intrinsic_filter_count += 1
+                    tags["INTRINSIC_FILTER"] = tags.get("INTRINSIC_FILTER", 0) + 1
+                    continue
+
+                # ── [EXPIRY_ROLL][SCORE_BONUS] ────────────────────────────
+                m = _RE_EXPIRY_ROLL_BONUS.search(line)
+                if m:
+                    tags["EXPIRY_ROLL_BONUS"] = tags.get("EXPIRY_ROLL_BONUS", 0) + 1
+                    continue
+
+                # ── [LOT_SIZE] ────────────────────────────────────────────
+                m = _RE_LOT_SIZE.search(line)
+                if m:
+                    tags["LOT_SIZE"] = tags.get("LOT_SIZE", 0) + 1
+                    continue
+
+                # ── [CONFIG] DEFAULT_LOT_SIZE ─────────────────────────────
+                if "[CONFIG] DEFAULT_LOT_SIZE" in line:
+                    tags["CONFIG_LOT_SIZE"] = tags.get("CONFIG_LOT_SIZE", 0) + 1
+                    continue
+
+                # ── [VIX_CONTEXT] ─────────────────────────────────────────
+                m = _RE_VIX_CONTEXT.search(line)
+                if m:
+                    vix_tier_count += 1
+                    tags["VIX_CONTEXT"] = tags.get("VIX_CONTEXT", 0) + 1
+                    continue
+
+                # ── [GREEKS] ──────────────────────────────────────────────
+                m = _RE_GREEKS.search(line)
+                if m:
+                    greeks_usage_count += 1
+                    tags["GREEKS"] = tags.get("GREEKS", 0) + 1
+                    continue
+
+                # ── [VOL_CONTEXT][SCORE_ADJUST] ───────────────────────────
+                m = _RE_VOL_CONTEXT_ADJUST.search(line)
+                if m:
+                    tags["VOL_CONTEXT_ADJUST"] = tags.get("VOL_CONTEXT_ADJUST", 0) + 1
+                    _ta = m.group("theta_adj")
+                    if _ta is not None and int(_ta) < 0:
+                        theta_penalty_count += 1
+                    continue
+
+                # ── [POSITION_SIZE] (vol-adjusted) ────────────────────────
+                m = _RE_POSITION_SIZE_VOL.search(line)
+                if m:
+                    tags["POSITION_SIZE"] = tags.get("POSITION_SIZE", 0) + 1
+                    _vh = m.group("vega_high")
+                    if _vh is not None and _vh.lower() == "true":
+                        vega_penalty_count += 1
+                    continue
+
+                # ── [VOL_CONTEXT][ALIGN] ──────────────────────────────────
+                m = _RE_VOL_CONTEXT_ALIGN.search(line)
+                if m:
+                    vol_context_align_count += 1
+                    continue
+
+                # ── [GREEKS_ALIGN] ────────────────────────────────────────
+                m = _RE_GREEKS_ALIGN.search(line)
+                if m:
+                    greeks_align_count += 1
+                    continue
+
+                # ── [SCORE_MATRIX] ────────────────────────────────────────
+                m = _RE_SCORE_MATRIX.search(line)
+                if m:
+                    score_matrix_usage_count += 1
+                    continue
+
+                # ── [ENTRY BLOCKED][OSC_EXTREME] ──────────────────────────
+                # Tracked via blocked_counts; also mirror into osc_blocks
+                if "[ENTRY BLOCKED][OSC_EXTREME]" in line:
+                    osc_blocks += 1
+                    # Fall through to _RE_ENTRY_BLOCKED which handles it too
+
                 # ── P1–P5 tags ────────────────────────────────────────────
                 m = _RE_TAG_ANY.search(line)
                 if m:
@@ -508,12 +1073,27 @@ class LogParser:
                         "pnl_rs":      0.0,
                     })
 
-        # If no TRADE OPEN/EXIT pairs found, fall back to EXIT AUDIT records
-        if not trades and audit_records:
-            trades = audit_records
+        # Select best trade list: struct > rich_exit > V1 pairs > EXIT AUDIT fallback
+        # struct:      new PositionManager format (option_name-keyed open+exit pair)
+        # rich_exit:   [EXIT][PAPER/LIVE ...] self-contained records (entry+exit+pnl all in one line)
+        # trades:      legacy [TRADE OPEN][MODE]/[TRADE EXIT] pairs
+        # audit_records: EXIT AUDIT only (no entry data, pnl only when premium_move present)
+        if trades_struct:
+            effective_trades = trades_struct
+        elif rich_exit_trades:
+            effective_trades = rich_exit_trades
+        elif trades:
+            effective_trades = trades
+        elif audit_records:
+            effective_trades = audit_records
+        else:
+            effective_trades = []
 
         # P5-F: annotate every trade with open_bias_aligned (extended P5-E logic)
-        for trade in trades:
+        for trade in effective_trades:
+            _existing = str(trade.get("open_bias_aligned", "")).upper()
+            if _existing in {"ALIGNED", "MISALIGNED", "NEUTRAL"}:
+                continue
             side = trade.get("side", "")
             call_aligned = side == "CALL" and (
                 open_bias_tag == "OPEN_LOW" or gap_tag == "GAP_UP"
@@ -528,8 +1108,14 @@ class LogParser:
             else:
                 trade["open_bias_aligned"] = "MISALIGNED"
 
-        return (trades, session_types, blocked, tags, signals_fired, entry_ok_count,
-                open_bias_tag, vs_close_tag, gap_tag, balance_tag)
+        return (effective_trades, session_types, blocked, tags, signals_fired, entry_ok_count,
+                open_bias_tag, vs_close_tag, gap_tag, balance_tag,
+                day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
+                osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,
+                expiry_roll_count, lot_size_mismatch_count, intrinsic_filter_count,
+                vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
+                vol_context_align_count, greeks_align_count, score_matrix_usage_count,
+                reversal_signal_count, dict(zone_entry_counts))
 
     @staticmethod
     def _log_ts(line: str) -> str:

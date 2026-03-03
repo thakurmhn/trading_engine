@@ -436,7 +436,8 @@ def detect_signal(candles_3m, candles_15m,
                   vwap=None,          # pass VWAP from paper_order / live_order
                   orb_high=None,      # opening range high
                   orb_low=None,       # opening range low
-                  day_type_result=None):  # NEW: DayTypeResult for threshold modifier
+                  day_type_result=None,  # NEW: DayTypeResult for threshold modifier
+                  osc_relief_active=False):  # NEW: S4/R4 relief override from gate
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -600,6 +601,7 @@ def detect_signal(candles_3m, candles_15m,
         pivot_signal=pivot_signal,
         current_time=current_time,
         day_type_result=day_type_result,
+        osc_relief_active=osc_relief_active,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────

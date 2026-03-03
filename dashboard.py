@@ -291,7 +291,7 @@ def print_summary(summary: dict) -> None:
     """Print a formatted summary to stdout."""
     sep = "=" * 55
     print(f"\n{sep}")
-    print("  SESSION DASHBOARD — TRADE SUMMARY")
+    print("  SESSION DASHBOARD - TRADE SUMMARY")
     print(sep)
     print(f"  Total trades   : {summary['total_trades']}")
     print(f"  Winners        : {summary['winners']}")
@@ -299,7 +299,7 @@ def print_summary(summary: dict) -> None:
     print(f"  Breakeven      : {summary['breakeven']}")
     print(f"  Win rate       : {summary['win_rate_pct']:.1f}%")
     print(f"  Net P&L (pts)  : {summary['net_pnl_points']:+.2f}")
-    print(f"  Net P&L (Rs)   : ₹{summary['net_pnl_rupees']:+,.2f}")
+    print(f"  Net P&L (Rs)   : Rs {summary['net_pnl_rupees']:+,.2f}")
     print(f"  Max win (pts)  : {summary['max_win_points']:+.2f}")
     print(f"  Max loss (pts) : {summary['max_loss_points']:+.2f}")
     print(sep)
@@ -697,9 +697,11 @@ def generate_full_report(
     text_path  = _write_text_report(session, out_dir / f"dashboard_report_{tag}.txt")
 
     logger.info(
-        f"[DASHBOARD] Full report: trades={session.total_trades} "
-        f"win={session.win_rate_pct}% net={session.net_pnl_pts:+.2f}pts "
-        f"blocked={session.total_blocked}"
+        f"[DASHBOARD_REPORT] date={session.date_tag} "
+        f"sessions=1 trades={session.total_trades} "
+        f"net_pnl={session.net_pnl_pts:+.1f}pts "
+        f"win_rate={session.win_rate_pct:.1f}% "
+        f"survivability={session.survivability_ratio:.1f}%"
     )
 
     return {
@@ -766,6 +768,179 @@ def _write_text_report(session, output_path: Path) -> Path:
         for tag, cnt in sorted(session.tag_counts.items(), key=lambda x: -x[1]):
             lines.append(f"  [{tag}]{'':>5}: {cnt}")
 
+    # Day classification section
+    lines.append("")
+    lines.append("  DAY CLASSIFICATION")
+    lines.append(sep2)
+    lines.append(f"  Day type tag       : {getattr(session, 'day_type_tag', 'N/A')}")
+    lines.append(f"  CPR width          : {getattr(session, 'cpr_width_tag', 'N/A')}")
+    lines.append(f"  Open bias tag      : {session.open_bias_tag}")
+    lines.append(f"  Open bias logs     : {session.tag_counts.get('OPEN_BIAS', 0)}")
+    lines.append(f"  Day-bias aligned   : {session.tag_counts.get('DAY_BIAS_ALIGN', 0)}")
+    lines.append(f"  Day-bias misalign  : {session.tag_counts.get('DAY_BIAS_MISALIGN', 0)}")
+    lines.append(f"  Gap tag            : {session.gap_tag}")
+    lines.append(f"  Balance tag        : {session.balance_tag}")
+
+    # Reversal detection section
+    rev_count = getattr(session, "reversal_trades_count", 0)
+    rev_signal_count = getattr(session, "reversal_signal_count", 0)
+    slope_count = getattr(session, "st_slope_override_count", 0)
+    rev_pnl = getattr(session, "reversal_pnl_attribution", 0.0)
+    if rev_count > 0 or rev_signal_count > 0 or slope_count > 0:
+        lines.append("")
+        lines.append("  REVERSAL DETECTOR")
+        lines.append(sep2)
+        lines.append(f"  Reversal signals   : {rev_signal_count}  ([REVERSAL_SIGNAL] detector firings)")
+        lines.append(f"  Reversal trades    : {rev_count}  (trades opened via REVERSAL_OVERRIDE path)")
+        lines.append(f"  Reversal P&L (pts) : {rev_pnl:+.2f}")
+        lines.append(f"  ST_SLOPE overrides : {slope_count}")
+
+    # Oscillator gating section
+    osc_blocks    = getattr(session, "oscillator_blocks", 0)
+    osc_overrides = getattr(session, "oscillator_overrides", 0)
+    zone_a_blocks = session.tag_counts.get("OSC_EXTREME", 0)
+    zone_b_trigs = session.tag_counts.get("OSC_REVERSAL", 0)
+    zone_c_relaxed = session.tag_counts.get("OSC_CONTINUATION", 0)
+    osc_context_logs = session.tag_counts.get("OSC_CONTEXT", 0)
+    _zone_entries = getattr(session, "zone_entry_counts", {})
+    _za_entries = _zone_entries.get("ZoneA", 0)
+    _zb_entries = _zone_entries.get("ZoneB", 0)
+    _zc_entries = _zone_entries.get("ZoneC", 0)
+    _zone_total = _za_entries + _zb_entries + _zc_entries
+    if osc_blocks > 0 or osc_overrides > 0 or zone_a_blocks > 0 or zone_b_trigs > 0 or zone_c_relaxed > 0:
+        osc_total = osc_blocks + osc_overrides
+        override_rate = (osc_overrides / osc_total * 100) if osc_total else 0.0
+        lines.append("")
+        lines.append("  OSCILLATOR GATING")
+        lines.append(sep2)
+        lines.append(f"  OSC blocks (extreme)   : {osc_blocks}")
+        lines.append(f"  OSC overrides (ADX)    : {osc_overrides}")
+        lines.append(f"  Override rate          : {override_rate:.1f}%")
+        if zone_a_blocks > 0 or zone_b_trigs > 0 or zone_c_relaxed > 0:
+            lines.append(f"  OSC context logs       : {osc_context_logs}")
+            lines.append(f"  Zone A blockers        : {zone_a_blocks}")
+            lines.append(f"  Zone B reversal trig   : {zone_b_trigs}")
+            lines.append(f"  Zone C continuation    : {zone_c_relaxed}")
+        if _zone_total > 0:
+            lines.append(f"  Zone A allowed entries : {_za_entries}  (tight OSC bounds)")
+            lines.append(f"  Zone B allowed entries : {_zb_entries}  (standard bounds)")
+            lines.append(f"  Zone C allowed entries : {_zc_entries}  (relaxed / trend bounds)")
+
+    # Entry gate context diagnostics section
+    entry_gate_count = session.tag_counts.get("ENTRY_GATE_CONTEXT", 0)
+    _bias_align    = session.tag_counts.get("DAY_BIAS_ALIGN",    0)
+    _bias_misalign = session.tag_counts.get("DAY_BIAS_MISALIGN", 0)
+    _bias_total    = _bias_align + _bias_misalign
+    if entry_gate_count > 0 or _zone_total > 0 or _bias_align > 0 or _bias_misalign > 0:
+        lines.append("")
+        lines.append("  ENTRY GATE CONTEXT")
+        lines.append(sep2)
+        lines.append(f"  Gate context logs      : {entry_gate_count}  ([ENTRY_GATE_CONTEXT] per-bar events)")
+        if _zone_total > 0:
+            lines.append(f"  Zone distribution      : A={_za_entries}  B={_zb_entries}  C={_zc_entries}  (allowed entries by zone)")
+        if _bias_total > 0:
+            _align_pct = round(_bias_align / _bias_total * 100, 1)
+            lines.append(f"  Day-bias aligned       : {_bias_align}/{_bias_total}  ({_align_pct:.1f}% aligned)")
+            lines.append(f"  Day-bias misaligned    : {_bias_misalign}")
+
+    # Trend loss section + OSC relief + Contract roll / expiry
+    trend_losses  = getattr(session, "trend_loss_count", 0)
+    osc_relief    = getattr(session, "oscillator_relief_count", 0)
+    expiry_rolls  = getattr(session, "expiry_roll_count", 0)
+    lot_mismatches = getattr(session, "lot_size_mismatch_count", 0)
+    intrinsic_skips = getattr(session, "intrinsic_filter_count", 0)
+
+    if trend_losses > 0 or osc_relief > 0 or expiry_rolls > 0 or lot_mismatches > 0 or intrinsic_skips > 0:
+        sl_loss_pct   = (trend_losses / session.total_trades * 100) if session.total_trades else 0.0
+        lines.append("")
+        lines.append("  TREND SURVIVABILITY")
+        lines.append(sep2)
+        if trend_losses > 0:
+            lines.append(f"  Trend SL exits         : {trend_losses}")
+            lines.append(f"  As % of all trades     : {sl_loss_pct:.1f}%")
+        if osc_relief > 0:
+            lines.append(f"  OSC relief overrides   : {osc_relief}  (S4/R4 breakout, extreme bypassed)")
+        if expiry_rolls > 0 or lot_mismatches > 0 or intrinsic_skips > 0:
+            lines.append("")
+            lines.append("  CONTRACT ROLL / EXPIRY")
+            lines.append(sep2)
+            lines.append(f"  Expiry rolls           : {expiry_rolls}  (automatic contract roll-over)")
+            lines.append(f"  Lot size mismatches    : {lot_mismatches}  (API vs manual mismatch)")
+            lines.append(f"  Intrinsic filter skips : {intrinsic_skips}  (zero-intrinsic contracts excluded)")
+
+    # Failed breakout, EMA stretch, and zone revisit attribution
+    fb_trades = [t for t in session.trades if t.get("failed_breakout")]
+    ema_trades = [t for t in session.trades if t.get("ema_stretch")]
+    zone_trades = [t for t in session.trades if t.get("zone_revisit")]
+    if fb_trades or ema_trades or zone_trades:
+        lines.append("")
+        lines.append("  CONTEXT ATTRIBUTION")
+        lines.append(sep2)
+        if fb_trades:
+            fb_w = sum(1 for t in fb_trades if t.get("pnl_pts", 0) > 0)
+            fb_l = sum(1 for t in fb_trades if t.get("pnl_pts", 0) < 0)
+            lines.append(f"  Failed breakout trades : {len(fb_trades)}  W/L={fb_w}/{fb_l}")
+        if ema_trades:
+            em_w = sum(1 for t in ema_trades if t.get("pnl_pts", 0) > 0)
+            em_l = sum(1 for t in ema_trades if t.get("pnl_pts", 0) < 0)
+            lines.append(f"  EMA stretch trades    : {len(ema_trades)}  W/L={em_w}/{em_l}")
+        if zone_trades:
+            z_w = sum(1 for t in zone_trades if t.get("pnl_pts", 0) > 0)
+            z_l = sum(1 for t in zone_trades if t.get("pnl_pts", 0) < 0)
+            br = [t for t in zone_trades if str(t.get("zone_revisit_action", "")).upper() == "BREAKOUT"]
+            rv = [t for t in zone_trades if str(t.get("zone_revisit_action", "")).upper() == "REVERSAL"]
+            br_w = sum(1 for t in br if t.get("pnl_pts", 0) > 0)
+            br_l = sum(1 for t in br if t.get("pnl_pts", 0) < 0)
+            rv_w = sum(1 for t in rv if t.get("pnl_pts", 0) > 0)
+            rv_l = sum(1 for t in rv if t.get("pnl_pts", 0) < 0)
+            atr_stop = sum(1 for t in zone_trades if "SL" in str(t.get("exit_reason", "")).upper())
+            avg_bars = (sum(float(t.get("bars_held", 0)) for t in zone_trades) / len(zone_trades)) if zone_trades else 0.0
+            lines.append(f"  Zone revisit trades    : {len(zone_trades)}  W/L={z_w}/{z_l}")
+            lines.append(f"  Breakout W/L           : {br_w}/{br_l}")
+            lines.append(f"  Reversal W/L           : {rv_w}/{rv_l}")
+            lines.append(f"  Avg bars held          : {avg_bars:.1f}")
+            lines.append(f"  ATR-stop exits         : {atr_stop}")
+            if any("zone_age_bars" in t for t in zone_trades):
+                ages = [float(t.get("zone_age_bars", 0)) for t in zone_trades]
+                age_avg = (sum(ages) / len(ages)) if ages else 0.0
+                lines.append(f"  Zone age avg (bars)    : {age_avg:.1f}")
+
+    # Volatility context section
+    vix_count     = getattr(session, "vix_tier_count",         0)
+    greeks_count  = getattr(session, "greeks_usage_count",     0)
+    theta_count   = getattr(session, "theta_penalty_count",    0)
+    vega_count    = getattr(session, "vega_penalty_count",     0)
+    vc_align      = getattr(session, "vol_context_align_count",  0)
+    gr_align      = getattr(session, "greeks_align_count",       0)
+    sc_matrix     = getattr(session, "score_matrix_usage_count", 0)
+    if vix_count > 0 or greeks_count > 0 or theta_count > 0 or vega_count > 0 \
+            or vc_align > 0 or gr_align > 0 or sc_matrix > 0:
+        lines.append("")
+        lines.append("  VOLATILITY CONTEXT")
+        lines.append(sep2)
+        lines.append(f"  VIX tier refreshes     : {vix_count}  (India VIX regime updates)")
+        lines.append(f"  Greeks computed        : {greeks_count}  (BSM IV + Delta/Theta/Vega)")
+        if theta_count > 0:
+            theta_pct = (theta_count / session.total_trades * 100) if session.total_trades else 0.0
+            lines.append(
+                f"  Theta penalty entries  : {theta_count}  ({theta_pct:.1f}% of trades — high decay)"
+            )
+        else:
+            lines.append(f"  Theta penalty entries  : {theta_count}")
+        if vega_count > 0:
+            vega_pct = (vega_count / session.total_trades * 100) if session.total_trades else 0.0
+            lines.append(
+                f"  Vega size reductions   : {vega_count}  ({vega_pct:.1f}% of trades — lots reduced)"
+            )
+        else:
+            lines.append(f"  Vega size reductions   : {vega_count}")
+        if vc_align > 0:
+            lines.append(f"  Vol-indicator aligns   : {vc_align}  ([VOL_CONTEXT][ALIGN] per-side events)")
+        if gr_align > 0:
+            lines.append(f"  Greeks-indicator aligns: {gr_align}  ([GREEKS_ALIGN] per-side events)")
+        if sc_matrix > 0:
+            lines.append(f"  Score matrix audits    : {sc_matrix}  ([SCORE_MATRIX] per-side breakdowns)")
+
     # P5-F: Opening Scenario section (all P5 tags + alignment breakdown)
     obs = session.open_bias_stats
     if obs["open_bias_tag"] != "NONE" or session.total_trades:
@@ -786,6 +961,12 @@ def _write_text_report(session, output_path: Path) -> Path:
             f"P&L: {obs['misaligned_pnl']:+.2f} pts"
         )
         lines.append(f"  Neutral trades     : {obs['neutral_count']:>4}")
+        _aligned_w = sum(1 for t in session.trades if t.get("open_bias_aligned") == "ALIGNED" and t.get("pnl_pts", 0) > 0)
+        _aligned_l = sum(1 for t in session.trades if t.get("open_bias_aligned") == "ALIGNED" and t.get("pnl_pts", 0) < 0)
+        _mis_w = sum(1 for t in session.trades if t.get("open_bias_aligned") == "MISALIGNED" and t.get("pnl_pts", 0) > 0)
+        _mis_l = sum(1 for t in session.trades if t.get("open_bias_aligned") == "MISALIGNED" and t.get("pnl_pts", 0) < 0)
+        lines.append(f"  Aligned W/L        : {_aligned_w}/{_aligned_l}")
+        lines.append(f"  Misaligned W/L     : {_mis_w}/{_mis_l}")
         if obs.get("is_gap_day"):
             lines.append(
                 f"  Gap day P&L        : {obs['gap_day_pnl']:+.2f} pts  "
@@ -797,11 +978,112 @@ def _write_text_report(session, output_path: Path) -> Path:
                 f"({obs['balance_tag']})"
             )
 
+    # ── GREEKS PENALTIES (standalone) ─────────────────────────────────────────
+    if theta_count > 0 or vega_count > 0:
+        lines.append("")
+        lines.append("  GREEKS PENALTIES")
+        lines.append(sep2)
+        _theta_score_est = theta_count * 8  # each penalty = −8 score pts
+        if theta_count > 0:
+            _theta_pct = (theta_count / session.total_trades * 100) if session.total_trades else 0.0
+            lines.append(
+                f"  Theta penalty entries  : {theta_count}"
+                f"  ({_theta_pct:.1f}% of trades, ~{_theta_score_est} score pts lost)"
+            )
+        else:
+            lines.append(f"  Theta penalty entries  : 0")
+        if vega_count > 0:
+            _vega_pct = (vega_count / session.total_trades * 100) if session.total_trades else 0.0
+            lines.append(
+                f"  Vega size reductions   : {vega_count}"
+                f"  ({_vega_pct:.1f}% of trades — high IV exposure)"
+            )
+        else:
+            lines.append(f"  Vega size reductions   : 0")
+
+    # ── LOT SIZE ENFORCEMENT ───────────────────────────────────────────────────
+    _lot_cap   = getattr(session, "lot_cap_count", 0)
+    _lot_mis   = getattr(session, "lot_size_mismatch_count", 0)
+    _intr_skip = getattr(session, "intrinsic_filter_count", 0)
+    if _lot_cap > 0 or _lot_mis > 0 or _intr_skip > 0:
+        lines.append("")
+        lines.append("  LOT SIZE ENFORCEMENT")
+        lines.append(sep2)
+        lines.append(f"  MAX_TRADES_CAP blocks  : {_lot_cap}  (daily cap reached)")
+        lines.append(f"  Lot size mismatches    : {_lot_mis}  (API lot ≠ config lot)")
+        lines.append(f"  Intrinsic filter skips : {_intr_skip}  (zero-intrinsic contracts skipped)")
+
+    # ── TRADE DETAILS table ────────────────────────────────────────────────────
+    if session.total_trades > 0:
+        lines.append("")
+        lines.append("  TRADE DETAILS")
+        lines.append(sep2)
+        _hdr = (
+            f"  {'#':>2}  {'Time':<8}  {'Side':<4}  {'Contract':<26}"
+            f"  {'Entry':>7}  {'Exit':>7}  {'P&L(pts)':>9}  {'P&L(Rs)':>8}"
+            f"  {'Bars':>4}  {'Lots':>4}  Reason"
+        )
+        lines.append(_hdr)
+        lines.append("  " + "-" * (len(_hdr) - 2))
+        for _i, _t in enumerate(session.trades, 1):
+            _ts     = str(_t.get("bar_ts") or "")[-8:] or "?"
+            _side   = (_t.get("side") or "?")[:4]
+            _cname  = (_t.get("option_name") or "N/A")[:26]
+            _eprem  = _t.get("entry_prem")
+            _xprem  = _t.get("exit_prem")
+            _pnl_p  = _t.get("pnl_pts", 0.0)
+            _pnl_r  = _t.get("pnl_rs", 0.0)
+            _bars   = _t.get("bars_held", "?")
+            _lots   = _t.get("lot") or "?"
+            _reason = (_t.get("exit_reason") or _t.get("outcome") or "?")[:12]
+            lines.append(
+                f"  {_i:>2}  {_ts:<8}  {_side:<4}  {_cname:<26}"
+                f"  {_eprem if _eprem is not None else '?':>7}  "
+                f"{_xprem if _xprem is not None else '?':>7}  "
+                f"{_pnl_p:>+9.2f}  {_pnl_r:>+8.0f}"
+                f"  {str(_bars):>4}  {str(_lots):>4}  {_reason}"
+            )
+        lines.append("  " + "-" * (len(_hdr) - 2))
+
+    # ── P&L SUMMARY ───────────────────────────────────────────────────────────
+    if session.total_trades > 0:
+        lines.append("")
+        lines.append("  P&L SUMMARY")
+        lines.append(sep2)
+        lines.append(
+            f"  Net P&L       : {session.net_pnl_pts:>+8.2f} pts"
+            f"  ({session.net_pnl_rs:>+.0f} Rs)"
+        )
+        lines.append(
+            f"  Average P&L   : {session.avg_pnl_pts:>+8.2f} pts per trade"
+        )
+        # Best / worst trade
+        _pnl_vals = [(t.get("pnl_pts", 0.0), t) for t in session.trades]
+        if _pnl_vals:
+            _best_pts, _best_t = max(_pnl_vals, key=lambda x: x[0])
+            _worst_pts, _worst_t = min(_pnl_vals, key=lambda x: x[0])
+            _best_side  = _best_t.get("side", "?")
+            _worst_side = _worst_t.get("side", "?")
+            _best_bar   = _best_t.get("bar") or str(_best_t.get("bar_ts") or "?")[-8:] or "?"
+            _worst_bar  = _worst_t.get("bar") or str(_worst_t.get("bar_ts") or "?")[-8:] or "?"
+            lines.append(
+                f"  Best trade    : {_best_pts:>+8.2f} pts"
+                f"  ({_best_side} bar={_best_bar})"
+            )
+            lines.append(
+                f"  Worst trade   : {_worst_pts:>+8.2f} pts"
+                f"  ({_worst_side} bar={_worst_bar})"
+            )
+        lines.append(
+            f"  Survivability : {session.survivability_count}/{session.total_trades} trades"
+            f"  ({session.survivability_ratio:.1f}%) held >=3 bars"
+        )
+
     lines += ["", sep, ""]
 
     text = "\n".join(lines)
     output_path.write_text(text, encoding="utf-8")
-    logger.info(f"[DASHBOARD] Text report saved → {output_path}")
+    logger.info(f"[DASHBOARD] Text report saved -> {output_path}")
     return output_path
 
 
@@ -849,16 +1131,83 @@ def compare_sessions(
         for s in sessions:
             for k, v in s.tag_counts.items():
                 all_tags[k] = all_tags.get(k, 0) + v
+        reversal_trades   = sum(getattr(s, "reversal_trades_count", 0) for s in sessions)
+        reversal_signals  = sum(getattr(s, "reversal_signal_count", 0) for s in sessions)
+        slope_overrides   = sum(getattr(s, "st_slope_override_count", 0) for s in sessions)
+        reversal_pnl      = round(sum(getattr(s, "reversal_pnl_attribution", 0.0) for s in sessions), 2)
+        osc_blocks        = sum(getattr(s, "oscillator_blocks", 0) for s in sessions)
+        osc_overrides     = sum(getattr(s, "oscillator_overrides", 0) for s in sessions)
+        osc_relief        = sum(getattr(s, "oscillator_relief_count", 0) for s in sessions)
+        trend_losses      = sum(getattr(s, "trend_loss_count", 0) for s in sessions)
+        expiry_rolls      = sum(getattr(s, "expiry_roll_count", 0) for s in sessions)
+        lot_mismatches    = sum(getattr(s, "lot_size_mismatch_count", 0) for s in sessions)
+        intrinsic_skips   = sum(getattr(s, "intrinsic_filter_count", 0) for s in sessions)
+        vix_tier_count    = sum(getattr(s, "vix_tier_count",         0) for s in sessions)
+        greeks_usage      = sum(getattr(s, "greeks_usage_count",     0) for s in sessions)
+        theta_penalties   = sum(getattr(s, "theta_penalty_count",    0) for s in sessions)
+        vega_penalties    = sum(getattr(s, "vega_penalty_count",     0) for s in sessions)
+        vc_aligns         = sum(getattr(s, "vol_context_align_count",  0) for s in sessions)
+        gr_aligns         = sum(getattr(s, "greeks_align_count",       0) for s in sessions)
+        sc_matrices       = sum(getattr(s, "score_matrix_usage_count", 0) for s in sessions)
+        surv_count        = sum(getattr(s, "survivability_count",      0) for s in sessions)
+        lot_cap           = sum(getattr(s, "lot_cap_count",            0) for s in sessions)
+        zone_counts_all: Dict[str, int] = {}
+        for s in sessions:
+            for z, v in getattr(s, "zone_entry_counts", {}).items():
+                zone_counts_all[z] = zone_counts_all.get(z, 0) + v
+        bias_aligned_wins   = sum(
+            1 for s in sessions for t in s.trades
+            if t.get("open_bias_aligned") == "ALIGNED" and t.get("pnl_pts", 0) > 0
+        )
+        bias_aligned_losses = sum(
+            1 for s in sessions for t in s.trades
+            if t.get("open_bias_aligned") == "ALIGNED" and t.get("pnl_pts", 0) < 0
+        )
+        bias_misalign_wins  = sum(
+            1 for s in sessions for t in s.trades
+            if t.get("open_bias_aligned") == "MISALIGNED" and t.get("pnl_pts", 0) > 0
+        )
+        bias_misalign_losses = sum(
+            1 for s in sessions for t in s.trades
+            if t.get("open_bias_aligned") == "MISALIGNED" and t.get("pnl_pts", 0) < 0
+        )
         return {
-            "sessions":        len(sessions),
-            "total_trades":    total,
-            "winners":         wins,
-            "losers":          losses,
-            "win_rate_pct":    round(wins / total * 100, 1) if total else 0.0,
-            "net_pnl_pts":     round(pnl, 2),
-            "total_blocked":   blocked_total,
-            "blocked_counts":  all_blocked,
-            "tag_counts":      all_tags,
+            "sessions":                 len(sessions),
+            "total_trades":             total,
+            "winners":                  wins,
+            "losers":                   losses,
+            "win_rate_pct":             round(wins / total * 100, 1) if total else 0.0,
+            "net_pnl_pts":              round(pnl, 2),
+            "total_blocked":            blocked_total,
+            "blocked_counts":           all_blocked,
+            "tag_counts":               all_tags,
+            "reversal_trades_count":    reversal_trades,
+            "reversal_signal_count":    reversal_signals,
+            "reversal_pnl_attribution": reversal_pnl,
+            "st_slope_override_count":  slope_overrides,
+            "oscillator_blocks":        osc_blocks,
+            "oscillator_overrides":     osc_overrides,
+            "oscillator_relief_count":   osc_relief,
+            "trend_loss_count":          trend_losses,
+            "expiry_roll_count":         expiry_rolls,
+            "lot_size_mismatch_count":   lot_mismatches,
+            "intrinsic_filter_count":    intrinsic_skips,
+            "vix_tier_count":            vix_tier_count,
+            "greeks_usage_count":        greeks_usage,
+            "theta_penalty_count":       theta_penalties,
+            "vega_penalty_count":        vega_penalties,
+            "vol_context_align_count":   vc_aligns,
+            "greeks_align_count":        gr_aligns,
+            "score_matrix_usage_count":  sc_matrices,
+            "survivability_count":       surv_count,
+            "survivability_ratio":       round(surv_count / total * 100, 1) if total else 0.0,
+            "avg_pnl_pts":               round(pnl / total, 2) if total else 0.0,
+            "lot_cap_count":             lot_cap,
+            "zone_entry_counts":         zone_counts_all,
+            "bias_aligned_wins":         bias_aligned_wins,
+            "bias_aligned_losses":       bias_aligned_losses,
+            "bias_misalign_wins":        bias_misalign_wins,
+            "bias_misalign_losses":      bias_misalign_losses,
         }
 
     base = _aggregate(baseline_sessions)
@@ -921,6 +1270,121 @@ def _write_comparison_text(
             fv = fix["blocked_counts"].get(r, 0)
             diff = fv - bv
             lines.append(f"  {r:<30} {bv:>12} {fv:>12}  ({'+' if diff>=0 else ''}{diff})")
+
+    # Reversal / oscillator section
+    rev_b = base.get("reversal_trades_count", 0)
+    rev_f = fix.get("reversal_trades_count", 0)
+    rev_sig_b = base.get("reversal_signal_count", 0)
+    rev_sig_f = fix.get("reversal_signal_count", 0)
+    slope_b = base.get("st_slope_override_count", 0)
+    slope_f = fix.get("st_slope_override_count", 0)
+    ob_b = base.get("oscillator_blocks", 0)
+    ob_f = fix.get("oscillator_blocks", 0)
+    oo_b = base.get("oscillator_overrides", 0)
+    oo_f = fix.get("oscillator_overrides", 0)
+    or_b = base.get("oscillator_relief_count", 0)
+    or_f = fix.get("oscillator_relief_count", 0)
+    tl_b = base.get("trend_loss_count", 0)
+    tl_f = fix.get("trend_loss_count", 0)
+    er_b  = base.get("expiry_roll_count", 0)
+    er_f  = fix.get("expiry_roll_count", 0)
+    lm_b  = base.get("lot_size_mismatch_count", 0)
+    lm_f  = fix.get("lot_size_mismatch_count", 0)
+    is_b  = base.get("intrinsic_filter_count", 0)
+    is_f  = fix.get("intrinsic_filter_count", 0)
+    sv_b  = base.get("survivability_ratio", 0.0)
+    sv_f  = fix.get("survivability_ratio", 0.0)
+    lc_b  = base.get("lot_cap_count", 0)
+    lc_f  = fix.get("lot_cap_count", 0)
+    if any([rev_b, rev_f, rev_sig_b, rev_sig_f, slope_b, slope_f,
+            ob_b, ob_f, oo_b, oo_f, or_b, or_f, tl_b, tl_f, sv_b, sv_f]):
+        lines += ["", "  REVERSAL & OSCILLATOR GATING", sep2]
+        for label, bv, fv, hib in [
+            ("Reversal signals",             rev_sig_b, rev_sig_f, True),
+            ("Reversal trades",              rev_b,   rev_f,   True),
+            ("ST_SLOPE overrides",           slope_b, slope_f, True),
+            ("OSC blocks (extreme)",         ob_b,    ob_f,    False),
+            ("OSC overrides (ADX)",          oo_b,    oo_f,    True),
+            ("OSC relief (S4/R4 break)",     or_b,    or_f,    True),
+            ("Trend SL exits",               tl_b,    tl_f,    False),
+            ("Survivability ratio % (▲=better)", sv_b, sv_f,  True),
+        ]:
+            diff = fv - bv
+            arrow = "▲" if (diff > 0) == hib else ("▼" if diff != 0 else "=")
+            lines.append(
+                f"  {label:<30} {bv:>12} {fv:>12}  ({'+' if diff>=0 else ''}{diff} {arrow})"
+            )
+
+    # Open bias alignment comparison
+    ba_w_b = base.get("bias_aligned_wins",   0)
+    ba_w_f = fix.get("bias_aligned_wins",    0)
+    ba_l_b = base.get("bias_aligned_losses", 0)
+    ba_l_f = fix.get("bias_aligned_losses",  0)
+    bm_w_b = base.get("bias_misalign_wins",  0)
+    bm_w_f = fix.get("bias_misalign_wins",   0)
+    bm_l_b = base.get("bias_misalign_losses",0)
+    bm_l_f = fix.get("bias_misalign_losses", 0)
+    if any([ba_w_b, ba_w_f, ba_l_b, ba_l_f, bm_w_b, bm_w_f, bm_l_b, bm_l_f]):
+        lines += ["", "  OPEN BIAS ALIGNMENT", sep2]
+        for label, bv, fv, hib in [
+            ("Aligned   W (▲=more wins)",     ba_w_b, ba_w_f, True),
+            ("Aligned   L (▼=fewer losses)",  ba_l_b, ba_l_f, False),
+            ("Misaligned W",                  bm_w_b, bm_w_f, True),
+            ("Misaligned L (▼=fewer losses)", bm_l_b, bm_l_f, False),
+        ]:
+            diff = fv - bv
+            arrow = "▲" if (diff > 0) == hib else ("▼" if diff != 0 else "=")
+            lines.append(
+                f"  {label:<35} {bv:>9} {fv:>9}  ({'+' if diff>=0 else ''}{diff} {arrow})"
+            )
+
+    # Contract roll / expiry comparison
+    if any([er_b, er_f, lm_b, lm_f, is_b, is_f, lc_b, lc_f]):
+        lines += ["", "  CONTRACT ROLL / EXPIRY", sep2]
+        for label, bv, fv, hib in [
+            ("Expiry rolls (▲ = better continuity)", er_b, er_f, True),
+            ("Lot size mismatches (▼ = better)",     lm_b, lm_f, False),
+            ("Intrinsic filter skips",               is_b, is_f, False),
+            ("MAX_TRADES_CAP blocks (▼ = better)",   lc_b, lc_f, False),
+        ]:
+            diff  = fv - bv
+            arrow = "▲" if (diff > 0) == hib else ("▼" if diff != 0 else "=")
+            lines.append(
+                f"  {label:<40} {bv:>8} {fv:>8}  ({'+' if diff>=0 else ''}{diff} {arrow})"
+            )
+
+    # Volatility context comparison
+    vc_b  = base.get("vix_tier_count",         0)
+    vc_f  = fix.get("vix_tier_count",          0)
+    gr_b  = base.get("greeks_usage_count",     0)
+    gr_f  = fix.get("greeks_usage_count",      0)
+    tp_b  = base.get("theta_penalty_count",    0)
+    tp_f  = fix.get("theta_penalty_count",     0)
+    vp_b  = base.get("vega_penalty_count",     0)
+    vp_f  = fix.get("vega_penalty_count",      0)
+    vca_b = base.get("vol_context_align_count",  0)
+    vca_f = fix.get("vol_context_align_count",   0)
+    gra_b = base.get("greeks_align_count",       0)
+    gra_f = fix.get("greeks_align_count",        0)
+    scm_b = base.get("score_matrix_usage_count", 0)
+    scm_f = fix.get("score_matrix_usage_count",  0)
+    if any([vc_b, vc_f, gr_b, gr_f, tp_b, tp_f, vp_b, vp_f,
+            vca_b, vca_f, gra_b, gra_f, scm_b, scm_f]):
+        lines += ["", "  VOLATILITY CONTEXT", sep2]
+        for label, bv, fv, hib in [
+            ("VIX tier refreshes (▲ = more aware)",        vc_b,  vc_f,  True),
+            ("Greeks computed (▲ = more coverage)",        gr_b,  gr_f,  True),
+            ("Theta penalties (▼ = fewer = better)",       tp_b,  tp_f,  False),
+            ("Vega size cuts (▼ = fewer = better)",        vp_b,  vp_f,  False),
+            ("Vol-indicator aligns (▲ = more audited)",    vca_b, vca_f, True),
+            ("Greeks aligns (▲ = more audited)",           gra_b, gra_f, True),
+            ("Score matrix events (▲ = more adjustments)", scm_b, scm_f, True),
+        ]:
+            diff  = fv - bv
+            arrow = "▲" if (diff > 0) == hib else ("▼" if diff != 0 else "=")
+            lines.append(
+                f"  {label:<40} {bv:>8} {fv:>8}  ({'+' if diff>=0 else ''}{diff} {arrow})"
+            )
 
     # P1-P4 tag comparison
     all_tags = set(base["tag_counts"]) | set(fix["tag_counts"])

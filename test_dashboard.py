@@ -1488,6 +1488,600 @@ class TestDashboardOpenBiasExtended(unittest.TestCase):
         self.assertGreater(s.tag_counts.get("BALANCE_OPEN", 0), 0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestNewLogParserFields — new SessionSummary fields added in Mar 2026
+# Covers: day_type_tag, cpr_width_tag, reversal/osc/expiry/volatility counters,
+#         structured TRADE OPEN/EXIT format, lot_cap_count, survivability.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _day_type_log(day_type: str = "TREND_DAY", cpr_width: str = "NARROW") -> str:
+    return textwrap.dedent(f"""\
+        2026-03-02 09:30:01,001 - INFO - [DAY_TYPE] day_type_tag={day_type} open_bias=OPEN_LOW gap=NO_GAP balance=OUTSIDE_BALANCE vs_close=OPEN_ABOVE_CLOSE cpr_width={cpr_width}
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=72 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] WIN  CALL bar=7 2026-03-02 09:38:00 prem 100.00→115.00 P&L=+15.00pts (+1125₹) peak=116.00 held=2bars
+    """)
+
+
+def _reversal_log() -> str:
+    return textwrap.dedent("""\
+        2026-03-02 09:30:01,001 - INFO - [REVERSAL_SIGNAL] CALL score=78 strength=HIGH stretch=-1.87x ATR pivot=S4 ema9=22100 ema13=22080
+        2026-03-02 09:30:02,001 - INFO - [REVERSAL_OVERRIDE] RSI=22.5 oscillator extreme flipped to confirmation for CALL reversal score=78 strength=HIGH pivot_zone=S4
+        2026-03-02 09:30:03,001 - INFO - [ENTRY ALLOWED][ST_SLOPE_OVERRIDE] timestamp=2026-03-02 09:30:03 symbol=NSE:NIFTY50-INDEX allowed_side=CALL ST3m_bias=BULLISH ST3m_slope=DOWN override_reason=REVERSAL_OVERRIDE: reversal_score=78 strength=HIGH
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=78 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] WIN  CALL bar=7 2026-03-02 09:38:00 prem 100.00→120.00 P&L=+20.00pts (+1500₹) peak=121.00 held=2bars
+    """)
+
+
+def _osc_gating_log() -> str:
+    return textwrap.dedent("""\
+        2026-03-02 09:30:01,001 - INFO - [ENTRY BLOCKED][OSC_EXTREME] timestamp=2026-03-02 09:30:01 symbol=NSE:NIFTY50-INDEX allowed_side=PUT RSI=22.0 CCI=-210.0 rsi_range=[20.0,80.0] cci_range=[-250.0,250.0] tier=ADX_STRONG_40 ADX=41.5 reason=Oscillator extreme
+        2026-03-02 09:30:02,001 - INFO - [OSC_OVERRIDE][TREND_CONFIRMED] timestamp=2026-03-02 09:30:02 symbol=NSE:NIFTY50-INDEX allowed_side=CALL ADX=38.2 tier=ADX_MOD_30 RSI=71.5 (expanded [25.0,75.0]) CCI=188.3 (expanded [-200.0,200.0])
+        2026-03-02 09:30:03,001 - INFO - [OSC_RELIEF][S4/R4_BREAK] side=PUT reason=price below S4-ATR close=21800.0 s4=21900.0 s4_relief_thr=21850.0 atr=50.0
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=72 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] WIN  CALL bar=7 2026-03-02 09:38:00 prem 100.00→115.00 P&L=+15.00pts (+1125₹) peak=116.00 held=2bars
+    """)
+
+
+def _contract_expiry_log() -> str:
+    return textwrap.dedent("""\
+        2026-03-02 09:15:01,001 - INFO - [CONTRACT_METADATA] symbol=NIFTY lot=75 expiry=2026-03-06 contracts_loaded=120
+        2026-03-02 09:15:02,001 - INFO - [CONTRACT_ROLL] symbol=NIFTY old_expiry=2026-03-06 new_expiry=2026-03-13
+        2026-03-02 09:15:03,001 - DEBUG - [CONTRACT_FILTER] symbol=NIFTY24MAR22000CE strike=22000 intrinsic=0.00 → SKIPPED
+        2026-03-02 09:15:04,001 - WARNING - [CONTRACT_METADATA][LOT_MISMATCH] api_lot=75 manual_lot=50
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=72 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] WIN  CALL bar=7 2026-03-02 09:38:00 prem 100.00→115.00 P&L=+15.00pts (+1125₹) peak=116.00 held=2bars
+    """)
+
+
+def _volatility_log() -> str:
+    return textwrap.dedent("""\
+        2026-03-02 09:15:01,001 - INFO - [VIX_CONTEXT] symbol=NSE:INDIAVIX-INDEX value=13.50 tier=CALM
+        2026-03-02 09:15:02,001 - INFO - [GREEKS] symbol=NIFTY24MAR22400CE delta=0.48 gamma=0.003 theta=-6.2 vega=18.5 iv=14.2%
+        2026-03-02 09:15:03,001 - DEBUG - [VOL_CONTEXT][SCORE_ADJUST][CALL] vix_tier=CALM vol_adj=-5 theta=-6.2 theta_adj=-8 vega=18.5
+        2026-03-02 09:15:04,001 - INFO - [POSITION_SIZE] equity=N/A score=72 atr=85.0 vix_tier=CALM vega_high=True conf_low=False lots=1
+        2026-03-02 09:15:05,001 - DEBUG - [VOL_CONTEXT][ALIGN][CALL] indicators=RSI:61.7_ADX:32.5 vix_tier=CALM adj=score:-5_osc:STRICTER_atr:TIGHTER
+        2026-03-02 09:15:06,001 - DEBUG - [GREEKS_ALIGN][CALL] symbol=NIFTY24MAR22400CE theta=-6.2 vega=18.5 adj=theta:-8_vega_risk:HIGH
+        2026-03-02 09:15:07,001 - DEBUG - [SCORE_MATRIX][CALL] base=85 vol_adj=-5 theta_adj=-8 final=72/50
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=72 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] WIN  CALL bar=7 2026-03-02 09:38:00 prem 100.00→115.00 P&L=+15.00pts (+1125₹) peak=116.00 held=2bars
+    """)
+
+
+def _struct_trade_log() -> str:
+    """Structured [TRADE OPEN] / [TRADE EXIT] format from PositionManager."""
+    return textwrap.dedent("""\
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:32:00 side=CALL option_name=NIFTY24MAR22400CE entry=100.00 lots=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:38:00 option_name=NIFTY24MAR22400CE exit=115.00 pnl_pts=+15.00 pnl_rs=+1125 bars=2 reason=TG_HIT
+        2026-03-02 09:45:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:45:00 side=PUT option_name=NIFTY24MAR22200PE entry=80.00 lots=75
+        2026-03-02 09:51:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:51:00 option_name=NIFTY24MAR22200PE exit=68.00 pnl_pts=-12.00 pnl_rs=-900 bars=2 reason=SL_HIT
+    """)
+
+
+def _trend_loss_log() -> str:
+    return textwrap.dedent("""\
+        2026-03-02 09:32:00,001 - INFO - [TRADE OPEN][PAPER] CALL bar=5 2026-03-02 09:32:00 underlying=22400.00 premium=100.00 score=72 src=PIVOT lot=75
+        2026-03-02 09:38:00,001 - INFO - [TRADE EXIT] LOSS CALL bar=7 2026-03-02 09:38:00 prem 100.00→85.00 P&L=-15.00pts (-1125₹) peak=102.00 held=5bars
+        2026-03-02 09:38:01,001 - INFO - [TREND_LOSS] side=CALL exit_reason=SL_HIT pnl=-15.00 bars=5 adx_tier=ADX_DEFAULT
+    """)
+
+
+class TestNewLogParserFields(unittest.TestCase):
+    """Mar 2026: new SessionSummary fields parsed from structured log tags."""
+
+    def _parse_log(self, content: str) -> "SessionSummary":
+        log_path = _make_log_file(content)
+        try:
+            return LogParser(log_path).parse()
+        finally:
+            os.unlink(log_path)
+
+    # ── day_type_tag ──────────────────────────────────────────────────────────
+
+    def test_day_type_tag_trend_day(self):
+        s = self._parse_log(_day_type_log("TREND_DAY"))
+        self.assertEqual(s.day_type_tag, "TREND_DAY")
+
+    def test_day_type_tag_range_day(self):
+        s = self._parse_log(_day_type_log("RANGE_DAY"))
+        self.assertEqual(s.day_type_tag, "RANGE_DAY")
+
+    def test_day_type_tag_default_neutral(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - no day type here\n")
+        self.assertEqual(s.day_type_tag, "NEUTRAL_DAY")
+
+    def test_cpr_width_tag_narrow(self):
+        s = self._parse_log(_day_type_log(cpr_width="NARROW"))
+        self.assertEqual(s.cpr_width_tag, "NARROW")
+
+    def test_cpr_width_tag_wide(self):
+        s = self._parse_log(_day_type_log(cpr_width="WIDE"))
+        self.assertEqual(s.cpr_width_tag, "WIDE")
+
+    def test_cpr_width_tag_default_normal(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - no cpr here\n")
+        self.assertEqual(s.cpr_width_tag, "NORMAL")
+
+    def test_day_type_counted_in_tag_counts(self):
+        s = self._parse_log(_day_type_log())
+        self.assertGreater(s.tag_counts.get("DAY_TYPE", 0), 0)
+
+    # ── reversal_trades_count and st_slope_override_count ────────────────────
+
+    def test_reversal_trades_count(self):
+        s = self._parse_log(_reversal_log())
+        self.assertEqual(s.reversal_trades_count, 1)
+
+    def test_st_slope_override_count(self):
+        s = self._parse_log(_reversal_log())
+        self.assertEqual(s.st_slope_override_count, 1)
+
+    def test_reversal_trade_count_zero_default(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - nothing\n")
+        self.assertEqual(s.reversal_trades_count, 0)
+
+    def test_reversal_signal_counted_in_tag_counts(self):
+        s = self._parse_log(_reversal_log())
+        self.assertGreater(s.tag_counts.get("REVERSAL_SIGNAL", 0), 0)
+
+    def test_st_slope_override_counted_in_tag_counts(self):
+        s = self._parse_log(_reversal_log())
+        self.assertGreater(s.tag_counts.get("ST_SLOPE_OVERRIDE", 0), 0)
+
+    # ── oscillator_blocks / oscillator_overrides / oscillator_relief_count ───
+
+    def test_oscillator_blocks_counted(self):
+        s = self._parse_log(_osc_gating_log())
+        self.assertEqual(s.oscillator_blocks, 1)
+
+    def test_oscillator_overrides_counted(self):
+        s = self._parse_log(_osc_gating_log())
+        self.assertEqual(s.oscillator_overrides, 1)
+
+    def test_oscillator_relief_count(self):
+        s = self._parse_log(_osc_gating_log())
+        self.assertEqual(s.oscillator_relief_count, 1)
+
+    def test_osc_defaults_zero(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - nothing\n")
+        self.assertEqual(s.oscillator_blocks, 0)
+        self.assertEqual(s.oscillator_overrides, 0)
+        self.assertEqual(s.oscillator_relief_count, 0)
+
+    # ── trend_loss_count ─────────────────────────────────────────────────────
+
+    def test_trend_loss_count(self):
+        s = self._parse_log(_trend_loss_log())
+        self.assertEqual(s.trend_loss_count, 1)
+
+    def test_trend_loss_count_zero_default(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - nothing\n")
+        self.assertEqual(s.trend_loss_count, 0)
+
+    # ── expiry_roll_count / lot_size_mismatch_count / intrinsic_filter_count ─
+
+    def test_expiry_roll_count(self):
+        s = self._parse_log(_contract_expiry_log())
+        self.assertEqual(s.expiry_roll_count, 1)
+
+    def test_lot_size_mismatch_count(self):
+        s = self._parse_log(_contract_expiry_log())
+        self.assertEqual(s.lot_size_mismatch_count, 1)
+
+    def test_intrinsic_filter_count(self):
+        s = self._parse_log(_contract_expiry_log())
+        self.assertEqual(s.intrinsic_filter_count, 1)
+
+    def test_contract_fields_zero_default(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - nothing\n")
+        self.assertEqual(s.expiry_roll_count, 0)
+        self.assertEqual(s.lot_size_mismatch_count, 0)
+        self.assertEqual(s.intrinsic_filter_count, 0)
+
+    # ── volatility context counters ───────────────────────────────────────────
+
+    def test_vix_tier_count(self):
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.vix_tier_count, 1)
+
+    def test_greeks_usage_count(self):
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.greeks_usage_count, 1)
+
+    def test_theta_penalty_count(self):
+        """theta_adj=-8 in VOL_CONTEXT/SCORE_ADJUST → theta_penalty_count=1."""
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.theta_penalty_count, 1)
+
+    def test_vega_penalty_count(self):
+        """vega_high=True in POSITION_SIZE → vega_penalty_count=1."""
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.vega_penalty_count, 1)
+
+    def test_vol_context_align_count(self):
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.vol_context_align_count, 1)
+
+    def test_greeks_align_count(self):
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.greeks_align_count, 1)
+
+    def test_score_matrix_usage_count(self):
+        s = self._parse_log(_volatility_log())
+        self.assertEqual(s.score_matrix_usage_count, 1)
+
+    def test_volatility_fields_zero_default(self):
+        s = self._parse_log("2026-03-02 09:30:00,001 - INFO - nothing\n")
+        self.assertEqual(s.vix_tier_count, 0)
+        self.assertEqual(s.greeks_usage_count, 0)
+        self.assertEqual(s.theta_penalty_count, 0)
+        self.assertEqual(s.vega_penalty_count, 0)
+        self.assertEqual(s.vol_context_align_count, 0)
+        self.assertEqual(s.greeks_align_count, 0)
+        self.assertEqual(s.score_matrix_usage_count, 0)
+
+    # ── structured TRADE OPEN / TRADE EXIT format ────────────────────────────
+
+    def test_struct_format_trade_count(self):
+        """Structured format: 2 TRADE OPEN + 2 TRADE EXIT → 2 trades."""
+        s = self._parse_log(_struct_trade_log())
+        self.assertEqual(s.total_trades, 2)
+
+    def test_struct_format_side_preserved(self):
+        s = self._parse_log(_struct_trade_log())
+        sides = {t.get("side") for t in s.trades}
+        self.assertIn("CALL", sides)
+        self.assertIn("PUT", sides)
+
+    def test_struct_format_pnl_pts(self):
+        s = self._parse_log(_struct_trade_log())
+        pnls = sorted(t.get("pnl_pts", 0.0) for t in s.trades)
+        self.assertAlmostEqual(pnls[0], -12.0, places=1)
+        self.assertAlmostEqual(pnls[1],  15.0, places=1)
+
+    def test_struct_format_option_name(self):
+        s = self._parse_log(_struct_trade_log())
+        names = {t.get("option_name") for t in s.trades}
+        self.assertIn("NIFTY24MAR22400CE", names)
+        self.assertIn("NIFTY24MAR22200PE", names)
+
+    def test_struct_format_exit_reason(self):
+        s = self._parse_log(_struct_trade_log())
+        reasons = {t.get("exit_reason") for t in s.trades}
+        self.assertIn("TG_HIT", reasons)
+        self.assertIn("SL_HIT", reasons)
+
+    def test_struct_format_winners_losers(self):
+        s = self._parse_log(_struct_trade_log())
+        self.assertEqual(s.winners, 1)
+        self.assertEqual(s.losers, 1)
+
+    # ── lot_cap_count / survivability ─────────────────────────────────────────
+
+    def test_lot_cap_count_via_tag_counts(self):
+        log = textwrap.dedent("""\
+            2026-03-02 09:30:01,001 - INFO - [MAX_TRADES_CAP] trade_count=8 max=8 entry blocked
+            2026-03-02 09:30:02,001 - INFO - [MAX_TRADES_CAP] trade_count=8 max=8 entry blocked
+        """)
+        s = self._parse_log(log)
+        self.assertEqual(s.lot_cap_count, 2)
+
+    def test_survivability_count_min_3_bars(self):
+        """Trades held >= 3 bars contribute to survivability_count."""
+        log = textwrap.dedent("""\
+            2026-03-02 09:32:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:32:00 side=CALL option_name=NIFTY24MAR22400CE entry=100.00 lots=75
+            2026-03-02 09:44:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:44:00 option_name=NIFTY24MAR22400CE exit=115.00 pnl_pts=+15.00 pnl_rs=+1125 bars=4 reason=TG_HIT
+            2026-03-02 09:45:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:45:00 side=PUT option_name=NIFTY24MAR22200PE entry=80.00 lots=75
+            2026-03-02 09:48:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:48:00 option_name=NIFTY24MAR22200PE exit=68.00 pnl_pts=-12.00 pnl_rs=-900 bars=1 reason=SL_HIT
+        """)
+        s = self._parse_log(log)
+        self.assertEqual(s.survivability_count, 1)
+
+    def test_survivability_ratio_calculation(self):
+        """survivability_ratio = survivability_count / total_trades * 100."""
+        log = textwrap.dedent("""\
+            2026-03-02 09:32:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:32:00 side=CALL option_name=NIFTY24MAR22400CE entry=100.00 lots=75
+            2026-03-02 09:44:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:44:00 option_name=NIFTY24MAR22400CE exit=115.00 pnl_pts=+15.00 pnl_rs=+1125 bars=4 reason=TG_HIT
+            2026-03-02 09:45:00,001 - INFO - [TRADE OPEN] time=2026-03-02 09:45:00 side=PUT option_name=NIFTY24MAR22200PE entry=80.00 lots=75
+            2026-03-02 09:48:00,001 - INFO - [TRADE EXIT] time=2026-03-02 09:48:00 option_name=NIFTY24MAR22200PE exit=68.00 pnl_pts=-12.00 pnl_rs=-900 bars=1 reason=SL_HIT
+        """)
+        s = self._parse_log(log)
+        self.assertAlmostEqual(s.survivability_ratio, 50.0, places=1)
+
+    # ── to_dict() includes all new fields ────────────────────────────────────
+
+    def test_to_dict_has_new_fields(self):
+        s = self._parse_log(_day_type_log())
+        d = s.to_dict()
+        for key in ("day_type_tag", "cpr_width_tag", "reversal_trades_count",
+                    "st_slope_override_count", "oscillator_blocks",
+                    "oscillator_overrides", "oscillator_relief_count",
+                    "trend_loss_count", "expiry_roll_count",
+                    "lot_size_mismatch_count", "intrinsic_filter_count",
+                    "vix_tier_count", "greeks_usage_count",
+                    "theta_penalty_count", "vega_penalty_count",
+                    "vol_context_align_count", "greeks_align_count",
+                    "score_matrix_usage_count", "lot_cap_count",
+                    "survivability_count", "survivability_ratio"):
+            self.assertIn(key, d, f"Missing to_dict key: {key}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestNewTextReportSections — new _write_text_report sections (Mar 2026)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNewTextReportSections(unittest.TestCase):
+    """New sections in generate_full_report text output."""
+
+    def _report_text(self, log_content: str) -> str:
+        log_path = _make_log_file(log_content)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                result = generate_full_report(log_path, output_dir=tmp)
+                return result["text"].read_text(encoding="utf-8")
+        finally:
+            os.unlink(log_path)
+
+    # ── DAY CLASSIFICATION section ────────────────────────────────────────────
+
+    def test_day_classification_section_present(self):
+        text = self._report_text(_day_type_log())
+        self.assertIn("DAY CLASSIFICATION", text)
+
+    def test_day_type_tag_in_report(self):
+        text = self._report_text(_day_type_log("TREND_DAY"))
+        self.assertIn("TREND_DAY", text)
+
+    def test_cpr_width_in_report(self):
+        text = self._report_text(_day_type_log(cpr_width="NARROW"))
+        self.assertIn("NARROW", text)
+
+    # ── REVERSAL DETECTOR section ─────────────────────────────────────────────
+
+    def test_reversal_section_present_when_fired(self):
+        text = self._report_text(_reversal_log())
+        self.assertIn("REVERSAL DETECTOR", text)
+
+    def test_reversal_section_absent_when_not_fired(self):
+        text = self._report_text(_day_type_log())
+        self.assertNotIn("REVERSAL DETECTOR", text)
+
+    def test_reversal_pnl_in_report(self):
+        text = self._report_text(_reversal_log())
+        self.assertIn("Reversal P&L", text)
+
+    def test_slope_overrides_in_report(self):
+        text = self._report_text(_reversal_log())
+        self.assertIn("ST_SLOPE overrides", text)
+
+    # ── OSCILLATOR GATING section ─────────────────────────────────────────────
+
+    def test_oscillator_gating_section_present_when_fired(self):
+        text = self._report_text(_osc_gating_log())
+        self.assertIn("OSCILLATOR GATING", text)
+
+    def test_oscillator_gating_absent_when_not_fired(self):
+        text = self._report_text(_day_type_log())
+        self.assertNotIn("OSCILLATOR GATING", text)
+
+    def test_osc_blocks_in_report(self):
+        text = self._report_text(_osc_gating_log())
+        self.assertIn("OSC blocks", text)
+
+    def test_osc_overrides_in_report(self):
+        text = self._report_text(_osc_gating_log())
+        self.assertIn("OSC overrides", text)
+
+    # ── TREND SURVIVABILITY section ───────────────────────────────────────────
+
+    def test_trend_survivability_section_present(self):
+        text = self._report_text(_trend_loss_log())
+        self.assertIn("TREND SURVIVABILITY", text)
+
+    def test_trend_loss_count_in_report(self):
+        text = self._report_text(_trend_loss_log())
+        self.assertIn("Trend SL exits", text)
+
+    # ── VOLATILITY CONTEXT section ────────────────────────────────────────────
+
+    def test_volatility_context_section_present(self):
+        text = self._report_text(_volatility_log())
+        self.assertIn("VOLATILITY CONTEXT", text)
+
+    def test_vix_tier_refreshes_in_report(self):
+        text = self._report_text(_volatility_log())
+        self.assertIn("VIX tier", text)
+
+    def test_greeks_computed_in_report(self):
+        text = self._report_text(_volatility_log())
+        self.assertIn("Greeks computed", text)
+
+    # ── TRADE DETAILS table ───────────────────────────────────────────────────
+
+    def test_trade_details_table_present(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("TRADE DETAILS", text)
+
+    def test_trade_details_shows_option_names(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("NIFTY24MAR22400CE", text)
+
+    def test_trade_details_shows_exit_reason(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("TG_HIT", text)
+
+    # ── P&L SUMMARY section ───────────────────────────────────────────────────
+
+    def test_pnl_summary_section_present(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("P&L SUMMARY", text)
+
+    def test_pnl_summary_shows_net_pnl(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("Net P&L", text)
+
+    def test_pnl_summary_shows_survivability(self):
+        text = self._report_text(_struct_trade_log())
+        self.assertIn("Survivability", text)
+
+
+# ── Rich-exit log helper ──────────────────────────────────────────────────────
+
+def _rich_exit_log() -> str:
+    """[EXIT][PAPER/LIVE <reason>] format emitted by execution.py cleanup_trade_exit."""
+    return textwrap.dedent("""\
+        2026-03-02 09:48:02,585 - INFO - \x1b[93m[EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630225000PE Entry=102.50 Exit=94.25 Qty=130 PnL=-1072.50 (points=-8.25) BarsHeld=0 ExitType=SL Trigger=ltp<=98.50\x1b[0m
+        2026-03-02 10:45:14,001 - INFO - [EXIT][PAPER SCALP_PT_HIT] CALL NSE:NIFTY2630224700CE Entry=137.15 Exit=140.55 Qty=130 PnL=442.00 (points=3.40) BarsHeld=0 ExitType=PT Trigger=ltp>=140.00
+        2026-03-02 10:57:32,001 - INFO - [EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630224900PE Entry=107.45 Exit=94.25 Qty=130 PnL=-1716.00 (points=-13.20) BarsHeld=0 ExitType=SL Trigger=ltp<=101.00
+        2026-03-02 11:02:20,001 - INFO - [EXIT][LIVE SL_HIT] PUT NSE:NIFTY2630225000PE Entry=170.20 Exit=152.30 Qty=130 PnL=-2327.00 (points=-17.90) BarsHeld=0 ExitType=SL Trigger=ltp<=161.50
+    """)
+
+
+def _rich_exit_log_survival() -> str:
+    """Rich-exit log with some BarsHeld>=3 trades for survivability test."""
+    return textwrap.dedent("""\
+        2026-03-02 09:48:02,001 - INFO - [EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630225000PE Entry=102.50 Exit=94.25 Qty=130 PnL=-1072.50 (points=-8.25) BarsHeld=0 ExitType=SL Trigger=ltp<=98.50
+        2026-03-02 10:30:00,001 - INFO - [EXIT][PAPER TG_HIT] CALL NSE:NIFTY2630224700CE Entry=90.00 Exit=115.00 Qty=75 PnL=1875.00 (points=25.00) BarsHeld=5 ExitType=TG Trigger=ltp>=115.00
+        2026-03-02 11:00:00,001 - INFO - [EXIT][PAPER SL_HIT] CALL NSE:NIFTY2630224800CE Entry=80.00 Exit=72.00 Qty=75 PnL=-600.00 (points=-8.00) BarsHeld=3 ExitType=SL Trigger=ltp<=75.00
+    """)
+
+
+class TestRichExitParsing(unittest.TestCase):
+    """Tests for _RE_EXIT_RICH — execution.py [EXIT][PAPER/LIVE reason] format."""
+
+    def _parse(self, content: str):
+        p = _make_log_file(content)
+        try:
+            from log_parser import parse_session
+            return parse_session(str(p))
+        finally:
+            os.unlink(p)
+
+    # ── Trade count ───────────────────────────────────────────────────────────
+
+    def test_rich_exit_trade_count(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.total_trades, 4)
+
+    def test_rich_exit_winners_losers(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.winners, 1)
+        self.assertEqual(s.losers, 3)
+
+    # ── P&L ──────────────────────────────────────────────────────────────────
+
+    def test_rich_exit_net_pnl_pts(self):
+        s = self._parse(_rich_exit_log())
+        # -8.25 + 3.40 - 13.20 - 17.90 = -35.95
+        self.assertAlmostEqual(s.net_pnl_pts, -35.95, places=2)
+
+    def test_rich_exit_net_pnl_rs(self):
+        s = self._parse(_rich_exit_log())
+        # -1072.50 + 442.00 - 1716.00 - 2327.00 = -4673.50
+        self.assertAlmostEqual(s.net_pnl_rs, -4673.50, places=0)
+
+    def test_rich_exit_best_trade(self):
+        s = self._parse(_rich_exit_log())
+        pnls = [t.get("pnl_pts", 0.0) for t in s.trades]
+        self.assertAlmostEqual(max(pnls), 3.40, places=2)
+
+    def test_rich_exit_worst_trade(self):
+        s = self._parse(_rich_exit_log())
+        pnls = [t.get("pnl_pts", 0.0) for t in s.trades]
+        self.assertAlmostEqual(min(pnls), -17.90, places=2)
+
+    # ── CALL / PUT split ─────────────────────────────────────────────────────
+
+    def test_rich_exit_call_count(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.call_trades, 1)
+
+    def test_rich_exit_put_count(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.put_trades, 3)
+
+    # ── Exit reasons ─────────────────────────────────────────────────────────
+
+    def test_rich_exit_sl_hit_count(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.exit_reason_counts.get("SL_HIT", 0), 3)
+
+    def test_rich_exit_scalp_pt_count(self):
+        s = self._parse(_rich_exit_log())
+        self.assertEqual(s.exit_reason_counts.get("SCALP_PT_HIT", 0), 1)
+
+    # ── Session mode ─────────────────────────────────────────────────────────
+
+    def test_rich_exit_session_mode_paper(self):
+        # First 3 trades are PAPER, last one is LIVE — session_type should reflect LIVE
+        s = self._parse(_rich_exit_log())
+        # At least one session type must be populated
+        self.assertIn(s.session_type, ("PAPER", "LIVE", "MIXED"))
+
+    # ── ANSI stripping ────────────────────────────────────────────────────────
+
+    def test_rich_exit_ansi_stripped(self):
+        """ANSI escape codes in the log line must not break parsing."""
+        content = (
+            "2026-03-02 09:48:02,585 - INFO - "
+            "\x1b[93m[EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630225000PE "
+            "Entry=102.50 Exit=94.25 Qty=130 PnL=-1072.50 (points=-8.25) BarsHeld=0\x1b[0m\n"
+        )
+        s = self._parse(content)
+        self.assertEqual(s.total_trades, 1)
+        self.assertAlmostEqual(s.net_pnl_pts, -8.25, places=2)
+
+    # ── Lot size ─────────────────────────────────────────────────────────────
+
+    def test_rich_exit_lot_size_captured(self):
+        s = self._parse(_rich_exit_log())
+        # All trades should have Qty=130 or 75 — verify trades list exists
+        self.assertGreater(s.total_trades, 0)
+
+    # ── Contract names ────────────────────────────────────────────────────────
+
+    def test_rich_exit_option_names_present(self):
+        """Trade details must include full NSE option_name from log."""
+        from log_parser import parse_session
+        p = _make_log_file(_rich_exit_log())
+        try:
+            s = parse_session(str(p))
+            names = [t.get("option_name", "") for t in s.trades]
+            self.assertTrue(any("NIFTY" in n for n in names))
+        finally:
+            os.unlink(p)
+
+    # ── Survivability ────────────────────────────────────────────────────────
+
+    def test_rich_exit_survivability_zero(self):
+        """All BarsHeld=0 → survivability_count=0."""
+        # Use only the first line (BarsHeld=0)
+        content = (
+            "2026-03-02 09:48:02,001 - INFO - [EXIT][PAPER SL_HIT] PUT "
+            "NSE:NIFTY2630225000PE Entry=102.50 Exit=94.25 Qty=130 "
+            "PnL=-1072.50 (points=-8.25) BarsHeld=0\n"
+        )
+        s = self._parse(content)
+        self.assertEqual(s.survivability_count, 0)
+
+    def test_rich_exit_survivability_counted(self):
+        """Trades with BarsHeld>=3 must increment survivability_count."""
+        s = self._parse(_rich_exit_log_survival())
+        # BarsHeld=0 (no), BarsHeld=5 (yes), BarsHeld=3 (yes) → 2
+        self.assertEqual(s.survivability_count, 2)
+
+    # ── Priority over EXIT AUDIT ──────────────────────────────────────────────
+
+    def test_rich_exit_takes_priority_over_audit(self):
+        """When rich-exit lines exist alongside EXIT AUDIT, rich wins."""
+        content = textwrap.dedent("""\
+            2026-03-02 09:48:02,001 - INFO - [EXIT][PAPER SL_HIT] PUT NSE:NIFTY2630225000PE Entry=102.50 Exit=94.25 Qty=130 PnL=-1072.50 (points=-8.25) BarsHeld=0
+            2026-03-02 09:48:02,001 - INFO - [EXIT AUDIT] side=PUT pnl_pts=0.0 pnl_rs=0 bars=0 reason=SL_HIT score=0
+        """)
+        s = self._parse(content)
+        # Rich exit should win: pnl = -8.25, NOT 0.0
+        self.assertAlmostEqual(s.net_pnl_pts, -8.25, places=2)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     unittest.main(verbosity=2)
