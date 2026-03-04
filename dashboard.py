@@ -269,6 +269,20 @@ def compute_summary(
     call_mask  = df.get("option_type", pd.Series([""] * total)).str.upper() == "CALL"
     put_mask   = df.get("option_type", pd.Series([""] * total)).str.upper() == "PUT"
 
+    # Symbol-wise breakdown
+    symbol_stats = {}
+    if "option_name" in df.columns:
+        # Extract underlying from option name (e.g. NIFTY from NSE:NIFTY24JAN...)
+        # Simple heuristic: take first alpha part
+        df["_underlying"] = df["option_name"].apply(lambda x: re.match(r"([A-Z]+)", str(x).split(':')[-1]).group(1) if re.match(r"([A-Z]+)", str(x).split(':')[-1]) else "UNKNOWN")
+        
+        for sym, group in df.groupby("_underlying"):
+            s_pnl = group["pnl_points"].sum()
+            s_wins = (group["pnl_points"] > 0).sum()
+            s_total = len(group)
+            s_wr = (s_wins / s_total * 100) if s_total else 0
+            symbol_stats[sym] = {"pnl": round(s_pnl, 2), "trades": s_total, "win_rate": round(s_wr, 1)}
+
     return {
         "total_trades":    total,
         "winners":         winners,
@@ -284,6 +298,7 @@ def compute_summary(
         "call_pnl_points": round(float(pnl[call_mask].sum()), 2),
         "put_pnl_points":  round(float(pnl[put_mask].sum()), 2),
         "config_thresholds": config_thresholds or {},
+        "symbol_stats":    symbol_stats,
     }
 
 
@@ -305,6 +320,10 @@ def print_summary(summary: dict) -> None:
     print(sep)
     print(f"  CALL trades    : {summary['call_trades']}  P&L: {summary['call_pnl_points']:+.2f} pts")
     print(f"  PUT  trades    : {summary['put_trades']}  P&L: {summary['put_pnl_points']:+.2f} pts")
+    if summary.get("symbol_stats"):
+        print(sep)
+        for sym, stats in summary["symbol_stats"].items():
+            print(f"  {sym:<15}: {stats['trades']} trades, {stats['win_rate']}% win, {stats['pnl']:+.2f} pts")
     thresholds = summary.get("config_thresholds") or {}
     if thresholds:
         print(sep)
@@ -1013,6 +1032,19 @@ def _write_text_report(session, output_path: Path) -> Path:
                 f"  Balance day P&L    : {obs['balance_day_pnl']:+.2f} pts  "
                 f"({obs['balance_tag']})"
             )
+
+    # Survivability & Liquidity
+    tg_suppressed = session.tag_counts.get("TG_HIT_EXIT_SUPPRESSED", 0)
+    surv_override = session.tag_counts.get("SURVIVABILITY_OVERRIDE", 0)
+    entry_skipped = session.tag_counts.get("ENTRY_ALLOWED_BUT_NOT_EXECUTED", 0)
+    
+    if tg_suppressed > 0 or surv_override > 0 or entry_skipped > 0:
+        lines.append("")
+        lines.append("  SURVIVABILITY & LIQUIDITY")
+        lines.append(sep2)
+        lines.append(f"  TG exit suppressed     : {tg_suppressed}  (held for min bars)")
+        lines.append(f"  Survivability override : {surv_override}  (premature exit prevented)")
+        lines.append(f"  Entry skipped (liq)    : {entry_skipped}  (signal OK but no option/cap)")
 
     # ── GREEKS PENALTIES (standalone) ─────────────────────────────────────────
     if theta_count > 0 or vega_count > 0:

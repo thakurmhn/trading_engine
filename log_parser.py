@@ -216,6 +216,9 @@ _P_TAGS = [
     "SCALP_ENTRY",
     "TREND_ENTRY",
     "EXIT_ATTRIBUTION",
+    "TG_HIT_EXIT_SUPPRESSED",
+    "SURVIVABILITY_OVERRIDE",
+    "ENTRY_ALLOWED_BUT_NOT_EXECUTED",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 

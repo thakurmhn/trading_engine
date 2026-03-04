@@ -54,6 +54,7 @@ fyers_async = fyersModel.FyersModel(client_id=client_id, is_async=True, token=ac
 # ===== Option chains for all symbols =====
 all_symbols = symbols[:]  # start with underlying indices
 
+option_chain_list = []
 for sym in symbols:
     try:
         # First call to get expiry list
@@ -64,9 +65,11 @@ for sym in symbols:
         # Second call with expiry
         data = {"symbol": sym, "strikecount": strike_count, "timestamp": expiry_e}
         response = fyers.optionchain(data=data)['data']
-        option_chain = pd.DataFrame(response['optionsChain'])
+        df_chain = pd.DataFrame(response['optionsChain'])
+        df_chain['underlying'] = sym
+        option_chain_list.append(df_chain)
 
-        symbols_from_chain = option_chain['symbol'].to_list()
+        symbols_from_chain = df_chain['symbol'].to_list()
         all_symbols.extend(symbols_from_chain)
 
         logging.info(f"[OPTIONCHAIN] {sym} contracts fetched: {len(symbols_from_chain)}")
@@ -78,11 +81,16 @@ for sym in symbols:
                 quote = fyers.quotes(data={"symbols": sym})
                 spot_price = quote["d"][0]["v"]["lp"]
             except Exception:
-                spot_price = option_chain['ltp'].iloc[0] if 'ltp' in option_chain.columns else None
+                spot_price = df_chain['ltp'].iloc[0] if 'ltp' in df_chain.columns else None
         logging.info(f"[SPOT] {sym} underlying spot={spot_price}")
 
     except Exception as e:
         logging.error(f"[OPTIONCHAIN ERROR] Failed to fetch for {sym}: {e}")
+
+if option_chain_list:
+    option_chain = pd.concat(option_chain_list, ignore_index=True)
+else:
+    option_chain = pd.DataFrame()
 
 # Replace symbols with merged list
 symbols = all_symbols

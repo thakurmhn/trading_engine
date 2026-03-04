@@ -498,12 +498,11 @@ def _validate_restored_positions_on_startup(
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
     Select ITM option strike with strike_diff points inside ATM.
-    Jan 8th baseline: always ITM with 100-point difference.
-    CALL: ATM - strike_diff
-    PUT:  ATM + strike_diff
+    Checks against live quote dataframe `df` to ensure liquidity/availability.
     """
 
     from config import strike_diff
+    # df is already imported globally from setup
 
     if spot_price_ is None or pd.isna(spot_price_):
         logging.error("[get_option_by_moneyness] Invalid spot price")
@@ -529,26 +528,50 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
         f"side={side}, requested_strike={strike}"
     )
 
-    sel = option_chain[
-        (option_chain['strike_price'] == strike) &
-        (option_chain['option_type'].isin([side, side.replace('E','ALL')]))  # CE/PE or CALL/PUT
-    ]['symbol']
+    # Filter candidates by side
+    candidates = option_chain[
+        (option_chain['option_type'].isin([side, side.replace('E','ALL')]))
+    ].copy()
 
-    if sel.empty:
-        side_df = option_chain[option_chain['option_type'].isin([side, side.replace('E','ALL')])].copy()
-        if side_df.empty:
-            logging.error(f"[get_option_by_moneyness] No options available for side={side}")
-            return None, None
-        side_df['strike_diff_abs'] = (side_df['strike_price'] - strike).abs()
-        side_df = side_df.sort_values('strike_diff_abs')
-        symbol = side_df.iloc[0]['symbol']
-        strike = side_df.iloc[0]['strike_price']
-        logging.warning(
-            f"[get_option_by_moneyness] Fallback ITM for {side}: requested {strike}, using nearest available"
+    if candidates.empty:
+        logging.error(f"[get_option_by_moneyness] No options available for side={side}")
+        return None, None
+
+    # Calculate distance to desired strike
+    candidates['strike_diff_abs'] = (candidates['strike_price'] - strike).abs()
+    candidates = candidates.sort_values('strike_diff_abs')
+
+    # Liquidity-aware selection: prefer symbol present in live feed (df)
+    selected_symbol = None
+    selected_strike = None
+
+    for _, row in candidates.iterrows():
+        sym = row['symbol']
+        # In LIVE/PAPER mode, df holds subscribed symbols. In REPLAY, df might be empty or irrelevant.
+        # We check if df is populated (LIVE/PAPER) and if sym is in it.
+        if not df.empty and sym in df.index:
+            selected_symbol = sym
+            selected_strike = row['strike_price']
+            break
+    
+    # If no live symbol found (or REPLAY mode where df might be empty/irrelevant for selection),
+    # fall back to the closest strike from option_chain.
+    if not selected_symbol:
+        best_match = candidates.iloc[0]
+        selected_symbol = best_match['symbol']
+        selected_strike = best_match['strike_price']
+        if not df.empty: # Only warn if we expected live data
+             logging.warning(
+                f"[get_option_by_moneyness] No liquid option found in df for {side} near {strike}. "
+                f"Using closest from chain: {selected_symbol}"
+            )
+
+    if selected_strike != strike:
+         logging.warning(
+            f"[get_option_by_moneyness] Strike adjustment: requested {strike}, using {selected_strike} ({selected_symbol})"
         )
-        return symbol, strike
 
-    return sel.squeeze(), strike
+    return selected_symbol, selected_strike
 
 
 def _get_option_market_snapshot(symbol, fallback_price):
@@ -1539,7 +1562,7 @@ def _trend_entry_quality_gate(
 
     if _bias_misaligned and _osc_in_extreme:
         logging.info(
-            "[ENTRY BLOCKED][BIAS_MISALIGN_EXTREME] "
+            "[ENTRY BLOCKED][BIAS_MISALIGN_BLOCKED] "
             f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
             f"bias={merged_ctx.get('bias', 'UNKNOWN')} gap={merged_ctx.get('gap_tag', 'UNKNOWN')} "
             f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
@@ -1837,16 +1860,18 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         audit("MIN_BAR", "DEFERRED", f"bars_held<{min_bars_for_pt_tg}")
         if tg_hit:
             logging.info(
-                "[TG_HIT_SUPPRESSED] "
+                "[TG_HIT_EXIT_SUPPRESSED] "
                 f"symbol={symbol} option_type={side} bars_held={bars_held} "
                 f"min_hold={min_bars_for_pt_tg} adx={last_adx if np.isfinite(last_adx) else 'N/A'}"
             )
             logging.info(
+                f"[SURVIVABILITY_OVERRIDE] Minimum hold enforced. "
                 f"{YELLOW}[EXIT DEFERRED] TG hit before min bars ({bars_held} < {min_bars_for_pt_tg}). "
                 f"ltp={current_ltp:.2f} tg={tg:.2f} defer_until={entry_candle + min_bars_for_pt_tg}{RESET}"
             )
         elif state.get("pt_deferred_logged", 0) == 0:
             logging.info(
+                f"[SURVIVABILITY_OVERRIDE] Minimum hold enforced. "
                 f"{YELLOW}[EXIT DEFERRED] PT hit before min bars ({bars_held} < {min_bars_for_pt_tg}). "
                 f"ltp={current_ltp:.2f} pt={pt:.2f} defer_until={entry_candle + min_bars_for_pt_tg}{RESET}"
             )
@@ -3069,30 +3094,43 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     pulse = get_pulse_module()
 
     # ── Pulse Check ───────────────────────────────────────────────
+    # First check: pulse rate must exceed threshold
     tick_rate = pulse.get("tick_rate", 0)
     burst_flag = pulse.get("burst_flag", False)
     direction_drift = pulse.get("direction_drift", "NEUTRAL")
-    
+
     pulse_passed = False
     if not burst_flag or tick_rate < PULSE_TICKRATE_THRESHOLD:
         logging.info(
-            f"[SCALP SKIP][PULSE_FAIL] tick_rate={tick_rate}, drift={direction_drift}"
+            f"[SCALP SKIP][PULSE_FAILED_SKIP] tick_rate={tick_rate}, burst_flag={burst_flag}, drift={direction_drift}"
         )
     else:
-        if direction_drift == "UP" and scalp_side != "CALL":
-            logging.info(
-                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
-            )
-        elif direction_drift == "DOWN" and scalp_side != "PUT":
-            logging.info(
-                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
-            )
-        else:
-            # Pulse check passed - proceed with scalp entry
-            pulse_passed = True
-    
+        # Pulse rate OK - now detect scalp signal and check direction alignment
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
+        if scalp_sig:
+            scalp_side = scalp_sig["side"]
+            
+            if direction_drift == "UP" and scalp_side != "CALL":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+                )
+            elif direction_drift == "DOWN" and scalp_side != "PUT":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+                )
+            else:
+                # Pulse direction matches scalp side - proceed with entry
+                pulse_passed = True
+                logging.info("[SCALP ALLOWED][PULSE_PASSED_ALLOW] Pulse check passed, proceeding with scalp entry")
+                log_entry_green(
+                    f"[ENTRY ATTEMPT][SCALP][PAPER] side={scalp_sig.get('side')} "
+                    f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                    f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                    "long=True"
+                )
+
     if not pulse_passed:
-        logging.info("[SCALP SKIP] Pulse check failed, skipping scalp entry")
+        logging.info("[SCALP SKIP][PULSE_FAILED_SKIP] Pulse check failed, skipping scalp entry")
     
     elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
@@ -3121,7 +3159,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
                     )
                     if not opt_name:
-                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        logging.info(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option found for {scalp_side}")
                         return
 
                     ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
@@ -3168,7 +3206,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "regime_context":    "SCALP",
                         "is_open":           True,
                         "lifecycle_state":   "OPEN",
-                        "scalp_mode":        True,   # P2-D: only SCALP class gets this
+                        "scalp_mode":        True,
                         "trade_class":       TRADE_CLASS_SCALP,
                         "scalp_pt_points":   SCALP_PT_POINTS,
                         "scalp_sl_points":   atr_sl_points,
@@ -3221,48 +3259,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"timestamp={ct} symbol={opt_name} option_type={scalp_side} "
                         f"position_side={paper_info[scalp_leg].get('position_side', 'LONG')} "
                         f"position_id={position_id} "
-                        f"lifecycle=OPEN regime=SCALP"
+                        "lifecycle=OPEN regime=SCALP"
                     )
                     _save_trades_paper()
                     store(paper_info, account_type)
                     return
                 logging.info(
-                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][SCALP] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
                     f"trade_count={paper_info.get('trade_count', 0)} side={scalp_side} entry blocked"
                 )
 
     # 6. Signal evaluation
-    _paper_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
-    _paper_gap = "NO_GAP"
-    if np.isfinite(_paper_close) and np.isfinite(cam_pre.get("r3", float("nan"))) and _paper_close > float(cam_pre.get("r3")):
-        _paper_gap = "GAP_UP"
-    elif np.isfinite(_paper_close) and np.isfinite(cam_pre.get("s3", float("nan"))) and _paper_close < float(cam_pre.get("s3")):
-        _paper_gap = "GAP_DOWN"
-    _paper_bias = "Positive" if _paper_gap == "GAP_UP" else ("Negative" if _paper_gap == "GAP_DOWN" else "Neutral")
-    _paper_open_bias = "UNKNOWN"
-    if np.isfinite(_paper_close):
-        if np.isfinite(cam_pre.get("r4", float("nan"))) and _paper_close > float(cam_pre.get("r4")):
-            _paper_open_bias = "Above R4, continuation likely"
-        elif np.isfinite(cam_pre.get("r3", float("nan"))) and _paper_close > float(cam_pre.get("r3")):
-            _paper_open_bias = "Above R3, expected momentum continuation"
-        elif np.isfinite(cam_pre.get("s4", float("nan"))) and _paper_close < float(cam_pre.get("s4")):
-            _paper_open_bias = "Below S4, downside continuation likely"
-        elif np.isfinite(cam_pre.get("s3", float("nan"))) and _paper_close < float(cam_pre.get("s3")):
-            _paper_open_bias = "Below S3, downside pressure active"
-        else:
-            _paper_open_bias = "Inside S3-R3, balanced open"
-
-    # Prefer DTC classification; fall back to gap-based tag for reversal_detector string param
-    _dtc_name = getattr(getattr(_paper_day_type, "name", None), "value", None)
-    _paper_day_type_tag = (
-        _dtc_name if (_dtc_name and _dtc_name != "UNKNOWN")
-        else ("GAP_DAY" if _paper_gap in ("GAP_UP", "GAP_DOWN") else "NEUTRAL_DAY")
-    )
-    _rev_sig_paper = detect_reversal(
-        candles_3m, cam_pre,
-        current_time=ct,
-        day_type_tag=_paper_day_type_tag,
-    )
     _fb_sig_paper = detect_failed_breakout(candles_3m, cam_pre)
     log_entry_green(
         f"[ENTRY ATTEMPT][TREND][PAPER] symbol={ticker} "
@@ -3395,7 +3402,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         if paper_info[leg]["trade_flag"] == 0:
             if not _cap_available(paper_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][TREND] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
                     f"scalp_used={_cap_used(paper_info, True)} scalp_cap={_cap_limit(paper_info, True)} "
                     f"trade_count={paper_info.get('trade_count', 0)} side={side} entry blocked"
                 )
@@ -3554,7 +3561,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"lifecycle=OPEN regime={regime_context}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIP] no option for {side} strike={strike}")
+                    logging.warning(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option for {side} strike={strike}")
     except Exception as e:
         logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
@@ -3725,20 +3732,32 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             f"[SCALP SKIP][PULSE_FAIL] tick_rate={tick_rate}, drift={direction_drift}"
         )
     else:
-        if direction_drift == "UP" and scalp_side != "CALL":
-            logging.info(
-                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
-            )
-        elif direction_drift == "DOWN" and scalp_side != "PUT":
-            logging.info(
-                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
-            )
-        else:
-            # Pulse check passed - proceed with scalp entry
-            pulse_passed = True
+        # Pulse rate OK - now detect scalp signal and check direction alignment
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
+        if scalp_sig:
+            scalp_side = scalp_sig["side"]
+            
+            if direction_drift == "UP" and scalp_side != "CALL":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+                )
+            elif direction_drift == "DOWN" and scalp_side != "PUT":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+                )
+            else:
+                # Pulse direction matches scalp side - proceed with entry
+                pulse_passed = True
+                logging.info("[SCALP ALLOWED][PULSE_PASSED_ALLOW] Pulse check passed, proceeding with scalp entry")
+                log_entry_green(
+                    f"[ENTRY ATTEMPT][SCALP][LIVE] side={scalp_sig.get('side')} "
+                    f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                    f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                    "long=True"
+                )
     
     if not pulse_passed:
-        logging.info("[SCALP SKIP] Pulse check failed, skipping scalp entry")
+        logging.info("[SCALP SKIP][PULSE_FAILED_SKIP] Pulse check failed, skipping scalp entry")
     
     elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
@@ -3767,7 +3786,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
                     )
                     if not opt_name:
-                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        logging.info(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option found for {scalp_side}")
                         return
 
                     ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
@@ -3871,7 +3890,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         store(live_info, account_type)
                         return
                 logging.info(
-                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][SCALP] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
                     f"trade_count={live_info.get('trade_count', 0)} side={scalp_side} entry blocked"
                 )
 
@@ -4038,7 +4057,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         if live_info[leg]["trade_flag"] == 0:
             if not _cap_available(live_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][TREND] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
                     f"scalp_used={_cap_used(live_info, True)} scalp_cap={_cap_limit(live_info, True)} "
                     f"trade_count={live_info.get('trade_count', 0)} side={side} entry blocked"
                 )
@@ -4193,7 +4212,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     f"lifecycle=OPEN regime={regime_context}"
                 )
             else:
-                logging.warning(f"[ENTRY SKIP] {side} no option. opt_name={opt_name}")
+                logging.warning(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] {side} no option. opt_name={opt_name}")
     except Exception as e:
         logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
 
@@ -5131,6 +5150,17 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 logging.info(f"    {reason:30s}: {cnt} bars")
 
         logging.info("-" * 80 + "\n")
+
+        # Auto-generate dashboard report
+        if not signal_only:
+            try:
+                from config import log_file
+                from dashboard import generate_full_report
+                if os.path.exists(log_file):
+                    logging.info(f"[REPLAY] Auto-generating dashboard for {log_file}...")
+                    generate_full_report(log_file, output_dir=output_dir)
+            except Exception as e:
+                logging.warning(f"[REPLAY] Dashboard generation failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
