@@ -23,3 +23,8 @@ __pycache__/
 .vscode/
 .idea/
 .ticks/
+.claude/
+reports/
+dashboard_report*.txt
+trades*.json
+zones*.json

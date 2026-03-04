@@ -350,6 +350,14 @@ class PositionManager:
             "day_type"     : day_type,
             "cpr_width"    : cpr_w,
             "atr_entry"    : float(atr_val) if atr_val else None,
+            "open_bias_aligned": signal.get("open_bias_aligned", "NEUTRAL"),
+            "failed_breakout": bool(signal.get("failed_breakout", False)),
+            "ema_stretch": bool(signal.get("ema_stretch", False)),
+            "ema_stretch_mult": signal.get("ema_stretch_mult"),
+            "zone_revisit": bool(signal.get("zone_revisit", False)),
+            "zone_revisit_type": signal.get("zone_revisit_type", "NONE"),
+            "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
+            "zone_age_bars": signal.get("zone_age_bars", 0),
 
             # ── mutable exit-tracking state ──
             "bars_held"    : 0,
@@ -408,7 +416,21 @@ class PositionManager:
             f"pivot={signal.get('pivot_reason', signal.get('pivot',''))} "
             f"cpr={cpr_w} day={day_type} "
             f"max_hold={max_hold}bars trail_min={trail_min:.0f}pts "
-            f"trail_step={trail_step:.0%} lot={self.lot_size}{RESET}"
+            f"trail_step={trail_step:.0%} lot={self.lot_size} "
+            f"option_name={signal.get('option_name','N/A')}{RESET}"
+        )
+        # Structured machine-readable log for dashboard parsing
+        logging.info(
+            f"[TRADE OPEN] time={str(bar_time)[:19]} side={side} "
+            f"option_name={signal.get('option_name', 'N/A')} "
+            f"entry={entry_premium:.2f} lots={self.lot_size} "
+            f"open_bias_aligned={signal.get('open_bias_aligned', 'NEUTRAL')} "
+            f"fb={1 if signal.get('failed_breakout', False) else 0} "
+            f"ema_stretch={1 if signal.get('ema_stretch', False) else 0} "
+            f"zone_revisit={1 if signal.get('zone_revisit', False) else 0} "
+            f"zone_type={signal.get('zone_revisit_type', 'NONE')} "
+            f"zone_action={signal.get('zone_revisit_action', 'NONE')} "
+            f"zone_age={signal.get('zone_age_bars', 0)}"
         )
         
         # Log detailed score breakdown for audit trail (v6 entry score framework)
@@ -946,6 +968,21 @@ class PositionManager:
             else:
                 logging.info(f"{YELLOW}[PM] Broker exit: {opt_name} order={order_id}{RESET}")
 
+        # Structured machine-readable log for dashboard parsing
+        _r_tag = (reason or "UNKNOWN").split()[0].replace("/", "_")[:30]
+        logging.info(
+            f"[TRADE EXIT] time={str(bar_time)[:19]} "
+            f"option_name={t.get('option_name', 'N/A')} "
+            f"exit={exit_px:.2f} pnl_pts={pnl_pts:+.2f} pnl_rs={pnl_val:+.0f} "
+            f"bars={t['bars_held']} reason={_r_tag} "
+            f"open_bias_aligned={t.get('open_bias_aligned', 'NEUTRAL')} "
+            f"fb={1 if t.get('failed_breakout', False) else 0} "
+            f"ema_stretch={1 if t.get('ema_stretch', False) else 0} "
+            f"zone_revisit={1 if t.get('zone_revisit', False) else 0} "
+            f"zone_type={t.get('zone_revisit_type', 'NONE')} "
+            f"zone_action={t.get('zone_revisit_action', 'NONE')} "
+            f"zone_age={t.get('zone_age_bars', 0)}"
+        )
         logging.info(
             f"{color}[TRADE EXIT] {outcome} {side} "
             f"bar={bar_idx} {bar_time} "
@@ -991,6 +1028,13 @@ class PositionManager:
             "trail_active"  : t["trail_active"],
             "trail_updates" : t.get("trail_updates", 0),
             "peak_cci"      : t.get("peak_cci",      0.0),
+            "open_bias_aligned": t.get("open_bias_aligned", "NEUTRAL"),
+            "failed_breakout": bool(t.get("failed_breakout", False)),
+            "ema_stretch": bool(t.get("ema_stretch", False)),
+            "zone_revisit": bool(t.get("zone_revisit", False)),
+            "zone_revisit_type": t.get("zone_revisit_type", "NONE"),
+            "zone_revisit_action": t.get("zone_revisit_action", "NONE"),
+            "zone_age_bars": t.get("zone_age_bars", 0),
             "pnl_points"    : round(pnl_pts, 2),
             "pnl_value"     : round(pnl_val, 2),
             "pnl_pct"       : round(pnl_pts / ep * 100, 1) if ep else 0,

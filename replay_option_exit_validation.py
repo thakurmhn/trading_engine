@@ -22,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from option_exit_manager import OptionExitConfig, OptionExitManager
@@ -115,7 +116,7 @@ def _replay_symbol(
     symbol: str,
     cfg: ReplayConfig,
     risk_buffer: float,
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, Any]]:
     query = """
         SELECT timestamp, last_price, COALESCE(volume, 0)
         FROM ticks
@@ -126,7 +127,12 @@ def _replay_symbol(
     """
     rows = cur.execute(query, (symbol,)).fetchall()
     if len(rows) < 40:
-        return []
+        return [], {
+            "entry_attempts": 0,
+            "blocked_slope": 0,
+            "blocked_adx": 0,
+            "blocked_osc": 0,
+        }
 
     hf_cfg = cfg.hf_config or OptionExitConfig(
         dynamic_trail_lo=0.10,
@@ -144,6 +150,62 @@ def _replay_symbol(
     entry_idx: int | None = None
     entry_px: float | None = None
     entry_ts: pd.Timestamp | None = None
+    entry_ctx: dict[str, Any] = {}
+
+    diag = {
+        "entry_attempts": 0,
+        "blocked_slope": 0,
+        "blocked_adx": 0,
+        "blocked_osc": 0,
+    }
+
+    def _tick_context(prices: list[float]) -> dict[str, float | bool]:
+        s = pd.Series(prices, dtype="float64")
+        if len(s) < 25:
+            return {
+                "adx14": float("nan"),
+                "rsi14": float("nan"),
+                "cci20": float("nan"),
+                "slope_agreement": False,
+                "osc_extreme": False,
+            }
+
+        ema_fast = s.ewm(span=5, adjust=False).mean()
+        ema_slow = s.ewm(span=13, adjust=False).mean()
+        gap = float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
+        slope = float(ema_fast.iloc[-1] - ema_fast.iloc[-4]) if len(ema_fast) >= 4 else 0.0
+        slope_agreement = bool((gap >= 0 and slope > 0) or (gap < 0 and slope < 0))
+
+        d = s.diff().fillna(0.0)
+        plus = d.clip(lower=0.0)
+        minus = -d.clip(upper=0.0)
+        atr = d.abs().rolling(14).mean().replace(0, np.nan)
+        plus_di = 100.0 * plus.rolling(14).mean() / atr
+        minus_di = 100.0 * minus.rolling(14).mean() / atr
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx14 = float(dx.rolling(14).mean().iloc[-1]) if len(dx) > 0 else float("nan")
+
+        diff = s.diff()
+        gain = diff.clip(lower=0).rolling(14).mean()
+        loss = (-diff.clip(upper=0)).rolling(14).mean().replace(0, np.nan)
+        rs = gain / loss
+        rsi14 = float((100 - (100 / (1 + rs))).iloc[-1]) if len(rs) > 0 else float("nan")
+
+        ma20 = s.rolling(20).mean()
+        md20 = (s - ma20).abs().rolling(20).mean().replace(0, np.nan)
+        cci20 = float(((s - ma20) / (0.015 * md20)).iloc[-1]) if len(ma20) > 0 else float("nan")
+
+        osc_extreme = bool(
+            (np.isfinite(rsi14) and (rsi14 < 35.0 or rsi14 > 65.0))
+            or (np.isfinite(cci20) and (cci20 < -120.0 or cci20 > 120.0))
+        )
+        return {
+            "adx14": adx14,
+            "rsi14": rsi14,
+            "cci20": cci20,
+            "slope_agreement": slope_agreement,
+            "osc_extreme": osc_extreme,
+        }
 
     for i, (ts_raw, px_raw, vol_raw) in enumerate(rows):
         px = float(px_raw)
@@ -152,6 +214,18 @@ def _replay_symbol(
 
         if manager is None:
             if i % cfg.entry_stride_ticks == 0 and cfg.min_premium <= px <= cfg.max_premium:
+                diag["entry_attempts"] += 1
+                ctx = _tick_context([float(r[1]) for r in rows[max(0, i - 80): i + 1]])
+                if not bool(ctx["slope_agreement"]):
+                    diag["blocked_slope"] += 1
+                    continue
+                if not np.isfinite(float(ctx["adx14"])) or float(ctx["adx14"]) <= 25.0:
+                    diag["blocked_adx"] += 1
+                    continue
+                if bool(ctx["osc_extreme"]):
+                    diag["blocked_osc"] += 1
+                    continue
+
                 manager = OptionExitManager(
                     entry_price=px,
                     side="CALL",
@@ -161,6 +235,7 @@ def _replay_symbol(
                 entry_idx = i
                 entry_px = px
                 entry_ts = ts
+                entry_ctx = ctx
             continue
 
         # Explicit sequential stream into update_tick() for replay fidelity.
@@ -193,6 +268,11 @@ def _replay_symbol(
                     "exit_reason": exit_reason,
                     "exit_type": _map_exit_type(exit_reason),
                     "risk_buffer": risk_buffer,
+                    "adx14_entry": round(float(entry_ctx.get("adx14", float("nan"))), 4),
+                    "slope_agreement_entry": bool(entry_ctx.get("slope_agreement", False)),
+                    "rsi14_entry": round(float(entry_ctx.get("rsi14", float("nan"))), 4),
+                    "cci20_entry": round(float(entry_ctx.get("cci20", float("nan"))), 4),
+                    "osc_extreme_entry": bool(entry_ctx.get("osc_extreme", False)),
                 }
             )
 
@@ -200,13 +280,24 @@ def _replay_symbol(
             entry_idx = None
             entry_px = None
             entry_ts = None
+            entry_ctx = {}
 
-    return trades
+    return trades, diag
 
 
-def run_replay(cfg: ReplayConfig, risk_buffer: float) -> list[dict]:
+def run_replay(
+    cfg: ReplayConfig,
+    risk_buffer: float,
+    return_diagnostics: bool = False,
+) -> list[dict] | tuple[list[dict], dict[str, Any]]:
     """Replay all eligible DBs and return trade records."""
     trades: list[dict] = []
+    diag = {
+        "entry_attempts": 0,
+        "blocked_slope": 0,
+        "blocked_adx": 0,
+        "blocked_osc": 0,
+    }
     paths = sorted(glob.glob(cfg.db_glob))
 
     for db_path in paths:
@@ -220,10 +311,17 @@ def run_replay(cfg: ReplayConfig, risk_buffer: float) -> list[dict]:
 
             symbols = _fetch_option_symbols(cur, cfg)
             for symbol in symbols:
-                trades.extend(_replay_symbol(cur, db_name, symbol, cfg, risk_buffer))
+                symbol_trades, symbol_diag = _replay_symbol(cur, db_name, symbol, cfg, risk_buffer)
+                trades.extend(symbol_trades)
+                diag["entry_attempts"] += int(symbol_diag.get("entry_attempts", 0))
+                diag["blocked_slope"] += int(symbol_diag.get("blocked_slope", 0))
+                diag["blocked_adx"] += int(symbol_diag.get("blocked_adx", 0))
+                diag["blocked_osc"] += int(symbol_diag.get("blocked_osc", 0))
         finally:
             con.close()
 
+    if return_diagnostics:
+        return trades, diag
     return trades
 
 
@@ -359,7 +457,7 @@ def _print_comparative_table(rows: list[dict[str, Any]]) -> str:
 
 def _run_profile(cfg: ReplayConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run one replay profile and print summary diagnostics."""
-    trades = run_replay(cfg, risk_buffer=cfg.risk_buffer)
+    trades, diag = run_replay(cfg, risk_buffer=cfg.risk_buffer, return_diagnostics=True)
     if not trades:
         print(f"No option trades generated for profile={cfg.profile_name}.")
         return pd.DataFrame(), {
@@ -371,6 +469,7 @@ def _run_profile(cfg: ReplayConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
             "reason_counts": {},
             "sample_trailing": None,
             "sample_mean_reversion": None,
+            "diag": diag,
         }
 
     df = pd.DataFrame(trades)
@@ -396,6 +495,28 @@ def _run_profile(cfg: ReplayConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
         print("early exits <=3 ticks (risk_buffer=0.0): " f"{early_0}")
 
     print(f"\nCSV exported: {cfg.out_csv}")
+    attempts = max(1, int(diag.get("entry_attempts", 0)))
+    pct_slope = float(diag.get("blocked_slope", 0)) * 100.0 / attempts
+    pct_adx = float(diag.get("blocked_adx", 0)) * 100.0 / attempts
+    pct_osc = float(diag.get("blocked_osc", 0)) * 100.0 / attempts
+    hft_pct = float((df["exit_type"] == "HFT").mean() * 100.0)
+    weak_or_extreme = df[
+        (df["adx14_entry"] <= 25.0) | (df["osc_extreme_entry"] == True)  # noqa: E712
+    ]
+    weak_losses = int((weak_or_extreme["pnl"] < 0).sum()) if not weak_or_extreme.empty else 0
+    weak_total = int(len(weak_or_extreme))
+
+    print(f"\n=== ENTRY BLOCK METRICS ({cfg.profile_name.upper()}) ===")
+    print(f"entry_attempts: {diag.get('entry_attempts', 0)}")
+    print(f"% blocked slope mismatch: {pct_slope:.2f}%")
+    print(f"% blocked weak ADX: {pct_adx:.2f}%")
+    print(f"% blocked oscillator extreme: {pct_osc:.2f}%")
+    print(f"% trades exited by HFT override: {hft_pct:.2f}%")
+    print(
+        f"loss clusters (weak trend or oscillator extreme): "
+        f"{weak_losses}/{weak_total}"
+    )
+
     profile_report = {
         "profile": cfg.profile_name,
         "coverage": observed_hf,
@@ -409,6 +530,14 @@ def _run_profile(cfg: ReplayConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
         "sample_mean_reversion": (
             df[df["exit_reason"] == "VOLATILITY_MEAN_REVERSION"].head(1).to_dict("records")
         ),
+        "diag": {
+            **diag,
+            "pct_blocked_slope": pct_slope,
+            "pct_blocked_adx": pct_adx,
+            "pct_blocked_osc": pct_osc,
+            "pct_hft_override": hft_pct,
+            "weak_loss_clusters": f"{weak_losses}/{weak_total}",
+        },
     }
     return df, profile_report
 
@@ -786,6 +915,17 @@ def _write_summary_file(
             f"{r['profile']} rb=1.0:{r['early_exits_rb1']} rb=0.0:{r['early_exits_rb0']}"
         )
 
+    block_lines: list[str] = []
+    for r in reports:
+        d = r.get("diag", {})
+        block_lines.append(
+            f"{r['profile']} slope_block={d.get('pct_blocked_slope', 0):.2f}% "
+            f"adx_block={d.get('pct_blocked_adx', 0):.2f}% "
+            f"osc_block={d.get('pct_blocked_osc', 0):.2f}% "
+            f"hft_override={d.get('pct_hft_override', 0):.2f}% "
+            f"weak_loss_cluster={d.get('weak_loss_clusters', '0/0')}"
+        )
+
     stress_sample = by_profile.get("stress", {}).get("sample_trailing")
     volstress_sample = by_profile.get("volstress", {}).get("sample_mean_reversion")
 
@@ -806,6 +946,9 @@ def _write_summary_file(
         "",
         "Risk buffer early-exit check (ticks_held <= 3):",
         *rb_lines,
+        "",
+        "Replay diagnostics:",
+        *block_lines,
         "",
         "Stress sample (DYNAMIC_TRAILING_STOP):",
         str(stress_sample[0]) if stress_sample else "None",

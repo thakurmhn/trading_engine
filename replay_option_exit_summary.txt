@@ -2,30 +2,35 @@ REPLAY OPTION EXIT VALIDATION SUMMARY
 
 Side-by-side comparison:
   Profile  Trades Win Rate Avg PnL Avg Bars Held                                                                 Exit Reasons
- baseline       4  100.00%    2.48          1.75                                             MOMENTUM_EXHAUSTION:3; TIMEOUT:1
-   stress      30  100.00%    4.04          1.00 MOMENTUM_EXHAUSTION:28; DYNAMIC_TRAILING_STOP:1; VOLATILITY_MEAN_REVERSION:1
-volstress      40  100.00%    4.30          1.02 MOMENTUM_EXHAUSTION:31; DYNAMIC_TRAILING_STOP:6; VOLATILITY_MEAN_REVERSION:3
+ baseline       5  100.00%    4.49          1.00                                                        MOMENTUM_EXHAUSTION:5
+   stress      13  100.00%    5.08          1.00                                                       MOMENTUM_EXHAUSTION:13
+volstress      21  100.00%    4.76          1.00 MOMENTUM_EXHAUSTION:14; DYNAMIC_TRAILING_STOP:6; VOLATILITY_MEAN_REVERSION:1
 
 HF coverage by profile:
-DYNAMIC_TRAILING_STOP: stress, volstress
+DYNAMIC_TRAILING_STOP: volstress
 MOMENTUM_EXHAUSTION: baseline, stress, volstress
-VOLATILITY_MEAN_REVERSION: stress, volstress
+VOLATILITY_MEAN_REVERSION: volstress
 
 Coverage differences:
-Observed only in volstress: None
-Observed only in stress vs baseline: DYNAMIC_TRAILING_STOP, VOLATILITY_MEAN_REVERSION
+Observed only in volstress: DYNAMIC_TRAILING_STOP, VOLATILITY_MEAN_REVERSION
+Observed only in stress vs baseline: None
 
 Reason-count comparison (extreme-exit focus):
-DYNAMIC_TRAILING_STOP: baseline=0, stress=1, volstress=6
-VOLATILITY_MEAN_REVERSION: baseline=0, stress=1, volstress=3
+DYNAMIC_TRAILING_STOP: baseline=0, stress=0, volstress=6
+VOLATILITY_MEAN_REVERSION: baseline=0, stress=0, volstress=1
 
 Risk buffer early-exit check (ticks_held <= 3):
 baseline rb=1.0:0 rb=0.0:0
 stress rb=1.0:0 rb=0.0:0
 volstress rb=1.0:0 rb=0.0:0
 
+Replay diagnostics:
+baseline slope_block=49.18% adx_block=13.11% osc_block=22.95% hft_override=100.00% weak_loss_cluster=0/0
+stress slope_block=47.14% adx_block=20.26% osc_block=21.59% hft_override=100.00% weak_loss_cluster=0/0
+volstress slope_block=53.30% adx_block=17.26% osc_block=18.53% hft_override=100.00% weak_loss_cluster=0/0
+
 Stress sample (DYNAMIC_TRAILING_STOP):
-{'profile': 'stress', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325400CE', 'entry_time': Timestamp('2026-01-30 04:23:58.936114'), 'exit_time': Timestamp('2026-01-30 04:24:53.622101'), 'entry_price': 159.05, 'exit_price': 164.2, 'ticks_held': 22, 'bars_held': 1, 'pnl': 5.15, 'exit_reason': 'DYNAMIC_TRAILING_STOP', 'exit_type': 'HFT', 'risk_buffer': 0.5}
+None
 
 Volstress sample (VOLATILITY_MEAN_REVERSION):
-{'profile': 'volstress', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325000CE', 'entry_time': Timestamp('2026-01-30 04:23:49.697875'), 'exit_time': Timestamp('2026-01-30 04:25:00.843780'), 'entry_price': 404.35, 'exit_price': 412.65, 'ticks_held': 27, 'bars_held': 1, 'pnl': 8.3, 'exit_reason': 'VOLATILITY_MEAN_REVERSION', 'exit_type': 'HFT', 'risk_buffer': 0.5}
+{'profile': 'volstress', 'db': 'ticks_2026-01-30.db', 'symbol': 'NSE:NIFTY2620325000CE', 'entry_time': Timestamp('2026-01-30 04:23:45.450980'), 'exit_time': Timestamp('2026-01-30 04:25:00.843780'), 'entry_price': 402.35, 'exit_price': 412.65, 'ticks_held': 29, 'bars_held': 1, 'pnl': 10.3, 'exit_reason': 'VOLATILITY_MEAN_REVERSION', 'exit_type': 'HFT', 'risk_buffer': 0.5, 'adx14_entry': 28.715, 'slope_agreement_entry': True, 'rsi14_entry': 38.2199, 'cci20_entry': -61.0212, 'osc_extreme_entry': False}

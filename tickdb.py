@@ -28,7 +28,7 @@ import glob
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytz
@@ -42,6 +42,24 @@ MARKET_CLOSE  = (15, 30)   # HH, MM
 def fmt(val):
     """Format numeric values safely for logs."""
     return f"{val:.2f}" if val is not None and not pd.isna(val) else "NA"
+
+
+
+def detect_time_column(conn):
+    cursor = conn.execute("PRAGMA table_info(ticks)")
+    cols = [row[1] for row in cursor.fetchall()]
+    for candidate in ["time", "ist_slot", "timestamp"]:
+        if candidate in cols:
+            return candidate
+    raise RuntimeError(f"No usable time column found in ticks table: {cols}")
+
+def detect_price_column(conn):
+    cursor = conn.execute("PRAGMA table_info(ticks)")
+    cols = [row[1] for row in cursor.fetchall()]
+    for candidate in ["price", "close", "last_price", "ltp"]:
+        if candidate in cols:
+            return candidate
+    raise RuntimeError(f"No usable price column found in ticks table: {cols}")
 
 def _is_market_hours(ts_str: str) -> bool:
     """
@@ -68,6 +86,19 @@ def _is_market_hours(ts_str: str) -> bool:
         return True  # If parsing fails, assume valid to be permissive
 
 
+def _expected_slots(interval: str) -> list[str]:
+    """Expected IST slot starts between 09:15 and 15:30 (close-exclusive)."""
+    step = 3 if interval == "3m" else 15
+    start = datetime(2000, 1, 1, 9, 15, 0)
+    end_exclusive = datetime(2000, 1, 1, 15, 30, 0)
+    slots = []
+    ts = start
+    while ts < end_exclusive:
+        slots.append(ts.strftime("%H:%M:%S"))
+        ts += timedelta(minutes=step)
+    return slots
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TickDatabase:
@@ -80,6 +111,7 @@ class TickDatabase:
 
         self.conn   = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
+        self._candle_log_throttle = {}
         self._create_tables()
 
         self.base_path   = base_path
@@ -92,6 +124,15 @@ class TickDatabase:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _create_tables(self):
+        existing = {
+            row[0]
+            for row in self.cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        had_3m = "candles_3m_ist" in existing
+        had_15m = "candles_15m_ist" in existing
+
         self.cursor.execute("""
         CREATE TABLE IF NOT EXISTS ticks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,22 +150,115 @@ class TickDatabase:
             trade_date TEXT NOT NULL,
             ist_slot   TEXT NOT NULL,
             symbol     TEXT NOT NULL,
-            open REAL, high REAL, low REAL, close REAL, volume REAL,
+            open REAL, high REAL, low REAL, close REAL, volume REAL DEFAULT 0,
             is_partial INTEGER DEFAULT 0,
             PRIMARY KEY (trade_date, ist_slot, symbol)
         )""")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candles_3m_key "
+            "ON candles_3m_ist(trade_date, ist_slot, symbol)"
+        )
 
         self.cursor.execute("""
         CREATE TABLE IF NOT EXISTS candles_15m_ist (
             trade_date TEXT NOT NULL,
             ist_slot   TEXT NOT NULL,
             symbol     TEXT NOT NULL,
-            open REAL, high REAL, low REAL, close REAL, volume REAL,
+            open REAL, high REAL, low REAL, close REAL, volume REAL DEFAULT 0,
             is_partial INTEGER DEFAULT 0,
             PRIMARY KEY (trade_date, ist_slot, symbol)
         )""")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candles_15m_key "
+            "ON candles_15m_ist(trade_date, ist_slot, symbol)"
+        )
 
         self.conn.commit()
+        if (not had_3m) or (not had_15m):
+            logging.info("[CANDLE SCHEMA] created candles_3m_ist, candles_15m_ist")
+
+    @staticmethod
+    def _slot_start(ts_ist: datetime, minutes: int) -> datetime:
+        slot_minute = (ts_ist.minute // minutes) * minutes
+        return ts_ist.replace(minute=slot_minute, second=0, microsecond=0)
+
+    def _upsert_live_candle(
+        self,
+        table: str,
+        trade_date: str,
+        slot_dt: datetime,
+        symbol: str,
+        price: float,
+        volume: float,
+    ) -> None:
+        ist_slot = slot_dt.strftime("%H:%M:%S")
+        self.cursor.execute(
+            f"""
+            INSERT INTO {table}
+                (trade_date, ist_slot, symbol, open, high, low, close, volume, is_partial)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(trade_date, ist_slot, symbol) DO UPDATE SET
+                high = MAX({table}.high, excluded.high),
+                low = MIN({table}.low, excluded.low),
+                close = excluded.close,
+                volume = COALESCE({table}.volume, 0) + COALESCE(excluded.volume, 0),
+                is_partial = 1
+            """,
+            (
+                trade_date,
+                ist_slot,
+                symbol,
+                price,
+                price,
+                price,
+                price,
+                volume,
+            ),
+        )
+
+        key = (table, symbol, trade_date, ist_slot)
+        now_utc = datetime.now(UTC)
+        last_ts = self._candle_log_throttle.get(key)
+        if (last_ts is None) or ((now_utc - last_ts).total_seconds() >= 30):
+            row = self.cursor.execute(
+                f"""
+                SELECT open, high, low, close, volume
+                FROM {table}
+                WHERE trade_date=? AND ist_slot=? AND symbol=?
+                """,
+                (trade_date, ist_slot, symbol),
+            ).fetchone()
+            if row:
+                open_, high, low, close, vol = row
+                logging.info(
+                    f"[CANDLE UPDATE] symbol={symbol} slot={trade_date}T{ist_slot} "
+                    f"open={fmt(open_)} high={fmt(high)} low={fmt(low)} "
+                    f"close={fmt(close)} volume={fmt(vol)}"
+                )
+                self._candle_log_throttle[key] = now_utc
+
+    def _detect_tick_columns(self) -> tuple[str, str, str]:
+        """Return (time_col, price_col, volume_col) from ticks schema."""
+        cols = [
+            row[1]
+            for row in self.cursor.execute("PRAGMA table_info(ticks)").fetchall()
+        ]
+        time_col = next((c for c in ("time", "ist_slot", "timestamp") if c in cols), None)
+        price_col = next((c for c in ("price", "close", "last_price", "ltp") if c in cols), None)
+        volume_col = "volume" if "volume" in cols else None
+        if time_col is None or price_col is None:
+            raise ValueError(
+                f"ticks schema missing required time/price columns; available={cols}"
+            )
+        return time_col, price_col, volume_col
+
+    def _log_continuity_missing_slots(self, symbol: str, interval: str, slots: list[str]) -> None:
+        expected = _expected_slots(interval)
+        got = set(slots)
+        missing = [s for s in expected if s not in got]
+        logging.info(
+            f"[CONTINUITY] {symbol} {interval} missing slots: {missing} total={len(missing)}"
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Tick persistence
@@ -132,9 +266,12 @@ class TickDatabase:
 
     def insert_tick(self, symbol, bid, ask, last_price, volume):
         """Persist a raw tick. Timestamp stored as UTC ISO string."""
-        ts         = datetime.utcnow().isoformat()          # always UTC
-        trade_date = datetime.now(time_zone).strftime("%Y-%m-%d")  # IST date
+        ts         = datetime.now(UTC).isoformat()          # always UTC
+        ts_ist = datetime.now(time_zone)
+        trade_date = ts_ist.strftime("%Y-%m-%d")  # IST date
         try:
+            px = float(last_price) if last_price is not None else None
+            vol = float(volume) if volume is not None else 0.0
             self.cursor.execute("""
                 INSERT INTO ticks
                     (timestamp, trade_date, symbol, bid, ask, last_price, volume)
@@ -143,9 +280,26 @@ class TickDatabase:
                 str(ts), str(trade_date), str(symbol),
                 float(bid)        if bid        is not None else None,
                 float(ask)        if ask        is not None else None,
-                float(last_price) if last_price is not None else None,
-                float(volume)     if volume     is not None else None,
+                px,
+                vol,
             ))
+            if px is not None:
+                self._upsert_live_candle(
+                    table="candles_3m_ist",
+                    trade_date=trade_date,
+                    slot_dt=self._slot_start(ts_ist, 3),
+                    symbol=str(symbol),
+                    price=px,
+                    volume=vol,
+                )
+                self._upsert_live_candle(
+                    table="candles_15m_ist",
+                    trade_date=trade_date,
+                    slot_dt=self._slot_start(ts_ist, 15),
+                    symbol=str(symbol),
+                    price=px,
+                    volume=vol,
+                )
             self.conn.commit()
         except Exception as exc:
             logging.error(f"[TICKDB INSERT ERROR] {symbol}: {exc}")
@@ -211,24 +365,34 @@ class TickDatabase:
     # ─────────────────────────────────────────────────────────────────────────
 
     def fetch_ticks(self, symbol, start_time=None, end_time=None):
-        query  = "SELECT timestamp, last_price, volume FROM ticks WHERE symbol=?"
+        try:
+            time_col, price_col, volume_col = self._detect_tick_columns()
+        except Exception as exc:
+            logging.error(f"[TICKDB FETCH TICKS] schema detection failed: {exc}")
+            return pd.DataFrame(columns=["time", "price", "volume"])
+
+        vol_expr = volume_col if volume_col else "0"
+        query = (
+            f"SELECT {time_col} AS time, {price_col} AS price, {vol_expr} AS volume "
+            "FROM ticks WHERE symbol=?"
+        )
         params = [symbol]
         if start_time:
-            query  += " AND timestamp >= ?"
+            query += f" AND {time_col} >= ?"
             params.append(start_time)
         if end_time:
-            query  += " AND timestamp <= ?"
+            query += f" AND {time_col} <= ?"
             params.append(end_time)
         try:
             df = pd.read_sql_query(query, self.conn, params=params)
             if df.empty:
-                return pd.DataFrame(columns=["timestamp", "last_price", "volume"])
-            df["last_price"] = pd.to_numeric(df["last_price"], errors="coerce")
-            df["volume"]     = pd.to_numeric(df["volume"],     errors="coerce")
+                return pd.DataFrame(columns=["time", "price", "volume"])
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
             return df
         except Exception as exc:
             logging.error(f"[TICKDB FETCH TICKS] {symbol}: {exc}")
-            return pd.DataFrame(columns=["timestamp", "last_price", "volume"])
+            return pd.DataFrame(columns=["time", "price", "volume"])
 
     def get_latest_tick(self, symbol):
         """Return the most recent tick dict, or None."""
@@ -249,12 +413,29 @@ class TickDatabase:
 
     def replay_ticks(self, symbol):
         try:
+            time_col, price_col, volume_col = self._detect_tick_columns()
+        except Exception as exc:
+            logging.error(f"[TICKDB REPLAY TICKS] schema detection failed: {exc}")
+            return pd.DataFrame()
+        try:
+            vol_expr = volume_col if volume_col else "0"
             df = pd.read_sql_query(
-                "SELECT * FROM ticks WHERE symbol=? ORDER BY timestamp ASC",
+                f"""
+                SELECT
+                    {time_col} AS time,
+                    {price_col} AS price,
+                    {vol_expr} AS volume,
+                    *
+                FROM ticks
+                WHERE symbol=?
+                ORDER BY {time_col} ASC
+                """,
                 self.conn, params=[symbol],
             )
-            df["last_price"] = pd.to_numeric(df["last_price"], errors="coerce")
-            df["volume"]     = pd.to_numeric(df["volume"],     errors="coerce")
+            if "price" in df.columns:
+                df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            if "volume" in df.columns:
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
             return df
         except Exception as exc:
             logging.error(f"[TICKDB REPLAY TICKS] {symbol}: {exc}")
@@ -283,7 +464,7 @@ class TickDatabase:
             return
 
         # ── Parse timestamp, ensure IST-aware ────────────────────────────────
-        df_ticks["ts"] = pd.to_datetime(df_ticks["timestamp"], errors="coerce")
+        df_ticks["ts"] = pd.to_datetime(df_ticks["time"], errors="coerce")
         df_ticks = df_ticks.dropna(subset=["ts"])
 
         if df_ticks.empty:
@@ -305,8 +486,8 @@ class TickDatabase:
         ohlc = (
             df_ticks.resample(rule, on="ts")
             .agg({
-                "last_price": ["first", "max", "min", "last"],
-                "volume":     "sum",
+                "price": ["first", "max", "min", "last"],
+                "volume": "sum",
             })
         )
         ohlc.columns = ["open", "high", "low", "close", "volume"]
@@ -356,6 +537,11 @@ class TickDatabase:
             f"L={fmt(latest['low'])} C={fmt(latest['close'])} "
             f"partial={latest['is_partial']}"
         )
+        self._log_continuity_missing_slots(
+            symbol=symbol,
+            interval=interval,
+            slots=[ts.strftime("%H:%M:%S") for ts in ohlc["ts"]],
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Rebuild from DB (replay / recovery)
@@ -368,7 +554,7 @@ class TickDatabase:
             logging.warning(f"[TICKDB REBUILD] No ticks for {symbol}")
             return
 
-        df_ticks["ts"] = pd.to_datetime(df_ticks["timestamp"], errors="coerce")
+        df_ticks["ts"] = pd.to_datetime(df_ticks["time"], errors="coerce")
         df_ticks = df_ticks.dropna(subset=["ts"])
 
         if df_ticks["ts"].dt.tz is None:
@@ -383,8 +569,8 @@ class TickDatabase:
         ohlc = (
             df_ticks.resample(rule, on="ts")
             .agg({
-                "last_price": ["first", "max", "min", "last"],
-                "volume":     "sum",
+                "price": ["first", "max", "min", "last"],
+                "volume": "sum",
             })
             .dropna()
         )
@@ -407,6 +593,11 @@ class TickDatabase:
                     row["volume"], symbol,
                 )
         logging.info(f"[TICKDB REBUILD] {interval} for {symbol}: {len(ohlc)} rows")
+        self._log_continuity_missing_slots(
+            symbol=symbol,
+            interval=interval,
+            slots=[ts.strftime("%H:%M:%S") for ts in ohlc["ts"]],
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Candle fetch (replay / OFFLINE mode)

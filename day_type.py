@@ -632,7 +632,7 @@ def apply_day_type_to_pm(
         old = pm.TRAIL_STEP
         pm.TRAIL_STEP = day_type_result.pm_trail_step
         logging.info(
-            f"{CYAN}[PM DAY TYPE] TRAIL_STEP {old:.2f}→{pm.TRAIL_STEP:.2f} "
+            f"{CYAN}[PM DAY TYPE] TRAIL_STEP {old:.2f}->{pm.TRAIL_STEP:.2f} "
             f"({day_type_result.name.value}){RESET}"
         )
 
@@ -640,7 +640,7 @@ def apply_day_type_to_pm(
         old = pm.MAX_HOLD
         pm.MAX_HOLD = day_type_result.pm_max_hold
         logging.info(
-            f"{CYAN}[PM DAY TYPE] MAX_HOLD {old}→{pm.MAX_HOLD} bars "
+            f"{CYAN}[PM DAY TYPE] MAX_HOLD {old}->{pm.MAX_HOLD} bars "
             f"({day_type_result.name.value}){RESET}"
         )
 

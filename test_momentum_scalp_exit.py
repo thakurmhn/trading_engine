@@ -1,4 +1,4 @@
-"""Comprehensive unit tests for MomentumScalpExit behavior.
+"""Comprehensive unit tests for dip-buying scalp logic.
 
 These tests compile selected functions from ``execution.py`` via AST extraction
 to avoid importing the full runtime module with broker/session side effects.
@@ -18,6 +18,9 @@ class DummyLogger:
 
     def __init__(self) -> None:
         self.messages: list[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
 
     def info(self, msg: str) -> None:
         self.messages.append(str(msg))
@@ -57,12 +60,14 @@ def _load_functions(*names: str, extra_ns: dict | None = None):
         "pd": pd,
         "dt": datetime,
         "timedelta": timedelta,
-        "time_zone": None,
         "logging": test_logger,
         "calculate_cci": lambda _df: pd.Series([0.0]),
         "williams_r": lambda _df: 0.0,
         "momentum_ok": lambda _df, _side: (True, 0.0),
         "get_option_by_moneyness": lambda *_args, **_kwargs: ("NSE:TESTCE", 0),
+        "time_zone": None,
+        # Mock dependencies for the new scalp logic
+        "calculate_traditional_pivots": lambda *args: {"s1": 22400, "r1": 22600, "pivot": 22500},
         "CALL_MONEYNESS": 0,
         "PUT_MONEYNESS": 0,
         "SCALP_PT_POINTS": 7.0,
@@ -70,6 +75,9 @@ def _load_functions(*names: str, extra_ns: dict | None = None):
         "SCALP_COOLDOWN_MINUTES": 20,
         "SCALP_HISTORY_MAXLEN": 120,
         "OSCILLATOR_EXIT_MODE": "HARD",
+        "SCALP_MIN_HOLD_BARS": 2,
+        "SCALP_EXTREME_MOVE_ATR_MULT": 0.90,
+        "PAPER_SLIPPAGE_POINTS": 4.0,
         "YELLOW": "",
         "GREEN": "",
         "RED": "",
@@ -83,23 +91,24 @@ def _load_functions(*names: str, extra_ns: dict | None = None):
             index=["NSE:TESTCE"],
         ),
     }
-    if extra_ns:
-        ns.update(extra_ns)
-
     mod = ast.Module(body=[found[name] for name in names], type_ignores=[])
     code = compile(mod, filename="<execution_funcs>", mode="exec")
     exec(code, ns)
+    if extra_ns:
+        ns.update(extra_ns)
     return {name: ns[name] for name in names}, test_logger, ns
 
 
-def _mk_df() -> pd.DataFrame:
+def _mk_df(rows: int = 4) -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "open": [100.0, 101.0, 102.0, 103.0],
-            "close": [101.0, 102.0, 103.0, 104.0],
-            "supertrend_bias": ["UP", "UP", "UP", "UP"],
-            "rsi14": [50.0, 50.0, 50.0, 50.0],
-            "time": pd.date_range("2026-02-26 10:00:00", periods=4, freq="3min"),
+            "open": [100.0] * rows,
+            "high": [101.0] * rows,
+            "low": [99.0] * rows,
+            "close": [100.5] * rows,
+            "supertrend_bias": ["UP"] * rows,
+            "rsi14": [50.0] * rows,
+            "time": pd.to_datetime(pd.date_range("2026-02-26 10:00:00", periods=rows, freq="3min")),
         }
     )
 
@@ -116,11 +125,10 @@ def _base_state(**overrides) -> dict:
         "pt": 208.0,
         "tg": 210.0,
         "trail_step": 5.0,
-        "source": "MOMENTUM_SCALP",
+        "source": "SCALP_BUY_DIP",
         "regime_context": "SCALP",
         "scalp_mode": True,
         "scalp_pt_points": 5.0,
-        "scalp_sl_points": 3.0,
         "hf_exit_manager": FakeHFManager(False),
         "quantity": 25,
         "trade_flag": 1,
@@ -129,44 +137,62 @@ def _base_state(**overrides) -> dict:
     return state
 
 
-class MomentumScalpDetectionTests(unittest.TestCase):
-    def test_momentum_signal_detects_burst(self):
-        funcs, _logger, ns = _load_functions(
-            "_update_scalp_premium_history",
-            "_rsi_series",
-            "_detect_scalp_momentum_signal",
-        )
-        detect = funcs["_detect_scalp_momentum_signal"]
+class ScalpDipBuyDetectionTests(unittest.TestCase):
+    def test_buy_on_dip_at_s1(self):
+        funcs, logger, _ns = _load_functions("_detect_scalp_dip_rally_signal")
+        detect = funcs["_detect_scalp_dip_rally_signal"]
+        candles = _mk_df()
+        # Make last candle dip to S1 and reject
+        candles.loc[candles.index[-1], "low"] = 22398.0  # S1 is 22400
+        candles.loc[candles.index[-1], "close"] = 22405.0
+        candles.loc[candles.index[-1], "high"] = 22408.0
+        trad_levels = {"s1": 22400.0, "r1": 22600.0, "pivot": 22500.0}
 
-        info = {"scalp_hist": {"CALL": [], "PUT": []}}
-        for px in [200.0, 200.2, 200.1, 200.3, 200.2, 200.4, 200.3, 200.5, 200.4]:
-            info["scalp_hist"]["CALL"].append({"ts": pd.Timestamp("2026-02-26 10:00:00"), "price": px})
-        ns["df"].loc["NSE:TESTCE", "ltp"] = 209.0
-
-        sig = detect(info, 22500.0, pd.Timestamp("2026-02-26 10:12:00"))
+        sig = detect(candles, trad_levels, atr=20.0)
         self.assertIsNotNone(sig)
         self.assertEqual(sig["side"], "CALL")
         self.assertIn("reason", sig)
+        self.assertEqual(sig["reason"], "SCALP_BUY_DIP_S1")
+        self.assertIn("stop", sig)
+        self.assertLess(sig["stop"], 22400.0)  # SL must be below S1
+        self.assertTrue(any("[SCALP_BUY_DIP]" in m for m in logger.messages))
 
-    def test_momentum_signal_suppresses_noise(self):
-        funcs, _logger, ns = _load_functions(
-            "_update_scalp_premium_history",
-            "_rsi_series",
-            "_detect_scalp_momentum_signal",
-        )
-        detect = funcs["_detect_scalp_momentum_signal"]
+    def test_sell_on_rally_at_r1(self):
+        funcs, logger, _ns = _load_functions("_detect_scalp_dip_rally_signal")
+        detect = funcs["_detect_scalp_dip_rally_signal"]
+        candles = _mk_df()
+        # Make last candle rally to R1 and reject
+        candles.loc[candles.index[-1], "high"] = 22602.0  # R1 is 22600
+        candles.loc[candles.index[-1], "close"] = 22595.0
+        candles.loc[candles.index[-1], "low"] = 22592.0
+        trad_levels = {"s1": 22400.0, "r1": 22600.0, "pivot": 22500.0}
 
         info = {"scalp_hist": {"CALL": [], "PUT": []}}
         noisy = [200.00, 200.05, 199.98, 200.02, 200.01, 200.04, 200.00, 200.03, 199.99]
         for px in noisy:
             info["scalp_hist"]["CALL"].append({"ts": pd.Timestamp("2026-02-26 10:00:00"), "price": px})
-        ns["df"].loc["NSE:TESTCE", "ltp"] = 200.01
-
-        sig = detect(info, 22500.0, pd.Timestamp("2026-02-26 10:12:00"))
+        _ns["df"].loc["NSE:TESTCE", "ltp"] = 200.01
+        sig = detect(candles, trad_levels, atr=20.0)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig["side"], "PUT")
+        self.assertEqual(sig["reason"], "SCALP_SELL_RALLY_R1")
+        self.assertIn("stop", sig)
+        self.assertGreater(sig["stop"], 22600.0)  # SL must be above R1
+        self.assertTrue(any("[SCALP_SELL_RALLY]" in m for m in logger.messages))
+    def test_no_signal_in_mid_range(self):
+        funcs, _logger, _ns = _load_functions("_detect_scalp_dip_rally_signal")
+        detect = funcs["_detect_scalp_dip_rally_signal"]
+        candles = _mk_df()
+        # Price is well inside S1/R1 — low stays above S1+atr_buf, high stays below R1-atr_buf
+        candles.loc[candles.index[-1], "low"] = 22420.0
+        candles.loc[candles.index[-1], "high"] = 22480.0
+        candles.loc[candles.index[-1], "close"] = 22450.0
+        trad_levels = {"s1": 22400.0, "r1": 22600.0, "pivot": 22500.0}
+        sig = detect(candles, trad_levels, atr=20.0)
         self.assertIsNone(sig)
 
 
-class MomentumScalpControlTests(unittest.TestCase):
+class ScalpControlTests(unittest.TestCase):
     def test_cooldown_blocks_duplicate_entries(self):
         funcs, _logger, _ns = _load_functions("_can_enter_scalp")
         can_enter = funcs["_can_enter_scalp"]
@@ -188,11 +214,11 @@ class MomentumScalpControlTests(unittest.TestCase):
         self.assertEqual(reason, "OK")
 
 
-class MomentumScalpExitTests(unittest.TestCase):
-    def test_scalp_pt_exit_immediate_without_min_bars(self):
+class ScalpExitLogicTests(unittest.TestCase):
+    def test_scalp_pt_suppressed_before_min_bars(self):
         funcs, logger, _ns = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
-        state = _base_state()
+        state = _base_state(entry_candle=len(_mk_df()) - 1)  # bars_held=0
 
         triggered, reason = fn(
             _mk_df(),
@@ -201,38 +227,45 @@ class MomentumScalpExitTests(unittest.TestCase):
             option_volume=100.0,
             timestamp="2026-02-26T10:09:00",
         )
-        self.assertTrue(triggered)
-        self.assertEqual(reason, "SCALP_PT_HIT")
-        self.assertEqual(state.get("last_exit_type"), "SCALP_PT_HIT")
-        self.assertTrue(any("premium_move=" in m for m in logger.messages if "[EXIT AUDIT]" in m))
+        self.assertFalse(triggered)
+        self.assertIsNone(reason)
 
-    def test_scalp_sl_exit_immediate(self):
+    def test_scalp_pt_fires_after_min_bars(self):
         funcs, _logger, _ns = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
-        state = _base_state()
+        state = _base_state(entry_candle=0)  # bars_held=3 >= 2
 
         triggered, reason = fn(
             _mk_df(),
             state,
-            option_price=196.5,
+            option_price=206.0,  # PT hit
             option_volume=100.0,
             timestamp="2026-02-26T10:09:00",
         )
         self.assertTrue(triggered)
-        self.assertEqual(reason, "SCALP_SL_HIT")
-        self.assertEqual(state.get("last_exit_type"), "SCALP_SL_HIT")
+        self.assertEqual(reason, "SCALP_PT_HIT")
 
-    def test_sl_backstop_active_in_scalp_mode(self):
+    def test_scalp_sl_points_logic_is_removed(self):
+        """The old SCALP_SL_HIT based on fixed points should no longer fire."""
         funcs, _logger, _ns = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
-        state = _base_state(stop=198.0, scalp_pt_points=10.0, scalp_sl_points=10.0)
+        state = _base_state(stop=180.0)  # Main SL is far away
+
+        # This would have triggered the old SCALP_SL_HIT
+        triggered, _reason = fn(
+            _mk_df(), state, option_price=196.5, option_volume=100.0, timestamp="2026-02-26T10:09:00"
+        )
+        self.assertFalse(triggered)
+
+    def test_sl_backstop_active_in_scalp_mode(self):
+        """The main ATR-based SL should still fire for scalp trades."""
+        funcs, _logger, _ns = _load_functions("check_exit_condition")
+        fn = funcs["check_exit_condition"]
+        state = _base_state(stop=198.0, scalp_pt_points=10.0, entry_candle=0)
 
         triggered, reason = fn(
-            _mk_df(),
-            state,
-            option_price=197.9,
-            option_volume=10.0,
-            timestamp="2026-02-26T10:09:00",
+            _mk_df(), state, option_price=197.9, option_volume=10.0,
+            timestamp="2026-02-26T10:09:00"
         )
         self.assertTrue(triggered)
         self.assertEqual(reason, "SL_HIT")
@@ -243,7 +276,8 @@ class MomentumScalpExitTests(unittest.TestCase):
         fn = funcs["check_exit_condition"]
         state = _base_state(
             hf_exit_manager=FakeHFManager(True, "DYNAMIC_TRAILING_STOP"),
-            stop=180.0,
+            stop=180.0,  # Main SL is not hit
+            entry_candle=1,  # bars_held=2, so premature-exit gate does not suppress HFT
         )
 
         triggered, reason = fn(
@@ -257,25 +291,22 @@ class MomentumScalpExitTests(unittest.TestCase):
         self.assertEqual(reason, "DYNAMIC_TRAILING_STOP")
         self.assertEqual(state.get("last_exit_type"), "HFT")
 
-    def test_trend_exits_not_applied_for_scalp_trade(self):
+    def test_hft_can_fire_for_scalp_trade(self):
+        """Verify HFT logic can fire for scalp trades (fall-through)."""
         funcs, _logger, _ns = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
         state = _base_state(
-            scalp_pt_points=20.0,
-            scalp_sl_points=20.0,
-            pt=202.0,
-            tg=202.0,
+            scalp_pt_points=20.0,  # PT not hit
+            hf_exit_manager=FakeHFManager(True, "MOMENTUM_EXHAUSTION"),
+            entry_candle=0,  # bars_held=3, so HFT is active
         )
 
         triggered, reason = fn(
-            _mk_df(),
-            state,
-            option_price=202.5,  # would hit PT/TG for trend but not scalp threshold
-            option_volume=5.0,
-            timestamp="2026-02-26T10:09:00",
+            _mk_df(), state, option_price=202.5, option_volume=5.0,
+            timestamp="2026-02-26T10:09:00"
         )
-        self.assertFalse(triggered)
-        self.assertIsNone(reason)
+        self.assertTrue(triggered)
+        self.assertEqual(reason, "MOMENTUM_EXHAUSTION")
 
     def test_duplicate_exit_rejected_when_closed(self):
         funcs, _logger, _ns = _load_functions("check_exit_condition")
@@ -295,7 +326,7 @@ class MomentumScalpExitTests(unittest.TestCase):
     def test_audit_log_contains_scalp_exit_fields(self):
         funcs, logger, _ns = _load_functions("check_exit_condition")
         fn = funcs["check_exit_condition"]
-        state = _base_state(position_id="POS_AUDIT_1")
+        state = _base_state(position_id="POS_AUDIT_1", entry_candle=0)
 
         triggered, reason = fn(
             _mk_df(),
@@ -312,7 +343,7 @@ class MomentumScalpExitTests(unittest.TestCase):
         self.assertTrue(any("premium_move=" in m for m in audit_lines))
 
 
-class MomentumScalpLifecycleTests(unittest.TestCase):
+class ScalpLifecycleTests(unittest.TestCase):
     def test_process_order_transitions_open_hold_exit_and_sets_cooldown(self):
         df_market = pd.DataFrame({"ltp": [207.5], "volume": [250.0]}, index=["NSE:TESTCE"])
         funcs, _logger, _ns = _load_functions(
