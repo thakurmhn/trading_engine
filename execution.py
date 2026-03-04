@@ -8,7 +8,7 @@ import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
@@ -73,8 +73,8 @@ SCALP_PT_POINTS = 7.0
 SCALP_SL_POINTS = 4.0
 SCALP_MIN_HOLD_BARS = 2
 SCALP_EXTREME_MOVE_ATR_MULT = 0.90
-SCALP_ATR_SL_MIN_MULT = 0.04
-SCALP_ATR_SL_MAX_MULT = 0.12
+SCALP_ATR_SL_MIN_MULT = 0.80
+SCALP_ATR_SL_MAX_MULT = 1.00
 TREND_MIN_HOLD_BARS = 3
 TREND_EXTREME_MOVE_ATR_MULT = 1.15
 SCALP_COOLDOWN_MINUTES = 20
@@ -99,6 +99,8 @@ DEFAULT_OSC_WR_CALL = -10.0
 DEFAULT_OSC_WR_PUT = -88.0
 EMA_STRETCH_BLOCK_MULT = 3.0
 EMA_STRETCH_TAG_MULT = 2.0
+MAX_TRADE_TREND = 8
+MAX_TRADE_SCALP = 12
 
 #===========================================================
 # Initalize filled_df
@@ -110,7 +112,7 @@ except NameError:
 
 #===================================================================
 
-today_str = datetime.now().strftime("%Y-%m-%d")
+today_str = dt.now(time_zone).strftime("%Y-%m-%d")
 
 _compression_state = CompressionState()   # for paper_order / live_order
 
@@ -305,6 +307,12 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
     info.setdefault("scalp_cooldown_until", None)
     info.setdefault("scalp_last_burst_key", None)
     info.setdefault("scalp_hist", {"CALL": [], "PUT": []})
+    info.setdefault("trade_count", 0)
+    info.setdefault("trend_trade_count", 0)
+    info.setdefault("scalp_trade_count", 0)
+    info.setdefault("max_trades", MAX_TRADES_PER_DAY)
+    info.setdefault("max_trades_trend", MAX_TRADE_TREND)
+    info.setdefault("max_trades_scalp", MAX_TRADE_SCALP)
 
     persisted = _load_restart_state(account_type_)
     last_exit = _parse_ts(info.get("last_exit_time")) or _parse_ts(persisted.get("last_exit_time"))
@@ -352,6 +360,26 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
     )
     _save_restart_state(info, account_type_)
     return info
+
+
+def _cap_used(info: dict, is_scalp: bool) -> int:
+    return int(info.get("scalp_trade_count", 0) if is_scalp else info.get("trend_trade_count", 0))
+
+
+def _cap_limit(info: dict, is_scalp: bool) -> int:
+    return int(info.get("max_trades_scalp", MAX_TRADE_SCALP) if is_scalp else info.get("max_trades_trend", MAX_TRADE_TREND))
+
+
+def _cap_available(info: dict, is_scalp: bool) -> bool:
+    return _cap_used(info, is_scalp) < _cap_limit(info, is_scalp)
+
+
+def _register_trade(info: dict, is_scalp: bool) -> None:
+    info["trade_count"] = int(info.get("trade_count", 0)) + 1
+    if is_scalp:
+        info["scalp_trade_count"] = int(info.get("scalp_trade_count", 0)) + 1
+    else:
+        info["trend_trade_count"] = int(info.get("trend_trade_count", 0)) + 1
 
 
 def _validate_restored_positions_on_startup(
@@ -951,6 +979,11 @@ def _trend_entry_quality_gate(
     r4_thr = r4_val + (0.01 * atr_val) if np.isfinite(r4_val) and np.isfinite(atr_val) else float("nan")
     close_below_s4 = bool(np.isfinite(close_val) and np.isfinite(s4_thr) and close_val < s4_thr)
     close_above_r4 = bool(np.isfinite(close_val) and np.isfinite(r4_thr) and close_val > r4_thr)
+    _gap_ctx = str((open_bias_context or {}).get("gap_tag", "UNKNOWN")).upper()
+    _bias_aligned_fast = bool(
+        (allowed_side == "CALL" and _gap_ctx == "GAP_UP")
+        or (allowed_side == "PUT" and _gap_ctx == "GAP_DOWN")
+    )
     _cpr_classifier = globals().get("classify_cpr_width")
     if callable(_cpr_classifier):
         cpr_width = _cpr_classifier(cpr_levels or {}, close_price=close_val if np.isfinite(close_val) else None)
@@ -1118,6 +1151,12 @@ def _trend_entry_quality_gate(
                     f"TIME_SLOPE_OVERRIDE: post-11:00 flat slope "
                     f"adx={adx_val:.1f} < time_gate={_time_slope_gate:.1f}"
                 )
+        # Path E: strong trend continuation override
+        # If ADX is very strong and opening bias is aligned, allow slope conflict.
+        if _slope_override_reason is None and np.isfinite(adx_val) and adx_val > 40.0 and _bias_aligned_fast:
+            _slope_override_reason = (
+                f"TREND_ADX_BIAS_OVERRIDE: adx={adx_val:.1f} > 40 and open_bias_aligned=True"
+            )
 
         if _slope_override_reason:
             _entry_log(
@@ -1125,6 +1164,13 @@ def _trend_entry_quality_gate(
                 f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
                 f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']} "
                 f"override_reason={_slope_override_reason}"
+            )
+            logging.info(
+                "[SLOPE_OVERRIDE_TREND] "
+                f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                f"adx={adx_val if np.isfinite(adx_val) else 'N/A'} "
+                f"open_bias_aligned={_bias_aligned_fast} "
+                f"reason={_slope_override_reason}"
             )
             st_details["slope_override_reason"] = _slope_override_reason
         else:
@@ -1580,7 +1626,8 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     option_volume = option_volume if option_volume is not None else 0.0
     timestamp = timestamp if timestamp is not None else dt.now(time_zone)
 
-    min_bars_for_pt_tg = 3
+    atr_for_hold = float(state.get("atr_value", 0.0) or 0.0)
+    min_bars_for_pt_tg = 2 if atr_for_hold < 30.0 else 3
     time_exit_candles = int(state.get("time_exit_candles", 8))
     osc_rsi_call = float(state.get("osc_rsi_call", 75.0))
     osc_rsi_put = float(state.get("osc_rsi_put", 25.0))
@@ -1654,8 +1701,8 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     # Scalp trades should survive initial noise for >=2 bars unless move is extreme.
     if stop is not None and current_ltp <= stop:
         if state.get("scalp_mode", False):
-            min_hold = int(state.get("scalp_min_hold_bars", SCALP_MIN_HOLD_BARS))
             atr_val = float(state.get("atr_value", 0.0) or 0.0)
+            min_hold = 2 if atr_val < 30.0 else 3
             extreme_mul = float(state.get("scalp_extreme_move_atr_mult", SCALP_EXTREME_MOVE_ATR_MULT))
             extreme_pts = max(2.0, atr_val * extreme_mul * 0.06)
             emergency_stop = float(stop) - extreme_pts
@@ -1674,8 +1721,8 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
                     f"ltp={current_ltp:.2f} emergency_stop={emergency_stop:.2f}"
                 )
         else:
-            min_hold = int(state.get("trend_min_hold_bars", TREND_MIN_HOLD_BARS))
             atr_val = float(state.get("atr_value", 0.0) or 0.0)
+            min_hold = 2 if atr_val < 30.0 else 3
             extreme_mul = float(state.get("trend_extreme_move_atr_mult", TREND_EXTREME_MOVE_ATR_MULT))
             extreme_pts = max(3.0, atr_val * extreme_mul * 0.06)
             emergency_stop = float(stop) - extreme_pts
@@ -1697,7 +1744,16 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         logging.info(
             f"{RED}[EXIT][SL_HIT] {side} ltp={current_ltp:.2f} stop={stop:.2f} bars_held={bars_held}{RESET}"
         )
-        if not state.get("scalp_mode", False):
+        if state.get("scalp_mode", False):
+            logging.info(
+                f"[SCALP_SL_HIT] {side} trade_class={state.get('trade_class', 'SCALP')} "
+                f"bars_held={bars_held} entry={state.get('buy_price', '?')} stop={stop:.2f} ltp={current_ltp:.2f}"
+            )
+        else:
+            logging.info(
+                f"[TREND_SL_HIT] {side} trade_class={state.get('trade_class', 'TREND')} "
+                f"bars_held={bars_held} entry={state.get('buy_price', '?')} stop={stop:.2f} ltp={current_ltp:.2f}"
+            )
             logging.info(
                 f"[TREND_LOSS] {side} trade_class={state.get('trade_class', 'TREND')} "
                 f"bars_held={bars_held} entry={state.get('buy_price', '?')} "
@@ -1739,7 +1795,17 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         return False, None
 
     # 4) Min-bar maturity gate
+    last_adx = float(df_slice["adx14"].iloc[-1]) if ("adx14" in df_slice.columns and len(df_slice) > 0 and pd.notna(df_slice["adx14"].iloc[-1])) else float("nan")
+    tg_adx_override = bool(tg_hit and np.isfinite(last_adx) and last_adx > 40.0)
     if bars_held < min_bars_for_pt_tg and (tg_hit or pt_hit):
+        if tg_adx_override:
+            logging.info(
+                "[EXIT ALLOWED][TG_ADX_OVERRIDE] "
+                f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                f"min_hold={min_bars_for_pt_tg} adx={last_adx:.1f} tg={tg:.2f}"
+            )
+            audit("TG", "TARGET_HIT", f"ltp>={tg:.2f} adx={last_adx:.1f}")
+            return True, "TARGET_HIT"
         if bars_held <= 0 and pt_hit:
             audit("PT", "PT_HIT", f"ltp>={pt:.2f}")
             state["partial_booked"] = True
@@ -1748,6 +1814,11 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
             return True, "PT_HIT"
         audit("MIN_BAR", "DEFERRED", f"bars_held<{min_bars_for_pt_tg}")
         if tg_hit:
+            logging.info(
+                "[TG_HIT_SUPPRESSED] "
+                f"symbol={symbol} option_type={side} bars_held={bars_held} "
+                f"min_hold={min_bars_for_pt_tg} adx={last_adx if np.isfinite(last_adx) else 'N/A'}"
+            )
             logging.info(
                 f"{YELLOW}[EXIT DEFERRED] TG hit before min bars ({bars_held} < {min_bars_for_pt_tg}). "
                 f"ltp={current_ltp:.2f} tg={tg:.2f} defer_until={entry_candle + min_bars_for_pt_tg}{RESET}"
@@ -1900,10 +1971,19 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     is_reversal = ((side == "CALL" and last_c["close"] < last_c["open"]) or
                    (side == "PUT" and last_c["close"] > last_c["open"]))
     state["consec_count"] = (state.get("consec_count", 0) + 1) if is_reversal else 0
-    if state["consec_count"] >= 3 and bars_held >= min_bars_for_pt_tg:
+    rev_atr = float(state.get("atr_value", 0.0) or 0.0)
+    rev_threshold = 3
+    if np.isfinite(rev_atr) and rev_atr >= 30.0 and np.isfinite(last_adx) and last_adx >= 25.0:
+        rev_threshold = 2
+    if state["consec_count"] >= rev_threshold and bars_held >= min_bars_for_pt_tg:
         x_type = contextual_exit_type()
-        audit(x_type, "REVERSAL_EXIT", f"reversal_count={state['consec_count']}")
-        logging.info(f"{YELLOW}[EXIT][REVERSAL] {side} {state['consec_count']} bars_held={bars_held}{RESET}")
+        audit(x_type, "REVERSAL_EXIT", f"reversal_count={state['consec_count']} threshold={rev_threshold}")
+        logging.info(
+            f"{YELLOW}[EXIT][REVERSAL] {side} {state['consec_count']} "
+            f"bars_held={bars_held} threshold={rev_threshold} "
+            f"atr={rev_atr if np.isfinite(rev_atr) else 'N/A'} "
+            f"adx={last_adx if np.isfinite(last_adx) else 'N/A'}{RESET}"
+        )
         return True, "REVERSAL_EXIT"
 
     ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
@@ -2014,33 +2094,34 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     stop = max(round(entry_price - sl_mult * atr, 2), 1.0)
 
     # ════════ VOLATILITY REGIME (PT / TG / TRAIL) ════════
+    # PT/TG are now ATR-multiple based (not fixed premium percentages).
     if atr <= 60:
         regime   = "VERY_LOW"
-        pt_pct   = 0.10
-        tg_pct   = 0.15
+        pt_mult  = 1.2
+        tg_mult  = 1.4
         step_pct = 0.02
     elif atr <= 100:
         regime   = "LOW"
-        pt_pct   = 0.11
-        tg_pct   = 0.16
+        pt_mult  = 1.3
+        tg_mult  = 1.6
         step_pct = 0.025
     elif atr <= 150:
         regime   = "MODERATE"
-        pt_pct   = 0.12
-        tg_pct   = 0.18
+        pt_mult  = 1.4
+        tg_mult  = 1.8
         step_pct = 0.03
     elif atr <= 250:
         regime   = "HIGH"
-        pt_pct   = 0.13
-        tg_pct   = 0.20
+        pt_mult  = 1.6
+        tg_mult  = 2.0
         step_pct = 0.035
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
         return {"valid": False}
 
-    partial_target = round(entry_price * (1 + pt_pct), 2)
-    full_target    = round(entry_price * (1 + tg_pct), 2)
-    trail_start    = round(entry_price * pt_pct * float(trail_start_frac), 2)
+    partial_target = round(entry_price + (pt_mult * atr), 2)
+    full_target    = round(entry_price + (tg_mult * atr), 2)
+    trail_start    = round((pt_mult * atr) * float(trail_start_frac), 2)
     trail_step     = round(max(entry_price * step_pct, 1.5), 2)
 
     sl_dist_pct = (entry_price - stop) / entry_price * 100
@@ -2049,8 +2130,8 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     logging.info(
         f"{CYAN}[LEVELS][ATR_SL] {regime:12} | {side} entry={entry_price:.2f} | "
         f"SL={stop:.2f}(-{sl_dist_pct:.1f}% | {sl_mult}×ATR tier={sl_tier}/{_sl_atr_tier}) "
-        f"PT={partial_target:.2f}({pt_pct*100:+.1f}%) "
-        f"TG={full_target:.2f}({tg_pct*100:+.1f}%) "
+        f"PT={partial_target:.2f}(+{pt_mult:.2f}xATR) "
+        f"TG={full_target:.2f}(+{tg_mult:.2f}xATR) "
         f"| TrailStart={trail_start:.2f} TrailStep={trail_step:.2f} "
         f"ATR={atr:.1f} ADX={adx_val_f:.1f}{RESET}"
     )
@@ -2214,6 +2295,10 @@ if account_type == 'PAPER':
             'total_pnl': 0,
             'trade_count': 0,
             'max_trades': MAX_TRADES_PER_DAY,
+            'trend_trade_count': 0,
+            'scalp_trade_count': 0,
+            'max_trades_trend': MAX_TRADE_TREND,
+            'max_trades_scalp': MAX_TRADE_SCALP,
             'last_exit_time': None,
             'scalp_cooldown_until': None,
             'scalp_last_burst_key': None,
@@ -2318,6 +2403,10 @@ else:
             'total_pnl': 0,
             'trade_count': 0,
             'max_trades': MAX_TRADES_PER_DAY,
+            'trend_trade_count': 0,
+            'scalp_trade_count': 0,
+            'max_trades_trend': MAX_TRADE_TREND,
+            'max_trades_scalp': MAX_TRADE_SCALP,
             'last_exit_time': None,
             'scalp_cooldown_until': None,
             'scalp_last_burst_key': None,
@@ -2651,6 +2740,20 @@ def process_order(state, df_slice, info, spot_price,
             f"Levels: SL={state.get('stop', 'N/A')} "
             f"PT={state.get('pt','N/A')} TG={state.get('tg','N/A')}{RESET}"
         )
+        _is_tg_exit = str(exit_reason).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"}
+        _is_rev_exit = str(exit_reason).upper() in {"REVERSAL_EXIT", "MOMENTUM_EXHAUSTION"}
+        _is_atr_exit = str(exit_reason).upper() in {"SL_HIT", "TIME_EXIT", "ST_FLIP", "OSC_EXHAUSTION", "MOMENTUM_EXIT"}
+        logging.info(f"[EXIT_ATTRIBUTION] type={'TG' if _is_tg_exit else ('REVERSAL' if _is_rev_exit else ('ATR' if _is_atr_exit else 'OTHER'))} reason={exit_reason}")
+        _tg = state.get("tg")
+        _pt = state.get("pt")
+        _tg_hit_now = bool(_tg is not None and exit_price >= float(_tg))
+        _pt_hit_now = bool(_pt is not None and exit_price >= float(_pt))
+        if (not _tg_hit_now) and (not _pt_hit_now) and str(exit_reason).upper() not in {"TARGET_HIT", "PT_HIT", "TG_PARTIAL_EXIT"}:
+            logging.info(
+                "[PT_TG_UNREACHABLE_EXIT] "
+                f"symbol={symbol} side={side} reason={exit_reason} exit_price={exit_price:.2f} "
+                f"pt={_pt if _pt is not None else 'N/A'} tg={_tg if _tg is not None else 'N/A'}"
+            )
         # Strict lifecycle transition OPEN -> HOLD -> EXIT.
         state["is_open"] = False
         state["lifecycle_state"] = "EXIT"
@@ -2946,7 +3049,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
             if paper_info.get("scalp_last_burst_key") == burst_key:
                 logging.info(f"[SCALP SKIP] duplicate burst {burst_key}")
             elif paper_info[scalp_leg].get("trade_flag", 0) == 0 and paper_info[scalp_leg].get("is_open", False) is False:
-                if paper_info.get("trade_count", 0) < paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+                if _cap_available(paper_info, is_scalp=True):
                     opt_type = "CE" if scalp_side == "CALL" else "PE"
                     opt_name, _strike = get_option_by_moneyness(
                         spot_price,
@@ -2965,8 +3068,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
 
                     # P3-C: apply slippage — scalp entries also get worse fills
                     entry_price = base_entry + PAPER_SLIPPAGE_POINTS
-                    atr_sl_mult = float(np.clip(atr * 0.001, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
-                    atr_sl_points = max(SCALP_SL_POINTS, round(entry_price * atr_sl_mult, 2))
+                    atr_sl_mult = float(np.clip(0.9, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
+                    atr_sl_points = max(SCALP_SL_POINTS, round(float(atr) * atr_sl_mult, 2))
                     stop = round(entry_price - atr_sl_points, 2)
                     pt = round(entry_price + SCALP_PT_POINTS, 2)
                     position_id = f"scalp_{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
@@ -3028,8 +3131,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "spot_price": spot_price,
                         "quantity": quantity,
                     }
-                    paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
+                    _register_trade(paper_info, is_scalp=True)
                     paper_info["scalp_last_burst_key"] = burst_key
+                    logging.info(
+                        f"[SCALP_ENTRY] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
+                        f"trend_used={_cap_used(paper_info, False)} trend_cap={_cap_limit(paper_info, False)}"
+                    )
                     log_entry_green(
                         f"[SCALP ENTRY][PAPER] {scalp_side} {opt_name} @ {entry_price:.2f} "
                         f"PT=+{SCALP_PT_POINTS:.1f} SL=-{atr_sl_points:.2f} "
@@ -3055,6 +3162,10 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     _save_trades_paper()
                     store(paper_info, account_type)
                     return
+                logging.info(
+                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
+                    f"trade_count={paper_info.get('trade_count', 0)} side={scalp_side} entry blocked"
+                )
 
     # 6. Signal evaluation
     _paper_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
@@ -3150,7 +3261,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         comp_sig = _compression_state.entry_signal
         leg = "call_buy" if comp_sig["side"] == "CALL" else "put_buy"
         if paper_info[leg]["trade_flag"] == 0 and not risk_info.get("halt_trading", False):
-            if paper_info.get("trade_count", 0) < paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+            if _cap_available(paper_info, is_scalp=False):
                 logging.info(
                     f"[ENTRY DISPATCH] COMPRESSION_BREAKOUT {comp_sig['side']} "
                     f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f} | "
@@ -3218,11 +3329,11 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     leg = "call_buy" if side == "CALL" else "put_buy"
     try:
         if paper_info[leg]["trade_flag"] == 0:
-            if paper_info.get("trade_count", 0) >= paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+            if not _cap_available(paper_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP] trade_count={paper_info.get('trade_count', 0)} "
-                    f"max_trades={paper_info.get('max_trades', MAX_TRADES_PER_DAY)} "
-                    f"side={side} — entry blocked"
+                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
+                    f"scalp_used={_cap_used(paper_info, True)} scalp_cap={_cap_limit(paper_info, True)} "
+                    f"trade_count={paper_info.get('trade_count', 0)} side={side} entry blocked"
                 )
             else:
                 opt_type = "CE" if side == "CALL" else "PE"
@@ -3359,7 +3470,11 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         'spot_price': spot_price,
                         'quantity': quantity
                     }
-                    paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
+                    _register_trade(paper_info, is_scalp=False)
+                    logging.info(
+                        f"[TREND_ENTRY] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
+                        f"scalp_used={_cap_used(paper_info, True)} scalp_cap={_cap_limit(paper_info, True)}"
+                    )
 
                     logging.info(
                         f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f} "
@@ -3550,7 +3665,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             if live_info.get("scalp_last_burst_key") == burst_key:
                 logging.info(f"[SCALP SKIP] duplicate burst {burst_key}")
             elif live_info[scalp_leg].get("trade_flag", 0) == 0 and live_info[scalp_leg].get("is_open", False) is False:
-                if live_info.get("trade_count", 0) < live_info.get("max_trades", MAX_TRADES_PER_DAY):
+                if _cap_available(live_info, is_scalp=True):
                     opt_type = "CE" if scalp_side == "CALL" else "PE"
                     opt_name, _strike = get_option_by_moneyness(
                         spot_price,
@@ -3567,8 +3682,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         logging.info(f"[SCALP SKIP] invalid entry premium for {opt_name}")
                         return
 
-                    atr_sl_mult = float(np.clip(atr * 0.001, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
-                    atr_sl_points = max(SCALP_SL_POINTS, round(entry_price * atr_sl_mult, 2))
+                    atr_sl_mult = float(np.clip(0.9, SCALP_ATR_SL_MIN_MULT, SCALP_ATR_SL_MAX_MULT))
+                    atr_sl_points = max(SCALP_SL_POINTS, round(float(atr) * atr_sl_mult, 2))
                     stop = round(entry_price - atr_sl_points, 2)
                     pt = round(entry_price + SCALP_PT_POINTS, 2)
                     success, order_id = send_live_entry_order(opt_name, quantity, 1)
@@ -3630,8 +3745,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                             "spot_price": spot_price,
                             "quantity": quantity,
                         }
-                        live_info["trade_count"] = live_info.get("trade_count", 0) + 1
+                        _register_trade(live_info, is_scalp=True)
                         live_info["scalp_last_burst_key"] = burst_key
+                        logging.info(
+                            f"[SCALP_ENTRY] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
+                            f"trend_used={_cap_used(live_info, False)} trend_cap={_cap_limit(live_info, False)}"
+                        )
                         log_entry_green(
                             f"[SCALP ENTRY][LIVE] {scalp_side} {opt_name} @ {entry_price:.2f} "
                             f"PT=+{SCALP_PT_POINTS:.1f} SL=-{atr_sl_points:.2f} "
@@ -3657,6 +3776,10 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         _save_trades_live()
                         store(live_info, account_type)
                         return
+                logging.info(
+                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
+                    f"trade_count={live_info.get('trade_count', 0)} side={scalp_side} entry blocked"
+                )
 
     # 6. Signal evaluation
     _live_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
@@ -3752,7 +3875,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         comp_sig = _compression_state.entry_signal
         leg = "call_buy" if comp_sig["side"] == "CALL" else "put_buy"
         if live_info[leg]["trade_flag"] == 0 and not risk_info.get("halt_trading", False):
-            if live_info.get("trade_count", 0) < live_info.get("max_trades", MAX_TRADES_PER_DAY):
+            if _cap_available(live_info, is_scalp=False):
                 logging.info(
                     f"[ENTRY DISPATCH] COMPRESSION_BREAKOUT {comp_sig['side']} "
                     f"sl={comp_sig['sl']:.2f} tg={comp_sig['tg']:.2f} pt={comp_sig['pt']:.2f} | "
@@ -3819,11 +3942,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     leg = "call_buy" if side == "CALL" else "put_buy"
     try:
         if live_info[leg]["trade_flag"] == 0:
-            if live_info.get("trade_count", 0) >= live_info.get("max_trades", MAX_TRADES_PER_DAY):
+            if not _cap_available(live_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP] trade_count={live_info.get('trade_count', 0)} "
-                    f"max_trades={live_info.get('max_trades', MAX_TRADES_PER_DAY)} "
-                    f"side={side} — entry blocked"
+                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
+                    f"scalp_used={_cap_used(live_info, True)} scalp_cap={_cap_limit(live_info, True)} "
+                    f"trade_count={live_info.get('trade_count', 0)} side={side} entry blocked"
                 )
                 return
 
@@ -3957,7 +4080,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     'spot_price': spot_price,
                     'quantity': quantity
                 }
-                live_info["trade_count"] = live_info.get("trade_count", 0) + 1
+                _register_trade(live_info, is_scalp=False)
+                logging.info(
+                    f"[TREND_ENTRY] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
+                    f"scalp_used={_cap_used(live_info, True)} scalp_cap={_cap_limit(live_info, True)}"
+                )
 
                 logging.info(
                     f"{GREEN}[ENTRY][LIVE] {side} {opt_name} @ {entry_price:.2f} "

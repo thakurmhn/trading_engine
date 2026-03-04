@@ -28,7 +28,7 @@ import glob
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytz
@@ -217,7 +217,7 @@ class TickDatabase:
         )
 
         key = (table, symbol, trade_date, ist_slot)
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(UTC)
         last_ts = self._candle_log_throttle.get(key)
         if (last_ts is None) or ((now_utc - last_ts).total_seconds() >= 30):
             row = self.cursor.execute(
@@ -266,7 +266,7 @@ class TickDatabase:
 
     def insert_tick(self, symbol, bid, ask, last_price, volume):
         """Persist a raw tick. Timestamp stored as UTC ISO string."""
-        ts         = datetime.utcnow().isoformat()          # always UTC
+        ts         = datetime.now(UTC).isoformat()          # always UTC
         ts_ist = datetime.now(time_zone)
         trade_date = ts_ist.strftime("%Y-%m-%d")  # IST date
         try:

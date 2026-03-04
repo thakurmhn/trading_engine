@@ -785,8 +785,9 @@ def _write_text_report(session, output_path: Path) -> Path:
     rev_count = getattr(session, "reversal_trades_count", 0)
     rev_signal_count = getattr(session, "reversal_signal_count", 0)
     slope_count = getattr(session, "st_slope_override_count", 0)
+    slope_trend_override = session.tag_counts.get("SLOPE_OVERRIDE_TREND", 0)
     rev_pnl = getattr(session, "reversal_pnl_attribution", 0.0)
-    if rev_count > 0 or rev_signal_count > 0 or slope_count > 0:
+    if rev_count > 0 or rev_signal_count > 0 or slope_count > 0 or slope_trend_override > 0:
         lines.append("")
         lines.append("  REVERSAL DETECTOR")
         lines.append(sep2)
@@ -794,6 +795,7 @@ def _write_text_report(session, output_path: Path) -> Path:
         lines.append(f"  Reversal trades    : {rev_count}  (trades opened via REVERSAL_OVERRIDE path)")
         lines.append(f"  Reversal P&L (pts) : {rev_pnl:+.2f}")
         lines.append(f"  ST_SLOPE overrides : {slope_count}")
+        lines.append(f"  Slope Override Trend Signals : {slope_trend_override}")
 
     # Oscillator gating section
     osc_blocks    = getattr(session, "oscillator_blocks", 0)
@@ -858,6 +860,11 @@ def _write_text_report(session, output_path: Path) -> Path:
         if trend_losses > 0:
             lines.append(f"  Trend SL exits         : {trend_losses}")
             lines.append(f"  As % of all trades     : {sl_loss_pct:.1f}%")
+        scalp_sl_hits = session.tag_counts.get("SCALP_SL_HIT", 0)
+        trend_sl_hits = session.tag_counts.get("TREND_SL_HIT", 0)
+        if scalp_sl_hits > 0 or trend_sl_hits > 0:
+            lines.append(f"  Scalp SL hits          : {scalp_sl_hits}")
+            lines.append(f"  Trend SL hits          : {trend_sl_hits}")
         if osc_relief > 0:
             lines.append(f"  OSC relief overrides   : {osc_relief}  (S4/R4 breakout, extreme bypassed)")
         if expiry_rolls > 0 or lot_mismatches > 0 or intrinsic_skips > 0:
@@ -904,6 +911,35 @@ def _write_text_report(session, output_path: Path) -> Path:
                 ages = [float(t.get("zone_age_bars", 0)) for t in zone_trades]
                 age_avg = (sum(ages) / len(ages)) if ages else 0.0
                 lines.append(f"  Zone age avg (bars)    : {age_avg:.1f}")
+
+    # Exit governance attribution
+    tg_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"})
+    rev_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"REVERSAL_EXIT", "MOMENTUM_EXHAUSTION"})
+    atr_exits = sum(
+        1 for t in session.trades
+        if str(t.get("exit_reason", "")).upper() in {"SL_HIT", "TIME_EXIT", "ST_FLIP", "OSC_EXHAUSTION", "MOMENTUM_EXIT"}
+    )
+    pt_tg_unreach = session.tag_counts.get("PT_TG_UNREACHABLE_EXIT", 0)
+    tg_suppressed = session.tag_counts.get("TG_HIT_SUPPRESSED", 0)
+    if tg_exits > 0 or rev_exits > 0 or atr_exits > 0 or pt_tg_unreach > 0 or tg_suppressed > 0:
+        lines.append("")
+        lines.append("  EXIT GOVERNANCE")
+        lines.append(sep2)
+        lines.append(f"  TG exits               : {tg_exits}")
+        lines.append(f"  Reversal exits         : {rev_exits}")
+        lines.append(f"  ATR exits              : {atr_exits}")
+        lines.append(f"  PT/TG unreachable exits: {pt_tg_unreach}")
+        lines.append(f"  TG hit but suppressed  : {tg_suppressed}")
+
+    # ORB monitoring attribution
+    orb_active = session.tag_counts.get("ORB_ACTIVE", 0)
+    orb_expired = session.tag_counts.get("ORB_EXPIRED", 0)
+    if orb_active > 0 or orb_expired > 0:
+        lines.append("")
+        lines.append("  ORB MONITORING")
+        lines.append(sep2)
+        lines.append(f"  ORB_ACTIVE logs        : {orb_active}")
+        lines.append(f"  ORB_EXPIRED logs       : {orb_expired}")
 
     # Volatility context section
     vix_count     = getattr(session, "vix_tier_count",         0)
@@ -1012,6 +1048,8 @@ def _write_text_report(session, output_path: Path) -> Path:
         lines.append(f"  MAX_TRADES_CAP blocks  : {_lot_cap}  (daily cap reached)")
         lines.append(f"  Lot size mismatches    : {_lot_mis}  (API lot ≠ config lot)")
         lines.append(f"  Intrinsic filter skips : {_intr_skip}  (zero-intrinsic contracts skipped)")
+        lines.append(f"  Trend trades used      : {session.tag_counts.get('TREND_ENTRY', 0)} / 8")
+        lines.append(f"  Scalp trades used      : {session.tag_counts.get('SCALP_ENTRY', 0)} / 12")
 
     # ── TRADE DETAILS table ────────────────────────────────────────────────────
     if session.total_trades > 0:

@@ -307,18 +307,26 @@ def detect_orb_signal(last, atr, orb_high, orb_low, call_ok, put_ok,
                       current_time=None):
     """
     Opening range breakout entry.
-    Only valid before 11:30 IST — after that the opening range is stale.
+    Only valid before 11:45 IST — after that the opening range is stale.
     Fire CALL when close breaks above ORB high with confirmation.
     Fire PUT when close breaks below ORB low with confirmation.
     """
     if orb_high is None or orb_low is None or atr is None:
         return None
 
-    # Time gate: ORB only meaningful in first 2 hours of session
+    # Time gate: ORB remains active until 11:45 IST.
     if current_time is not None:
         t = current_time.hour * 60 + current_time.minute
-        if t >= 11 * 60 + 30:   # after 11:30 → stale, skip
+        if t >= 11 * 60 + 45:
+            logging.info(
+                f"[ORB_EXPIRED] time={current_time.hour:02d}:{current_time.minute:02d} "
+                "window_end=11:45"
+            )
             return None
+        logging.info(
+            f"[ORB_ACTIVE] time={current_time.hour:02d}:{current_time.minute:02d} "
+            "window_end=11:45"
+        )
 
     close = float(last.close)
     if call_ok and close > orb_high + 0.01 * atr:

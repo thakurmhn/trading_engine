@@ -206,6 +206,16 @@ _P_TAGS = [
     "FAILED_BREAKOUT",
     "EMA_STRETCH",
     "ZONE_REVISIT",
+    "SLOPE_OVERRIDE_TREND",
+    "PT_TG_UNREACHABLE_EXIT",
+    "TG_HIT_SUPPRESSED",
+    "ORB_ACTIVE",
+    "ORB_EXPIRED",
+    "SCALP_SL_HIT",
+    "TREND_SL_HIT",
+    "SCALP_ENTRY",
+    "TREND_ENTRY",
+    "EXIT_ATTRIBUTION",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 
