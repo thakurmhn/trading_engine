@@ -24,6 +24,7 @@ v2.1 fixes vs v2.0:
 """
 
 import logging
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -33,6 +34,7 @@ from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 from setup import client_id, access_token, fyers, fyers_async, ticker, symbols, df
 from order_utils import update_order_status, map_status_code
 from tickdb import TickDatabase
+from pulse_module import get_pulse_module, PulseModule
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -59,6 +61,10 @@ spot_price: float = 0.0
 
 # Index symbols we track as underlying
 INDEX_SYMBOLS = {"NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"}
+
+# ── Pulse Module (Tick-Rate Momentum) ────────────────────────────────────────
+# Initialize the global pulse module for tick-rate momentum calculation
+pulse: PulseModule = get_pulse_module()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,6 +147,13 @@ def onmessage(ticks: dict) -> None:
         logging.debug(
             f"[TICK DROPPED→MD] {sym} ltp={ltp:.2f} — market_data not yet wired"
         )
+
+    # 6. Feed Pulse Module (Tick-Rate Momentum)
+    try:
+        timestamp_ms = time.time() * 1000  # Current time in milliseconds
+        pulse.on_tick(timestamp_ms, ltp)
+    except Exception as exc:
+        logging.debug(f"[PULSE][TICK ERROR] {sym}: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -52,6 +52,7 @@ from zone_detector import (
     update_zone_activity,
     detect_zone_revisit,
 )
+from pulse_module import get_pulse_module, PulseModule
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -73,13 +74,16 @@ SCALP_PT_POINTS = 7.0
 SCALP_SL_POINTS = 4.0
 SCALP_MIN_HOLD_BARS = 2
 SCALP_EXTREME_MOVE_ATR_MULT = 0.90
-SCALP_ATR_SL_MIN_MULT = 0.80
-SCALP_ATR_SL_MAX_MULT = 1.00
+# Phase 2: Scalp SL Tightening - ATR × 0.6–0.8 (tighter than previous 0.8–1.0)
+SCALP_ATR_SL_MIN_MULT = 0.60
+SCALP_ATR_SL_MAX_MULT = 0.80
 TREND_MIN_HOLD_BARS = 3
 TREND_EXTREME_MOVE_ATR_MULT = 1.15
 SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
 STARTUP_SUPPRESSION_MINUTES = 5
+# Pulse module threshold for scalp entry (ticks per second)
+PULSE_TICKRATE_THRESHOLD = 15.0
 # P3-C: Paper mode slippage — models bid/ask spread + market impact on fills.
 # Applied to ENTRY price in paper mode so paper P&L reflects realistic fills.
 # Set to 0.0 to disable. Recommended: 4.0 pts for NIFTY ITM options.
@@ -1526,6 +1530,24 @@ def _trend_entry_quality_gate(
         )
         return True, allowed_side, "OK", st_details
 
+    # ── Bias Misalignment Filter ─────────────────────────────────────────────────
+    # Block entries when bias is misaligned AND oscillator is in extreme zone.
+    # This prevents fighting the opening bias when indicators also suggest exhaustion.
+    # Allow if: bias aligned OR oscillator NOT in extreme (still has room).
+    _osc_in_extreme = not (_rsi_in_expanded and _cci_in_expanded)
+    _bias_misaligned = not merged_ctx.get("bias_aligned", True)
+
+    if _bias_misaligned and _osc_in_extreme:
+        logging.info(
+            "[ENTRY BLOCKED][BIAS_MISALIGN_EXTREME] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            f"bias={merged_ctx.get('bias', 'UNKNOWN')} gap={merged_ctx.get('gap_tag', 'UNKNOWN')} "
+            f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
+            f"rsi_expanded={_rsi_in_expanded} cci_expanded={_cci_in_expanded} "
+            "reason=Bias misaligned AND oscillator in extreme zone, entry suppressed."
+        )
+        return False, allowed_side, "Bias misalignment with oscillator extreme, entry suppressed.", st_details
+
     # Case 4: S4/R4 breakout relief — price below S4−ATR (PUT) or above R4+ATR (CALL)
     # When price trades decisively outside the Camarilla extreme levels, oscillator
     # exhaustion reflects momentum continuation, not a reversal — allow entry.
@@ -2095,6 +2117,7 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
 
     # ════════ VOLATILITY REGIME (PT / TG / TRAIL) ════════
     # PT/TG are now ATR-multiple based (not fixed premium percentages).
+    # Phase 2: Enhanced survivability guard - scale PT/TG in strong ADX sessions
     if atr <= 60:
         regime   = "VERY_LOW"
         pt_mult  = 1.2
@@ -2118,6 +2141,17 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
         return {"valid": False}
+
+    # Phase 2: Strong ADX (>40) survivability guard - scale PT/TG up to ATR × 2.0
+    if adx_val_f > 40:
+        # In strong trending markets, extend targets for better survivability
+        pt_mult = max(pt_mult, 1.8)  # At least 1.8x ATR for PT
+        tg_mult = max(tg_mult, 2.0)  # At least 2.0x ATR for TG
+        regime = regime + "_STRONG_ADX"
+        logging.info(
+            f"[LEVELS][SURVIVABILITY_GUARD] ADX={adx_val_f:.1f} > 40 - "
+            f"scaled PT={pt_mult:.1f}xATR TG={tg_mult:.1f}xATR"
+        )
 
     partial_target = round(entry_price + (pt_mult * atr), 2)
     full_target    = round(entry_price + (tg_mult * atr), 2)
@@ -3028,9 +3062,39 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
 
     atr = pre_atr
 
-    # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
+        # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = paper_info.get("scalp_cooldown_until")
-    if scalp_cd_until and ct < scalp_cd_until:
+    
+    # Initialize Pulse module for scalp entry confirmation
+    pulse = get_pulse_module()
+
+    # ── Pulse Check ───────────────────────────────────────────────
+    tick_rate = pulse.get("tick_rate", 0)
+    burst_flag = pulse.get("burst_flag", False)
+    direction_drift = pulse.get("direction_drift", "NEUTRAL")
+    
+    pulse_passed = False
+    if not burst_flag or tick_rate < PULSE_TICKRATE_THRESHOLD:
+        logging.info(
+            f"[SCALP SKIP][PULSE_FAIL] tick_rate={tick_rate}, drift={direction_drift}"
+        )
+    else:
+        if direction_drift == "UP" and scalp_side != "CALL":
+            logging.info(
+                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+            )
+        elif direction_drift == "DOWN" and scalp_side != "PUT":
+            logging.info(
+                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+            )
+        else:
+            # Pulse check passed - proceed with scalp entry
+            pulse_passed = True
+    
+    if not pulse_passed:
+        logging.info("[SCALP SKIP] Pulse check failed, skipping scalp entry")
+    
+    elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
@@ -3646,7 +3710,37 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
 
     # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = live_info.get("scalp_cooldown_until")
-    if scalp_cd_until and ct < scalp_cd_until:
+    
+    # Initialize Pulse module for scalp entry confirmation
+    pulse = get_pulse_module()
+
+    # ── Pulse Check ───────────────────────────────────────────────
+    tick_rate = pulse.get("tick_rate", 0)
+    burst_flag = pulse.get("burst_flag", False)
+    direction_drift = pulse.get("direction_drift", "NEUTRAL")
+
+    pulse_passed = False
+    if not burst_flag or tick_rate < PULSE_TICKRATE_THRESHOLD:
+        logging.info(
+            f"[SCALP SKIP][PULSE_FAIL] tick_rate={tick_rate}, drift={direction_drift}"
+        )
+    else:
+        if direction_drift == "UP" and scalp_side != "CALL":
+            logging.info(
+                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+            )
+        elif direction_drift == "DOWN" and scalp_side != "PUT":
+            logging.info(
+                f"[SCALP SKIP][PULSE_DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+            )
+        else:
+            # Pulse check passed - proceed with scalp entry
+            pulse_passed = True
+    
+    if not pulse_passed:
+        logging.info("[SCALP SKIP] Pulse check failed, skipping scalp entry")
+    
+    elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
