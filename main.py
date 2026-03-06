@@ -309,6 +309,11 @@ async def main_strategy_code(md: MarketData) -> None:
 
             except Exception as exc:
                 logging.debug(f"[ORDERBOOK/PNL ERROR] {exc}")
+                
+        # ── Pulse Logging (every 30 seconds) ────────────────────────────────
+        if ct.second % 30 == 0:
+            from data_feed import pulse
+            pulse.log_stats()
 
         # ── Strategy ────────────────────────────────────────────────────────
         if MODE != "STRATEGY":

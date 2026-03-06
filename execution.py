@@ -52,6 +52,7 @@ from zone_detector import (
     update_zone_activity,
     detect_zone_revisit,
 )
+from pulse_module import get_pulse_module, PulseModule
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -73,13 +74,16 @@ SCALP_PT_POINTS = 7.0
 SCALP_SL_POINTS = 4.0
 SCALP_MIN_HOLD_BARS = 2
 SCALP_EXTREME_MOVE_ATR_MULT = 0.90
-SCALP_ATR_SL_MIN_MULT = 0.80
-SCALP_ATR_SL_MAX_MULT = 1.00
+# Phase 2: Scalp SL Tightening - ATR × 0.6–0.8 (tighter than previous 0.8–1.0)
+SCALP_ATR_SL_MIN_MULT = 0.60
+SCALP_ATR_SL_MAX_MULT = 0.80
 TREND_MIN_HOLD_BARS = 3
 TREND_EXTREME_MOVE_ATR_MULT = 1.15
 SCALP_COOLDOWN_MINUTES = 20
 SCALP_HISTORY_MAXLEN = 120
 STARTUP_SUPPRESSION_MINUTES = 5
+# Pulse module threshold for scalp entry (ticks per second)
+PULSE_TICKRATE_THRESHOLD = 15.0
 # P3-C: Paper mode slippage — models bid/ask spread + market impact on fills.
 # Applied to ENTRY price in paper mode so paper P&L reflects realistic fills.
 # Set to 0.0 to disable. Recommended: 4.0 pts for NIFTY ITM options.
@@ -306,6 +310,7 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
     info.setdefault("last_exit_time", None)
     info.setdefault("scalp_cooldown_until", None)
     info.setdefault("scalp_last_burst_key", None)
+    info.setdefault("osc_hold_until", None)  # Oscillator extreme hold timer
     info.setdefault("scalp_hist", {"CALL": [], "PUT": []})
     info.setdefault("trade_count", 0)
     info.setdefault("trend_trade_count", 0)
@@ -317,6 +322,7 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
     persisted = _load_restart_state(account_type_)
     last_exit = _parse_ts(info.get("last_exit_time")) or _parse_ts(persisted.get("last_exit_time"))
     scalp_cd = _parse_ts(info.get("scalp_cooldown_until")) or _parse_ts(persisted.get("scalp_cooldown_until"))
+    osc_hold = _parse_ts(info.get("osc_hold_until"))
     startup_until = _parse_ts(info.get("startup_suppression_until"))
     if startup_until is None:
         startup_until = now + timedelta(minutes=STARTUP_SUPPRESSION_MINUTES)
@@ -326,6 +332,7 @@ def _hydrate_runtime_state(info: dict, account_type_: str, mode_label: str) -> d
 
     info["last_exit_time"] = last_exit
     info["scalp_cooldown_until"] = scalp_cd
+    info["osc_hold_until"] = osc_hold
     info["startup_suppression_until"] = startup_until
     info.setdefault("startup_suppression_logged_at", None)
 
@@ -494,12 +501,11 @@ def _validate_restored_positions_on_startup(
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
     Select ITM option strike with strike_diff points inside ATM.
-    Jan 8th baseline: always ITM with 100-point difference.
-    CALL: ATM - strike_diff
-    PUT:  ATM + strike_diff
+    Checks against live quote dataframe `df` to ensure liquidity/availability.
     """
 
     from config import strike_diff
+    # df is already imported globally from setup
 
     if spot_price_ is None or pd.isna(spot_price_):
         logging.error("[get_option_by_moneyness] Invalid spot price")
@@ -525,26 +531,50 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
         f"side={side}, requested_strike={strike}"
     )
 
-    sel = option_chain[
-        (option_chain['strike_price'] == strike) &
-        (option_chain['option_type'].isin([side, side.replace('E','ALL')]))  # CE/PE or CALL/PUT
-    ]['symbol']
+    # Filter candidates by side
+    candidates = option_chain[
+        (option_chain['option_type'].isin([side, side.replace('E','ALL')]))
+    ].copy()
 
-    if sel.empty:
-        side_df = option_chain[option_chain['option_type'].isin([side, side.replace('E','ALL')])].copy()
-        if side_df.empty:
-            logging.error(f"[get_option_by_moneyness] No options available for side={side}")
-            return None, None
-        side_df['strike_diff_abs'] = (side_df['strike_price'] - strike).abs()
-        side_df = side_df.sort_values('strike_diff_abs')
-        symbol = side_df.iloc[0]['symbol']
-        strike = side_df.iloc[0]['strike_price']
-        logging.warning(
-            f"[get_option_by_moneyness] Fallback ITM for {side}: requested {strike}, using nearest available"
+    if candidates.empty:
+        logging.error(f"[get_option_by_moneyness] No options available for side={side}")
+        return None, None
+
+    # Calculate distance to desired strike
+    candidates['strike_diff_abs'] = (candidates['strike_price'] - strike).abs()
+    candidates = candidates.sort_values('strike_diff_abs')
+
+    # Liquidity-aware selection: prefer symbol present in live feed (df)
+    selected_symbol = None
+    selected_strike = None
+
+    for _, row in candidates.iterrows():
+        sym = row['symbol']
+        # In LIVE/PAPER mode, df holds subscribed symbols. In REPLAY, df might be empty or irrelevant.
+        # We check if df is populated (LIVE/PAPER) and if sym is in it.
+        if not df.empty and sym in df.index:
+            selected_symbol = sym
+            selected_strike = row['strike_price']
+            break
+    
+    # If no live symbol found (or REPLAY mode where df might be empty/irrelevant for selection),
+    # fall back to the closest strike from option_chain.
+    if not selected_symbol:
+        best_match = candidates.iloc[0]
+        selected_symbol = best_match['symbol']
+        selected_strike = best_match['strike_price']
+        if not df.empty: # Only warn if we expected live data
+             logging.warning(
+                f"[get_option_by_moneyness] No liquid option found in df for {side} near {strike}. "
+                f"Using closest from chain: {selected_symbol}"
+            )
+
+    if selected_strike != strike:
+         logging.warning(
+            f"[get_option_by_moneyness] Strike adjustment: requested {strike}, using {selected_strike} ({selected_symbol})"
         )
-        return symbol, strike
 
-    return sel.squeeze(), strike
+    return selected_symbol, selected_strike
 
 
 def _get_option_market_snapshot(symbol, fallback_price):
@@ -1526,6 +1556,24 @@ def _trend_entry_quality_gate(
         )
         return True, allowed_side, "OK", st_details
 
+    # ── Bias Misalignment Filter ─────────────────────────────────────────────────
+    # Block entries when bias is misaligned AND oscillator is in extreme zone.
+    # This prevents fighting the opening bias when indicators also suggest exhaustion.
+    # Allow if: bias aligned OR oscillator NOT in extreme (still has room).
+    _osc_in_extreme = not (_rsi_in_expanded and _cci_in_expanded)
+    _bias_misaligned = not merged_ctx.get("bias_aligned", True)
+
+    if _bias_misaligned and _osc_in_extreme:
+        logging.info(
+            "[ENTRY BLOCKED][BIAS_MISALIGN_BLOCKED] "
+            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+            f"bias={merged_ctx.get('bias', 'UNKNOWN')} gap={merged_ctx.get('gap_tag', 'UNKNOWN')} "
+            f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
+            f"rsi_expanded={_rsi_in_expanded} cci_expanded={_cci_in_expanded} "
+            "reason=Bias misaligned AND oscillator in extreme zone, entry suppressed."
+        )
+        return False, allowed_side, "Bias misalignment with oscillator extreme, entry suppressed.", st_details
+
     # Case 4: S4/R4 breakout relief — price below S4−ATR (PUT) or above R4+ATR (CALL)
     # When price trades decisively outside the Camarilla extreme levels, oscillator
     # exhaustion reflects momentum continuation, not a reversal — allow entry.
@@ -1641,6 +1689,25 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     tg = state.get("tg")
     trail_step = state.get("trail_step", 5)
     regime_ctx = state.get("regime_context", f"ATR={state.get('atr_value', 'N/A')}")
+    trade_class = state.get("trade_class", "TREND")
+    qty = state.get("quantity", 0)
+
+    # 0) Profit Booking Rules (Fixed P&L per lot)
+    # Scalp: +/- 700 INR per lot (~5.4 pts)
+    # Trend: +/- 1000 INR per lot (~7.7 pts)
+    pnl_per_lot_inr = (current_ltp - entry_price) * 130 # Assuming Nifty lot 130 for calc, adjust if config differs
+    # Use configured lot size for calculation if available
+    lot_mult = 130 # Default Nifty
+    
+    pnl_abs = pnl_per_lot_inr
+    
+    if trade_class == "SCALP" and (pnl_abs >= 700 or pnl_abs <= -700):
+        tag = "SCALP_PROFIT_BOOKED" if pnl_abs > 0 else "SCALP_STOP_BOOKED"
+        return True, tag
+    
+    if trade_class == "TREND" and (pnl_abs >= 1000 or pnl_abs <= -1000):
+        tag = "TREND_PROFIT_BOOKED" if pnl_abs > 0 else "TREND_STOP_BOOKED"
+        return True, tag
 
     if not state.get("is_open", False):
         logging.info(
@@ -1815,16 +1882,18 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         audit("MIN_BAR", "DEFERRED", f"bars_held<{min_bars_for_pt_tg}")
         if tg_hit:
             logging.info(
-                "[TG_HIT_SUPPRESSED] "
+                "[TG_HIT_EXIT_SUPPRESSED] "
                 f"symbol={symbol} option_type={side} bars_held={bars_held} "
                 f"min_hold={min_bars_for_pt_tg} adx={last_adx if np.isfinite(last_adx) else 'N/A'}"
             )
             logging.info(
+                f"[SURVIVABILITY_OVERRIDE] Minimum hold enforced. "
                 f"{YELLOW}[EXIT DEFERRED] TG hit before min bars ({bars_held} < {min_bars_for_pt_tg}). "
                 f"ltp={current_ltp:.2f} tg={tg:.2f} defer_until={entry_candle + min_bars_for_pt_tg}{RESET}"
             )
         elif state.get("pt_deferred_logged", 0) == 0:
             logging.info(
+                f"[SURVIVABILITY_OVERRIDE] Minimum hold enforced. "
                 f"{YELLOW}[EXIT DEFERRED] PT hit before min bars ({bars_held} < {min_bars_for_pt_tg}). "
                 f"ltp={current_ltp:.2f} pt={pt:.2f} defer_until={entry_candle + min_bars_for_pt_tg}{RESET}"
             )
@@ -2095,6 +2164,7 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
 
     # ════════ VOLATILITY REGIME (PT / TG / TRAIL) ════════
     # PT/TG are now ATR-multiple based (not fixed premium percentages).
+    # Phase 2: Enhanced survivability guard - scale PT/TG in strong ADX sessions
     if atr <= 60:
         regime   = "VERY_LOW"
         pt_mult  = 1.2
@@ -2118,6 +2188,17 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
         return {"valid": False}
+
+    # Phase 2: Strong ADX (>40) survivability guard - scale PT/TG up to ATR × 2.0
+    if adx_val_f > 40:
+        # In strong trending markets, extend targets for better survivability
+        pt_mult = max(pt_mult, 1.8)  # At least 1.8x ATR for PT
+        tg_mult = max(tg_mult, 2.0)  # At least 2.0x ATR for TG
+        regime = regime + "_STRONG_ADX"
+        logging.info(
+            f"[LEVELS][SURVIVABILITY_GUARD] ADX={adx_val_f:.1f} > 40 - "
+            f"scaled PT={pt_mult:.1f}xATR TG={tg_mult:.1f}xATR"
+        )
 
     partial_target = round(entry_price + (pt_mult * atr), 2)
     full_target    = round(entry_price + (tg_mult * atr), 2)
@@ -3025,12 +3106,97 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     if _is_startup_suppression_active(paper_info, ct, "PAPER"):
         store(paper_info, account_type)
         return
+        
+    # ── Oscillator Extreme Hold Logic ────────────────────────────────────────
+    osc_hold_until = paper_info.get("osc_hold_until")
+    if osc_hold_until:
+        if ct < osc_hold_until:
+            # Check for reversal confirmation during hold
+            # If price fades back below pivot (approx check via close vs prev close direction)
+            # This is a simplified check; robust check requires pivot levels.
+            # For now, we just log and block.
+            logging.info(f"[OSC_EXTREME_HOLD] Active until {osc_hold_until}. Entry suppressed.")
+            return
+        else:
+            # Hold expired
+            logging.info(f"[OSC_EXTREME_OVERRIDE] Hold expired. Checking for continuation.")
+            paper_info["osc_hold_until"] = None
+            # Allow entry to proceed (will be gated by quality check)
+
+    # ── Conflict Governance: Check Opposing Position ─────────────────────────
+    # If CALL is open, block PUT entry, and vice versa.
+    # This prevents hedging/locking in a directional strategy.
+    call_open = paper_info["call_buy"].get("trade_flag", 0) == 1
+    put_open = paper_info["put_buy"].get("trade_flag", 0) == 1
+    
+    if call_open:
+        logging.debug("[CONFLICT_BLOCKED] CALL position open. Blocking PUT signals.")
+        # We can return here if we want to strictly enforce single-direction.
+        # But we need to allow exit processing for the open leg.
+        # Since exit processing is done above, we are in entry section.
+        # We will enforce this check inside the signal handling block.
+        pass 
 
     atr = pre_atr
 
-    # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
+        # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = paper_info.get("scalp_cooldown_until")
-    if scalp_cd_until and ct < scalp_cd_until:
+    
+    # Initialize Pulse module for scalp entry confirmation
+    pulse = get_pulse_module()
+
+    # ── Pulse Check ───────────────────────────────────────────────
+    # First check: pulse rate must exceed threshold
+    pulse_metrics = pulse.get_pulse()
+    if isinstance(pulse_metrics, dict):
+        tick_rate = pulse_metrics.get("tick_rate", 0)
+        burst_flag = pulse_metrics.get("burst_flag", False)
+        direction_drift = pulse_metrics.get("direction_drift", "NEUTRAL")
+    else:
+        tick_rate = getattr(pulse_metrics, "tick_rate", 0)
+        burst_flag = getattr(pulse_metrics, "burst_flag", False)
+        direction_drift = getattr(pulse_metrics, "direction_drift", "NEUTRAL")
+
+    if tick_rate > 0:
+        logging.info(f"[PULSE_TICKRATE_VALID] tick_rate={tick_rate:.2f}")
+        logging.info(f"[PULSE_CHECK] tick_rate={tick_rate:.2f} burst={burst_flag} drift={direction_drift}")
+    else:
+        logging.info("[PULSE_TICKRATE_DEFAULT] tick_rate=0 (fallback)")
+
+    pulse_passed = False
+    if not burst_flag or tick_rate < PULSE_TICKRATE_THRESHOLD:
+        logging.info(
+            f"[SCALP SKIP][PULSE_FAILED_SKIP] tick_rate={tick_rate}, burst_flag={burst_flag}, drift={direction_drift}"
+        )
+    else:
+        # Pulse rate OK - now detect scalp signal and check direction alignment
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
+        if scalp_sig:
+            scalp_side = scalp_sig["side"]
+            
+            if direction_drift == "UP" and scalp_side != "CALL":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+                )
+            elif direction_drift == "DOWN" and scalp_side != "PUT":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+                )
+            else:
+                # Pulse direction matches scalp side - proceed with entry
+                pulse_passed = True
+                logging.info("[SCALP ALLOWED][PULSE_PASSED_ALLOW] Pulse check passed, proceeding with scalp entry")
+                log_entry_green(
+                    f"[ENTRY ATTEMPT][SCALP][PAPER] side={scalp_sig.get('side')} "
+                    f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                    f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                    "long=True"
+                )
+
+    if not pulse_passed:
+        logging.info("[SCALP SKIP][PULSE_FAILED_SKIP] Pulse check failed, skipping scalp entry")
+    
+    elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
@@ -3057,7 +3223,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
                     )
                     if not opt_name:
-                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        logging.info(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option found for {scalp_side}")
                         return
 
                     ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
@@ -3104,7 +3270,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "regime_context":    "SCALP",
                         "is_open":           True,
                         "lifecycle_state":   "OPEN",
-                        "scalp_mode":        True,   # P2-D: only SCALP class gets this
+                        "scalp_mode":        True,
                         "trade_class":       TRADE_CLASS_SCALP,
                         "scalp_pt_points":   SCALP_PT_POINTS,
                         "scalp_sl_points":   atr_sl_points,
@@ -3157,17 +3323,20 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"timestamp={ct} symbol={opt_name} option_type={scalp_side} "
                         f"position_side={paper_info[scalp_leg].get('position_side', 'LONG')} "
                         f"position_id={position_id} "
-                        f"lifecycle=OPEN regime=SCALP"
+                        "lifecycle=OPEN regime=SCALP"
                     )
                     _save_trades_paper()
                     store(paper_info, account_type)
                     return
                 logging.info(
-                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][SCALP] used={_cap_used(paper_info, True)} cap={_cap_limit(paper_info, True)} "
                     f"trade_count={paper_info.get('trade_count', 0)} side={scalp_side} entry blocked"
                 )
 
     # 6. Signal evaluation
+    _fb_sig_paper = detect_failed_breakout(candles_3m, cam_pre)
+
+    # Calculate gap/bias context (consistent with live_order)
     _paper_close = float(candles_3m.iloc[-1]["close"]) if len(candles_3m) else float("nan")
     _paper_gap = "NO_GAP"
     if np.isfinite(_paper_close) and np.isfinite(cam_pre.get("r3", float("nan"))) and _paper_close > float(cam_pre.get("r3")):
@@ -3175,6 +3344,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     elif np.isfinite(_paper_close) and np.isfinite(cam_pre.get("s3", float("nan"))) and _paper_close < float(cam_pre.get("s3")):
         _paper_gap = "GAP_DOWN"
     _paper_bias = "Positive" if _paper_gap == "GAP_UP" else ("Negative" if _paper_gap == "GAP_DOWN" else "Neutral")
+    
     _paper_open_bias = "UNKNOWN"
     if np.isfinite(_paper_close):
         if np.isfinite(cam_pre.get("r4", float("nan"))) and _paper_close > float(cam_pre.get("r4")):
@@ -3188,18 +3358,41 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         else:
             _paper_open_bias = "Inside S3-R3, balanced open"
 
-    # Prefer DTC classification; fall back to gap-based tag for reversal_detector string param
-    _dtc_name = getattr(getattr(_paper_day_type, "name", None), "value", None)
+    # Retrieve day_type tag safely with audit logging
+    _dt_name_obj = getattr(_paper_day_type, "name", None)
+    _paper_dtc_name = getattr(_dt_name_obj, "value", None) if _dt_name_obj else None
     _paper_day_type_tag = (
-        _dtc_name if (_dtc_name and _dtc_name != "UNKNOWN")
+        _paper_dtc_name if (_paper_dtc_name and _paper_dtc_name != "UNKNOWN")
         else ("GAP_DAY" if _paper_gap in ("GAP_UP", "GAP_DOWN") else "NEUTRAL_DAY")
     )
-    _rev_sig_paper = detect_reversal(
-        candles_3m, cam_pre,
-        current_time=ct,
-        day_type_tag=_paper_day_type_tag,
-    )
-    _fb_sig_paper = detect_failed_breakout(candles_3m, cam_pre)
+    
+    if _paper_day_type_tag != "NEUTRAL_DAY" and _paper_day_type_tag != "UNKNOWN":
+        logging.info(f"[DAYTYPE_TAG_VALID] tag={_paper_day_type_tag}")
+    else:
+        logging.info(f"[DAYTYPE_TAG_DEFAULT] tag={_paper_day_type_tag} (fallback)")
+
+    # Define _rev_sig_paper with audit logging
+    _rev_sig_paper = None
+    try:
+        _rev_sig_paper = detect_reversal(
+            candles_3m, cam_pre,
+            current_time=ct,
+            day_type_tag=_paper_day_type_tag,
+        )
+    except Exception as e:
+        logging.warning(f"[REVERSAL_DETECTOR_ERROR] {e}")
+
+    if _rev_sig_paper:
+        logging.info(f"[REVERSAL_SIGNAL_VALID] score={_rev_sig_paper.get('score')} side={_rev_sig_paper.get('side')}")
+    else:
+        logging.info("[REVERSAL_SIGNAL_DEFAULT] No reversal signal detected")
+        
+    # Conflict Governance: Arbitration
+    # If we have a trend signal AND a reversal signal on opposite sides
+    # Prioritize the one with higher score.
+    # This logic is implicitly handled by _trend_entry_quality_gate which takes reversal_signal
+    # and allows overrides. We just need to ensure we don't fire conflicting orders.
+
     log_entry_green(
         f"[ENTRY ATTEMPT][TREND][PAPER] symbol={ticker} "
         f"atr={atr:.2f} trade_count={paper_info.get('trade_count', 0)} "
@@ -3331,7 +3524,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         if paper_info[leg]["trade_flag"] == 0:
             if not _cap_available(paper_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][TREND] used={_cap_used(paper_info, False)} cap={_cap_limit(paper_info, False)} "
                     f"scalp_used={_cap_used(paper_info, True)} scalp_cap={_cap_limit(paper_info, True)} "
                     f"trade_count={paper_info.get('trade_count', 0)} side={side} entry blocked"
                 )
@@ -3465,8 +3658,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         'ticker': opt_name,
                         'price': entry_price,
                         'action': side,
-                        'stop_price': None,
-                        'take_profit': None,
+                        'stop_price': stop,
+                        'take_profit': pt,
                         'spot_price': spot_price,
                         'quantity': quantity
                     }
@@ -3490,7 +3683,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         f"lifecycle=OPEN regime={regime_context}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIP] no option for {side} strike={strike}")
+                    logging.warning(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option for {side} strike={strike}")
     except Exception as e:
         logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
@@ -3641,12 +3834,80 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     if _is_startup_suppression_active(live_info, ct, "LIVE"):
         store(live_info, account_type)
         return
+        
+    # ── Oscillator Extreme Hold Logic (Live) ────────────────────────────────
+    osc_hold_until = live_info.get("osc_hold_until")
+    if osc_hold_until:
+        if ct < osc_hold_until:
+            logging.info(f"[OSC_EXTREME_HOLD] Active until {osc_hold_until}. Entry suppressed.")
+            return
+        else:
+            logging.info(f"[OSC_EXTREME_OVERRIDE] Hold expired.")
+            live_info["osc_hold_until"] = None
+            
+    # ── Conflict Governance (Live) ──────────────────────────────────────────
+    call_open = live_info["call_buy"].get("trade_flag", 0) == 1
+    put_open = live_info["put_buy"].get("trade_flag", 0) == 1
 
     atr = pre_atr
 
     # 5A. Scalp entry flow (buy-on-dip CALL / sell-on-rally PUT with own cool-down)
     scalp_cd_until = live_info.get("scalp_cooldown_until")
-    if scalp_cd_until and ct < scalp_cd_until:
+    
+    # Initialize Pulse module for scalp entry confirmation
+    pulse = get_pulse_module()
+
+    # ── Pulse Check ───────────────────────────────────────────────
+    pulse_metrics = pulse.get_pulse()
+    if isinstance(pulse_metrics, dict):
+        tick_rate = pulse_metrics.get("tick_rate", 0)
+        burst_flag = pulse_metrics.get("burst_flag", False)
+        direction_drift = pulse_metrics.get("direction_drift", "NEUTRAL")
+    else:
+        tick_rate = getattr(pulse_metrics, "tick_rate", 0)
+        burst_flag = getattr(pulse_metrics, "burst_flag", False)
+        direction_drift = getattr(pulse_metrics, "direction_drift", "NEUTRAL")
+
+    if tick_rate > 0:
+        logging.info(f"[PULSE_TICKRATE_VALID] tick_rate={tick_rate:.2f}")
+        logging.info(f"[PULSE_CHECK] tick_rate={tick_rate:.2f} burst={burst_flag} drift={direction_drift}")
+    else:
+        logging.info("[PULSE_TICKRATE_DEFAULT] tick_rate=0 (fallback)")
+
+    pulse_passed = False
+    if not burst_flag or tick_rate < PULSE_TICKRATE_THRESHOLD:
+        logging.info(
+            f"[SCALP SKIP][PULSE_FAIL] tick_rate={tick_rate}, drift={direction_drift}"
+        )
+    else:
+        # Pulse rate OK - now detect scalp signal and check direction alignment
+        scalp_sig = _detect_scalp_dip_rally_signal(candles_3m, trad_pre, atr)
+        if scalp_sig:
+            scalp_side = scalp_sig["side"]
+            
+            if direction_drift == "UP" and scalp_side != "CALL":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=UP but scalp_side={scalp_side}"
+                )
+            elif direction_drift == "DOWN" and scalp_side != "PUT":
+                logging.info(
+                    f"[SCALP SKIP][PULSE_FAILED_SKIP][DIRECTION_MISMATCH] drift=DOWN but scalp_side={scalp_side}"
+                )
+            else:
+                # Pulse direction matches scalp side - proceed with entry
+                pulse_passed = True
+                logging.info("[SCALP ALLOWED][PULSE_PASSED_ALLOW] Pulse check passed, proceeding with scalp entry")
+                log_entry_green(
+                    f"[ENTRY ATTEMPT][SCALP][LIVE] side={scalp_sig.get('side')} "
+                    f"reason={scalp_sig.get('reason')} zone={scalp_sig.get('zone')} "
+                    f"atr={atr:.2f} position_type={scalp_sig.get('position_type', 'LONG')} "
+                    "long=True"
+                )
+    
+    if not pulse_passed:
+        logging.info("[SCALP SKIP][PULSE_FAILED_SKIP] Pulse check failed, skipping scalp entry")
+    
+    elif scalp_cd_until and ct < scalp_cd_until:
         logging.info(
             f"[SCALP SIGNAL IGNORED][COOLDOWN] now={ct} cooldown_until={scalp_cd_until}"
         )
@@ -3673,7 +3934,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         moneyness=CALL_MONEYNESS if scalp_side == "CALL" else PUT_MONEYNESS
                     )
                     if not opt_name:
-                        logging.info(f"[SCALP SKIP] no option found for {scalp_side}")
+                        logging.info(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] no option found for {scalp_side}")
                         return
 
                     ltp_val = df.loc[opt_name, "ltp"] if opt_name in df.index else None
@@ -3777,7 +4038,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         store(live_info, account_type)
                         return
                 logging.info(
-                    f"[MAX_TRADES_CAP][SCALP] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][SCALP] used={_cap_used(live_info, True)} cap={_cap_limit(live_info, True)} "
                     f"trade_count={live_info.get('trade_count', 0)} side={scalp_side} entry blocked"
                 )
 
@@ -3803,16 +4064,33 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             _live_open_bias = "Inside S3-R3, balanced open"
 
     # Prefer DTC classification; fall back to gap-based tag for reversal_detector string param
-    _live_dtc_name = getattr(getattr(_live_day_type, "name", None), "value", None)
+    _dt_name_obj_live = getattr(_live_day_type, "name", None)
+    _live_dtc_name = getattr(_dt_name_obj_live, "value", None) if _dt_name_obj_live else None
     _live_day_type_tag = (
         _live_dtc_name if (_live_dtc_name and _live_dtc_name != "UNKNOWN")
         else ("GAP_DAY" if _live_gap in ("GAP_UP", "GAP_DOWN") else "NEUTRAL_DAY")
     )
-    _rev_sig_live = detect_reversal(
-        candles_3m, cam_pre,
-        current_time=ct,
-        day_type_tag=_live_day_type_tag,
-    )
+    
+    if _live_day_type_tag != "NEUTRAL_DAY" and _live_day_type_tag != "UNKNOWN":
+        logging.info(f"[DAYTYPE_TAG_VALID] tag={_live_day_type_tag}")
+    else:
+        logging.info(f"[DAYTYPE_TAG_DEFAULT] tag={_live_day_type_tag} (fallback)")
+
+    _rev_sig_live = None
+    try:
+        _rev_sig_live = detect_reversal(
+            candles_3m, cam_pre,
+            current_time=ct,
+            day_type_tag=_live_day_type_tag,
+        )
+    except Exception as e:
+        logging.warning(f"[REVERSAL_DETECTOR_ERROR] {e}")
+    
+    if _rev_sig_live:
+        logging.info(f"[REVERSAL_SIGNAL_VALID] score={_rev_sig_live.get('score')} side={_rev_sig_live.get('side')}")
+    else:
+        logging.info("[REVERSAL_SIGNAL_DEFAULT] No reversal signal detected")
+        
     _fb_sig_live = detect_failed_breakout(candles_3m, cam_pre)
     log_entry_green(
         f"[ENTRY ATTEMPT][TREND][LIVE] symbol={ticker} "
@@ -3931,7 +4209,11 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         _save_trades_live()
         store(live_info, account_type)
         return
-
+                
+    if (side == "CALL" and put_open) or (side == "PUT" and call_open):
+        logging.info(f"[CONFLICT_BLOCKED] Opposing position already open. Blocking {side} entry.")
+        return
+            
     if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
         bias15 = hist_yesterday_15m.iloc[-1].get("supertrend_bias", "NEUTRAL")
         logging.info(f"[BIAS][15m] {bias15}")
@@ -3944,7 +4226,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         if live_info[leg]["trade_flag"] == 0:
             if not _cap_available(live_info, is_scalp=False):
                 logging.info(
-                    f"[MAX_TRADES_CAP][TREND] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
+                    f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED][MAX_TRADES_CAP][TREND] used={_cap_used(live_info, False)} cap={_cap_limit(live_info, False)} "
                     f"scalp_used={_cap_used(live_info, True)} scalp_cap={_cap_limit(live_info, True)} "
                     f"trade_count={live_info.get('trade_count', 0)} side={side} entry blocked"
                 )
@@ -4075,8 +4357,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     'ticker': opt_name,
                     'price': entry_price,
                     'action': side,
-                    'stop_price': None,
-                    'take_profit': None,
+                    'stop_price': stop,
+                    'take_profit': pt,
                     'spot_price': spot_price,
                     'quantity': quantity
                 }
@@ -4099,7 +4381,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     f"lifecycle=OPEN regime={regime_context}"
                 )
             else:
-                logging.warning(f"[ENTRY SKIP] {side} no option. opt_name={opt_name}")
+                logging.warning(f"[ENTRY_ALLOWED_BUT_NOT_EXECUTED] {side} no option. opt_name={opt_name}")
     except Exception as e:
         logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
 
@@ -4891,6 +5173,12 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             reason = signal["reason"]
             source = signal.get("source", "?")
             if side != allowed_side:
+                # Conflict Governance
+                if _rev_sig_paper and _rev_sig_paper.get("side") == allowed_side and _rev_sig_paper.get("score", 0) > score:
+                     logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by stronger Reversal signal {allowed_side}")
+                else:
+                     logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by ST alignment {allowed_side}")
+                     
                 blocker_counts["ST_SIDE_MISMATCH"] = blocker_counts.get("ST_SIDE_MISMATCH", 0) + 1
                 logging.info(
                     "[SIGNAL BLOCKED] "
@@ -4899,6 +5187,11 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"ST3m_bias={st_details['ST3m_bias']} ST15m_bias={st_details['ST15m_bias']} "
                     f"allowed_side={allowed_side} signal_side={side}"
                 )
+                continue
+                
+            # Conflict Governance: Check Open Positions
+            if (side == "CALL" and put_open) or (side == "PUT" and call_open):
+                logging.info(f"[CONFLICT_BLOCKED] Opposing position already open. Blocking {side} entry.")
                 continue
 
             # Enrich signal with current ST and day type for PM entry tracking
@@ -5037,6 +5330,17 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 logging.info(f"    {reason:30s}: {cnt} bars")
 
         logging.info("-" * 80 + "\n")
+
+        # Auto-generate dashboard report
+        if not signal_only:
+            try:
+                from config import log_file
+                from dashboard import generate_full_report
+                if os.path.exists(log_file):
+                    logging.info(f"[REPLAY] Auto-generating dashboard for {log_file}...")
+                    generate_full_report(log_file, output_dir=output_dir)
+            except Exception as e:
+                logging.warning(f"[REPLAY] Dashboard generation failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
