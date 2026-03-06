@@ -367,7 +367,7 @@ _PM_MAX_HOLD: Dict[DayType, Optional[int]] = {
 }
 
 # Minimum bars before classification is attempted
-_MIN_BARS_FOR_CLASSIFICATION = 15    # 45 minutes of 3m data
+_MIN_BARS_FOR_CLASSIFICATION = 5    # 15 minutes of 3m data (allows 09:30 classification)
 
 
 class DayTypeClassifier:
