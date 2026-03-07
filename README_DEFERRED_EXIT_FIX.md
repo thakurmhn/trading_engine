@@ -55,7 +55,7 @@ check_exit_condition(df_slice, state, option_price=current_option_price)
 **Fixed:** All logs consistently show option price (248.85) → CONSISTENT AUDIT TRAIL
 
 ---
-
+pip
 ## VALIDATED ✅
 
 - ✅ Syntax: No Python errors

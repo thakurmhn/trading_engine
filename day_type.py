@@ -367,7 +367,7 @@ _PM_MAX_HOLD: Dict[DayType, Optional[int]] = {
 }
 
 # Minimum bars before classification is attempted
-_MIN_BARS_FOR_CLASSIFICATION = 15    # 45 minutes of 3m data
+_MIN_BARS_FOR_CLASSIFICATION = 5    # 15 minutes of 3m data (allows 09:30 classification)
 
 
 class DayTypeClassifier:
@@ -632,7 +632,7 @@ def apply_day_type_to_pm(
         old = pm.TRAIL_STEP
         pm.TRAIL_STEP = day_type_result.pm_trail_step
         logging.info(
-            f"{CYAN}[PM DAY TYPE] TRAIL_STEP {old:.2f}→{pm.TRAIL_STEP:.2f} "
+            f"{CYAN}[PM DAY TYPE] TRAIL_STEP {old:.2f}->{pm.TRAIL_STEP:.2f} "
             f"({day_type_result.name.value}){RESET}"
         )
 
@@ -640,7 +640,7 @@ def apply_day_type_to_pm(
         old = pm.MAX_HOLD
         pm.MAX_HOLD = day_type_result.pm_max_hold
         logging.info(
-            f"{CYAN}[PM DAY TYPE] MAX_HOLD {old}→{pm.MAX_HOLD} bars "
+            f"{CYAN}[PM DAY TYPE] MAX_HOLD {old}->{pm.MAX_HOLD} bars "
             f"({day_type_result.name.value}){RESET}"
         )
 

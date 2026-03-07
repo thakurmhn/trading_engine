@@ -307,18 +307,26 @@ def detect_orb_signal(last, atr, orb_high, orb_low, call_ok, put_ok,
                       current_time=None):
     """
     Opening range breakout entry.
-    Only valid before 11:30 IST — after that the opening range is stale.
+    Only valid before 11:45 IST — after that the opening range is stale.
     Fire CALL when close breaks above ORB high with confirmation.
     Fire PUT when close breaks below ORB low with confirmation.
     """
     if orb_high is None or orb_low is None or atr is None:
         return None
 
-    # Time gate: ORB only meaningful in first 2 hours of session
+    # Time gate: ORB remains active until 11:45 IST.
     if current_time is not None:
         t = current_time.hour * 60 + current_time.minute
-        if t >= 11 * 60 + 30:   # after 11:30 → stale, skip
+        if t >= 11 * 60 + 45:
+            logging.info(
+                f"[ORB_EXPIRED] time={current_time.hour:02d}:{current_time.minute:02d} "
+                "window_end=11:45"
+            )
             return None
+        logging.info(
+            f"[ORB_ACTIVE] time={current_time.hour:02d}:{current_time.minute:02d} "
+            "window_end=11:45"
+        )
 
     close = float(last.close)
     if call_ok and close > orb_high + 0.01 * atr:
@@ -436,7 +444,10 @@ def detect_signal(candles_3m, candles_15m,
                   vwap=None,          # pass VWAP from paper_order / live_order
                   orb_high=None,      # opening range high
                   orb_low=None,       # opening range low
-                  day_type_result=None):  # NEW: DayTypeResult for threshold modifier
+                  day_type_result=None,  # NEW: DayTypeResult for threshold modifier
+                  osc_relief_active=False,  # NEW: S4/R4 relief override from gate
+                  zone_signal=None,      # Phase 4A: zone_detector output
+                  pulse_metrics=None):   # Phase 4B: pulse_module metrics dict
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -600,6 +611,9 @@ def detect_signal(candles_3m, candles_15m,
         pivot_signal=pivot_signal,
         current_time=current_time,
         day_type_result=day_type_result,
+        osc_relief_active=osc_relief_active,
+        zone_signal=zone_signal,
+        pulse_metrics=pulse_metrics,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────
