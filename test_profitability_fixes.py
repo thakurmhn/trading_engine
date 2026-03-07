@@ -2344,52 +2344,52 @@ class TestATRScaledSLTuning(unittest.TestCase):
     # ── Tier detection ────────────────────────────────────────────────────────
 
     def test_atr_default_no_expansion(self):
-        """ATR at MA level → ATR_DEFAULT → sl_mult unchanged (ADX_DEFAULT=2.0)."""
+        """ATR at MA level → ATR_DEFAULT → sl_mult unchanged (ADX_DEFAULT=1.2, v4)."""
         current_atr = self._BASE_ATR_MA          # exactly at MA, well below 1.3×
         result = self._call_levels(current_atr, adx_value=25.0)
         self.assertTrue(result.get("valid"), "build_dynamic_levels must return valid=True")
         self.assertEqual(result.get("sl_atr_tier"), "ATR_DEFAULT")
-        self.assertAlmostEqual(result.get("sl_mult"), 2.0, places=3,
+        self.assertAlmostEqual(result.get("sl_mult"), 1.2, places=3,
                                msg="sl_mult must be unchanged at ADX_DEFAULT + ATR_DEFAULT")
 
     def test_atr_elevated_expands_sl_mult(self):
-        """ATR = 1.4× MA → ATR_ELEVATED → sl_mult = ADX_DEFAULT × 1.35 = 2.7 (P6-E)."""
-        current_atr = round(self._BASE_ATR_MA * 1.4, 4)   # 9.8 pts  (> 1.3× but ≤ 1.5×)
+        """ATR = 1.4x MA -> ATR_ELEVATED -> sl_mult = ADX_DEFAULT(1.2) x 1.35 = 1.62, capped at 2.0 (v4)."""
+        current_atr = round(self._BASE_ATR_MA * 1.4, 4)   # 9.8 pts  (> 1.3x but <= 1.5x)
         result = self._call_levels(current_atr, adx_value=25.0)
         self.assertTrue(result.get("valid"))
         self.assertEqual(result.get("sl_atr_tier"), "ATR_ELEVATED")
-        expected_mult = round(min(2.0 * 1.35, 3.5), 3)    # 2.7
+        expected_mult = round(min(1.2 * 1.35, 2.0), 3)    # 1.62
         self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
                                msg=f"sl_mult must be {expected_mult} for ATR_ELEVATED+ADX_DEFAULT")
 
     def test_atr_high_expands_sl_mult(self):
-        """ATR = 1.6× MA → ATR_HIGH → sl_mult = ADX_DEFAULT × 1.75 = 3.5 (P6-E, capped)."""
-        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # 11.2 pts  (> 1.5×)
+        """ATR = 1.6x MA -> ATR_HIGH -> sl_mult = ADX_DEFAULT(1.2) x 1.75 = 2.1, capped at 2.0 (v4)."""
+        current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # 11.2 pts  (> 1.5x)
         result = self._call_levels(current_atr, adx_value=25.0)
         self.assertTrue(result.get("valid"))
         self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
-        expected_mult = round(min(2.0 * 1.75, 3.5), 3)    # 3.5
+        expected_mult = round(min(1.2 * 1.75, 2.0), 3)    # 2.0 (capped)
         self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
                                msg=f"sl_mult must be {expected_mult} for ATR_HIGH+ADX_DEFAULT")
 
     def test_atr_high_adx_weak_expands_sl_mult(self):
-        """ADX_WEAK_20 (sl_mult=1.2) + ATR_HIGH (×1.75 P6-E) → 2.1, not capped."""
+        """ADX_WEAK_20 (sl_mult=0.8, v4) + ATR_HIGH (x1.75) -> 1.4, not capped."""
         current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # ATR_HIGH
-        result = self._call_levels(current_atr, adx_value=15.0)  # ADX < 20 → WEAK
+        result = self._call_levels(current_atr, adx_value=15.0)  # ADX < 20 -> WEAK
         self.assertTrue(result.get("valid"))
         self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
-        expected_mult = round(min(1.2 * 1.75, 3.5), 3)    # 2.1
+        expected_mult = round(min(0.8 * 1.75, 2.0), 3)    # 1.4
         self.assertAlmostEqual(result.get("sl_mult"), expected_mult, places=3,
                                msg=f"sl_mult must be {expected_mult} for ADX_WEAK_20+ATR_HIGH")
 
-    def test_cap_at_3_5(self):
-        """ADX_STRONG_40 (sl_mult=2.5) + ATR_HIGH (×1.75 P6-E) = 4.375 → capped at 3.5."""
+    def test_cap_at_2_0(self):
+        """ADX_STRONG_40 (sl_mult=1.5, v4) + ATR_HIGH (x1.75) = 2.625 -> capped at 2.0."""
         current_atr = round(self._BASE_ATR_MA * 1.6, 4)   # ATR_HIGH
-        result = self._call_levels(current_atr, adx_value=45.0)  # ADX > 40 → STRONG
+        result = self._call_levels(current_atr, adx_value=45.0)  # ADX > 40 -> STRONG
         self.assertTrue(result.get("valid"))
         self.assertEqual(result.get("sl_atr_tier"), "ATR_HIGH")
-        self.assertAlmostEqual(result.get("sl_mult"), 3.5, places=3,
-                               msg="sl_mult must be capped at 3.5 (2.5×1.75=4.375 → cap=3.5)")
+        self.assertAlmostEqual(result.get("sl_mult"), 2.0, places=3,
+                               msg="sl_mult must be capped at 2.0 (1.5x1.75=2.625 -> cap=2.0)")
 
     # ── Return dict and log ───────────────────────────────────────────────────
 

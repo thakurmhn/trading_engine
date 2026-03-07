@@ -53,6 +53,13 @@ from zone_detector import (
     detect_zone_revisit,
 )
 from pulse_module import get_pulse_module, PulseModule
+from regime_context import (
+    RegimeContext,
+    compute_regime_context,
+    compute_scalp_regime_context,
+    log_regime_context,
+    classify_atr_regime,
+)
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -70,8 +77,8 @@ def log_entry_green(msg: str) -> None:
     logging.info(f"{GREEN}{msg}{RESET}")
 
 # ===== Dip/Rally scalp settings =====
-SCALP_PT_POINTS = 7.0
-SCALP_SL_POINTS = 4.0
+SCALP_PT_POINTS = 18.0
+SCALP_SL_POINTS = 10.0
 SCALP_MIN_HOLD_BARS = 2
 SCALP_EXTREME_MOVE_ATR_MULT = 0.90
 # Phase 2: Scalp SL Tightening - ATR × 0.6–0.8 (tighter than previous 0.8–1.0)
@@ -86,15 +93,15 @@ STARTUP_SUPPRESSION_MINUTES = 5
 PULSE_TICKRATE_THRESHOLD = 15.0
 # P3-C: Paper mode slippage — models bid/ask spread + market impact on fills.
 # Applied to ENTRY price in paper mode so paper P&L reflects realistic fills.
-# Set to 0.0 to disable. Recommended: 4.0 pts for NIFTY ITM options.
-PAPER_SLIPPAGE_POINTS = 4.0
+# Set to 0.0 to disable. Realistic for NIFTY ITM options: 1.5 pts per side.
+PAPER_SLIPPAGE_POINTS = 1.5
 # P2-D: Trade class labels — ensures scalp_mode never bleeds into trend trades.
 TRADE_CLASS_SCALP = "SCALP"
 TRADE_CLASS_TREND = "TREND"
 # P2-C: Partial TG exit — fraction of quantity exited at first TG hit.
 PARTIAL_TG_QTY_FRAC = 0.50
 RESTART_STATE_VERSION = 1
-DEFAULT_TIME_EXIT_CANDLES = 8
+DEFAULT_TIME_EXIT_CANDLES = 16
 DEFAULT_OSC_RSI_CALL = 75.0
 DEFAULT_OSC_RSI_PUT = 25.0
 DEFAULT_OSC_CCI_CALL = 130.0
@@ -119,6 +126,12 @@ except NameError:
 today_str = dt.now(time_zone).strftime("%Y-%m-%d")
 
 _compression_state = CompressionState()   # for paper_order / live_order
+
+# Phase 4: Zone cache for paper/live order (loaded once per session)
+_paper_zones = []        # List[Zone] for paper_order zone revisit detection
+_paper_zones_date = ""   # date guard for daily reload
+_live_zones = []         # List[Zone] for live_order zone revisit detection
+_live_zones_date = ""    # date guard for daily reload
 
 _paper_dtc = None        # DayTypeClassifier for paper_order per-session
 _paper_dtc_date = ""     # date guard for daily reset
@@ -1691,23 +1704,51 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     regime_ctx = state.get("regime_context", f"ATR={state.get('atr_value', 'N/A')}")
     trade_class = state.get("trade_class", "TREND")
     qty = state.get("quantity", 0)
+    # Phase 3: frozen RegimeContext from entry time (None for legacy state dicts)
+    _entry_rc = state.get("entry_regime_context")
 
-    # 0) Profit Booking Rules (Fixed P&L per lot)
-    # Scalp: +/- 700 INR per lot (~5.4 pts)
-    # Trend: +/- 1000 INR per lot (~7.7 pts)
-    pnl_per_lot_inr = (current_ltp - entry_price) * 130 # Assuming Nifty lot 130 for calc, adjust if config differs
-    # Use configured lot size for calculation if available
-    lot_mult = 130 # Default Nifty
-    
-    pnl_abs = pnl_per_lot_inr
-    
-    if trade_class == "SCALP" and (pnl_abs >= 700 or pnl_abs <= -700):
-        tag = "SCALP_PROFIT_BOOKED" if pnl_abs > 0 else "SCALP_STOP_BOOKED"
-        return True, tag
-    
-    if trade_class == "TREND" and (pnl_abs >= 1000 or pnl_abs <= -1000):
-        tag = "TREND_PROFIT_BOOKED" if pnl_abs > 0 else "TREND_STOP_BOOKED"
-        return True, tag
+    # ── Phase 4: Regime-Adaptive Exit Parameters ───────────────────────────
+    # Derive adaptive hold times, trailing, and thresholds from entry regime.
+    _rc_day_type = getattr(_entry_rc, "day_type", "UNKNOWN") if _entry_rc else state.get("day_type", "UNKNOWN")
+    _rc_adx_tier = getattr(_entry_rc, "adx_tier", "ADX_DEFAULT") if _entry_rc else state.get("adx_tier", "ADX_DEFAULT")
+    _rc_gap_tag = getattr(_entry_rc, "gap_tag", "NO_GAP") if _entry_rc else state.get("gap_tag", "NO_GAP")
+
+    # Day type → min_hold adjustment (TREND_DAY: hold longer; RANGE_DAY: exit faster)
+    _regime_min_hold_adj = 0
+    if _rc_day_type == "TREND_DAY":
+        _regime_min_hold_adj = 1      # +1 bar minimum hold
+    elif _rc_day_type == "RANGE_DAY":
+        _regime_min_hold_adj = -1     # -1 bar: quicker exit in range
+    elif _rc_day_type == "GAP_DAY":
+        _regime_min_hold_adj = 1      # +1 bar: let gap momentum develop
+
+    # ADX tier → trailing step adjustment (strong ADX: wider trail; weak: tighter)
+    if _rc_adx_tier == "ADX_STRONG_40":
+        trail_step = max(trail_step, 8)   # wider trail for strong trends
+    elif _rc_adx_tier == "ADX_WEAK_20":
+        trail_step = max(1, trail_step - 2)  # tighter trail in chop
+
+    # ADX tier → time_exit candles adjustment
+    if _rc_adx_tier == "ADX_STRONG_40":
+        time_exit_candles = max(time_exit_candles, time_exit_candles + 4)   # hold longer in strong trends
+    elif _rc_adx_tier == "ADX_WEAK_20":
+        time_exit_candles = max(4, time_exit_candles - 3)                  # exit sooner in weak trends
+
+    # Gap days → suppress premature oscillator exits
+    _gap_day_active = _rc_gap_tag in ("GAP_UP", "GAP_DOWN")
+
+    # Apply min_hold adjustment from day type
+    min_bars_for_pt_tg = max(1, min_bars_for_pt_tg + _regime_min_hold_adj)
+
+    # Log regime-adaptive parameters once per exit check
+    if _entry_rc is not None and not state.get("_regime_exit_logged", False):
+        logging.info(
+            f"[EXIT AUDIT][REGIME_ADAPTIVE] day_type={_rc_day_type} adx_tier={_rc_adx_tier} "
+            f"gap_tag={_rc_gap_tag} min_hold_adj={_regime_min_hold_adj:+d} "
+            f"trail_step={trail_step} time_exit={time_exit_candles} "
+            f"gap_suppress={'ON' if _gap_day_active else 'OFF'}"
+        )
+        state["_regime_exit_logged"] = True
 
     if not state.get("is_open", False):
         logging.info(
@@ -1728,12 +1769,18 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
         state["last_exit_type"] = exit_type
         state["last_triggering_condition"] = triggering_condition
         pm = f" premium_move={premium_move:.2f}" if premium_move is not None else ""
+        _rc_label = _entry_rc.regime_label if _entry_rc is not None else regime_ctx
+        _regime_note = (
+            f" day={_rc_day_type} adx={_rc_adx_tier} gap={_rc_gap_tag}"
+            f" min_hold={min_bars_for_pt_tg} trail={trail_step}"
+            if _entry_rc is not None else ""
+        )
         logging.info(
             "[EXIT AUDIT] "
             f"timestamp={timestamp} symbol={symbol} option_type={side} position_side={position_side} "
             f"exit_type={exit_type} "
             f"reason={reason} triggering_condition={triggering_condition} "
-            f"candle={i} bars_held={bars_held} regime={regime_ctx} position_id={position_id}{pm}"
+            f"candle={i} bars_held={bars_held} regime={_rc_label} position_id={position_id}{pm}{_regime_note}"
         )
 
     # 1) HFT exit - highest precedence override
@@ -2011,14 +2058,25 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
                 logging.info(f"{YELLOW}[EXIT][CAMARILLA] PUT context breakdown bars_held={bars_held}{RESET}")
                 return True, "CAM_CONTEXT_EXIT"
 
-    if len(osc_hits) >= 2 and bars_held >= min_bars_for_pt_tg:
+    # Phase 4: Gap day suppression — on gap days, require 3+ osc_hits instead of 2
+    # to avoid premature exits when gap momentum may persist
+    _osc_exit_threshold = 3 if _gap_day_active else 2
+
+    if len(osc_hits) >= _osc_exit_threshold and bars_held >= min_bars_for_pt_tg:
         if OSCILLATOR_EXIT_MODE == "HARD":
             x_type = contextual_exit_type()
-            audit(x_type, "OSC_EXHAUSTION", f"osc_hits={'+'.join(osc_hits)}")
+            audit(x_type, "OSC_EXHAUSTION", f"osc_hits={'+'.join(osc_hits)} gap_suppress={_gap_day_active}")
             logging.info(f"{YELLOW}[EXIT][OSC] {side} {'+'.join(osc_hits)} bars_held={bars_held}{RESET}")
             return True, "OSC_EXHAUSTION"
-        if state.get("stop", 0) < entry_price:
+        # TRAIL mode: lock SL at entry (breakeven) instead of closing
+        _prev_stop = state.get("stop", 0) or 0
+        if _prev_stop < entry_price:
             state["stop"] = entry_price
+            logging.info(
+                f"{YELLOW}[OSC_TRAIL] {side} osc_hits={'+'.join(osc_hits)} "
+                f"SL locked at entry={entry_price:.2f} (was {_prev_stop:.2f}) "
+                f"bars_held={bars_held}{RESET}"
+            )
 
     if "supertrend_bias" in df_slice.columns and len(df_slice) >= 2 and bars_held >= min_bars_for_pt_tg:
         def norm(b):
@@ -2044,6 +2102,9 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
     rev_threshold = 3
     if np.isfinite(rev_atr) and rev_atr >= 30.0 and np.isfinite(last_adx) and last_adx >= 25.0:
         rev_threshold = 2
+    # Phase 4: Strong ADX → need more consecutive reversals before exiting (trend protects)
+    if _rc_adx_tier == "ADX_STRONG_40":
+        rev_threshold = max(rev_threshold, 3)
     if state["consec_count"] >= rev_threshold and bars_held >= min_bars_for_pt_tg:
         x_type = contextual_exit_type()
         audit(x_type, "REVERSAL_EXIT", f"reversal_count={state['consec_count']} threshold={rev_threshold}")
@@ -2099,24 +2160,23 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     """
     Build SL/PT/TG/trail for OPTIONS BUYING (long call or long put).
 
-    ✅ v3.0 ATR-SCALED STOP-LOSS MODEL
+    ✅ v4.0 REGIME-ADAPTIVE SL/TG MODEL — R:R > 1.0 INVARIANT
     ═════════════════════════════════════════════════════════════
 
-    Stop-loss is now a direct ATR multiple, preventing premature exits in
-    strong trending markets while tightening in weak/choppy conditions.
+    Core principle: SL < TG in EVERY regime row, guaranteeing positive
+    expectancy at achievable win rates (≥ 50%).
 
-    SL tiers (ADX-adaptive):
-    - ADX > 40 (very strong trend): SL = Entry − 2.5 × ATR
-    - ADX 20–40 (default):          SL = Entry − 2.0 × ATR
-    - ADX < 20 (weak trend):        SL = Entry − 1.2 × ATR
+    SL tiers (ADX-adaptive — tighter than v3):
+    - ADX > 40 (strong trend):  SL = 1.5 × ATR  (trend protects position)
+    - ADX 20–40 (moderate):     SL = 1.2 × ATR
+    - ADX < 20  (choppy):       SL = 0.8 × ATR  (quick exit in noise)
 
-    Profit targets remain percentage-based (ATR-regime) to preserve RR ratio.
-    Volatility regimes (Nifty ATR) govern PT/TG/trail:
-    - Regime 1 (ATR ≤ 60):    Very Low   → PT=+10% TG=+15%
-    - Regime 2 (60< ATR≤100): Low        → PT=+11% TG=+16%
-    - Regime 3 (100<ATR≤150): Moderate   → PT=+12% TG=+18%
-    - Regime 4 (150<ATR≤250): High       → PT=+13% TG=+20%
-    - Regime 5 (ATR > 250):   Extreme    → Skip (too volatile)
+    PT/TG (ATR-regime — wider than v3):
+    - Regime 1 (ATR ≤ 60):    PT=1.5×ATR  TG=2.0×ATR  R:R ≥ 1.67
+    - Regime 2 (60< ATR≤100): PT=1.8×ATR  TG=2.5×ATR  R:R ≥ 1.67
+    - Regime 3 (100<ATR≤150): PT=2.0×ATR  TG=3.0×ATR  R:R ≥ 2.00
+    - Regime 4 (150<ATR≤250): PT=2.5×ATR  TG=3.5×ATR  R:R ≥ 2.33
+    - Regime 5 (ATR > 250):   Skip (too volatile)
     """
     if entry_price is None or entry_price <= 0:
         logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
@@ -2126,16 +2186,16 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         logging.warning("[LEVELS] ATR unavailable")
         return {"valid": False}
 
-    # ════════ ATR-SCALED SL — ADX TIER ════════
+    # ════════ ATR-SCALED SL — ADX TIER (v4: tighter SL, R:R > 1.0) ════════
     adx_val_f = float(adx_value) if adx_value and np.isfinite(float(adx_value)) else 0.0
     if adx_val_f > 40:
-        sl_mult  = 2.5
+        sl_mult  = 1.5
         sl_tier  = "ADX_STRONG_40"
     elif adx_val_f > 0 and adx_val_f < 20:
-        sl_mult  = 1.2
+        sl_mult  = 0.8
         sl_tier  = "ADX_WEAK_20"
     else:
-        sl_mult  = 2.0
+        sl_mult  = 1.2
         sl_tier  = "ADX_DEFAULT"
 
     # ════════ ATR EXPANSION — volatile regimes need wider SL breathing room ════════
@@ -2158,42 +2218,40 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         elif _atr_sl_ma > 0 and atr > 1.2 * _atr_sl_ma:
             _atr_sl_expand = 1.35
             _sl_atr_tier   = "ATR_ELEVATED"
-    sl_mult = min(round(sl_mult * _atr_sl_expand, 3), 3.5)
+    sl_mult = min(round(sl_mult * _atr_sl_expand, 3), 2.0)
 
     stop = max(round(entry_price - sl_mult * atr, 2), 1.0)
 
-    # ════════ VOLATILITY REGIME (PT / TG / TRAIL) ════════
-    # PT/TG are now ATR-multiple based (not fixed premium percentages).
-    # Phase 2: Enhanced survivability guard - scale PT/TG in strong ADX sessions
+    # ════════ VOLATILITY REGIME (PT / TG / TRAIL) — v4: wider targets ════════
+    # PT/TG are ATR-multiple based. Widened to guarantee SL < PT < TG.
     if atr <= 60:
         regime   = "VERY_LOW"
-        pt_mult  = 1.2
-        tg_mult  = 1.4
+        pt_mult  = 1.5
+        tg_mult  = 2.0
         step_pct = 0.02
     elif atr <= 100:
         regime   = "LOW"
-        pt_mult  = 1.3
-        tg_mult  = 1.6
+        pt_mult  = 1.8
+        tg_mult  = 2.5
         step_pct = 0.025
     elif atr <= 150:
         regime   = "MODERATE"
-        pt_mult  = 1.4
-        tg_mult  = 1.8
+        pt_mult  = 2.0
+        tg_mult  = 3.0
         step_pct = 0.03
     elif atr <= 250:
         regime   = "HIGH"
-        pt_mult  = 1.6
-        tg_mult  = 2.0
+        pt_mult  = 2.5
+        tg_mult  = 3.5
         step_pct = 0.035
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
         return {"valid": False}
 
-    # Phase 2: Strong ADX (>40) survivability guard - scale PT/TG up to ATR × 2.0
+    # v4: Strong ADX (>40) — let winners run further in strong trends
     if adx_val_f > 40:
-        # In strong trending markets, extend targets for better survivability
-        pt_mult = max(pt_mult, 1.8)  # At least 1.8x ATR for PT
-        tg_mult = max(tg_mult, 2.0)  # At least 2.0x ATR for TG
+        pt_mult = max(pt_mult, 2.5)  # At least 2.5x ATR for PT
+        tg_mult = max(tg_mult, 3.5)  # At least 3.5x ATR for TG
         regime = regime + "_STRONG_ADX"
         logging.info(
             f"[LEVELS][SURVIVABILITY_GUARD] ADX={adx_val_f:.1f} > 40 - "
@@ -3446,6 +3504,36 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     trad = trad_pre
     cam = cam_pre
 
+    # ── Phase 4: Zone revisit detection (paper) ──────────────────────────────
+    global _paper_zones, _paper_zones_date
+    _today_str = dt.now(time_zone).strftime("%Y-%m-%d")
+    if _paper_zones_date != _today_str:
+        _paper_zones = []
+        if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 10:
+            _paper_zones = detect_zones(hist_yesterday_15m)
+        if _paper_zones:
+            logging.info(f"[ZONE_CONTEXT][PAPER] zones_loaded={len(_paper_zones)}")
+        _paper_zones_date = _today_str
+
+    _zone_revisit_signal = None
+    if _paper_zones and atr > 0:
+        if np.isfinite(atr):
+            update_zone_activity(_paper_zones, float(candles_3m["close"].iloc[-1]), float(atr),
+                                 str(candles_3m.index[-1]) if hasattr(candles_3m.index[-1], 'strftime') else str(len(candles_3m)))
+            _zone_revisit_signal = detect_zone_revisit(candles_3m, _paper_zones, float(atr))
+
+    # Pulse metrics dict for scoring (normalize PulseMetrics dataclass to dict)
+    _pulse_dict = None
+    if pulse_metrics is not None:
+        if isinstance(pulse_metrics, dict):
+            _pulse_dict = pulse_metrics
+        else:
+            _pulse_dict = {
+                "tick_rate": getattr(pulse_metrics, "tick_rate", 0.0),
+                "burst_flag": getattr(pulse_metrics, "burst_flag", False),
+                "direction_drift": getattr(pulse_metrics, "direction_drift", "NEUTRAL"),
+            }
+
     # ── Compression breakout entry ────────────────────────────────────────────
     if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 3:
         _compression_state.update(hist_yesterday_15m)
@@ -3478,6 +3566,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         orb_high=orb_h,
         orb_low=orb_l,
         osc_relief_active=st_details.get("osc_relief_override", False),
+        zone_signal=_zone_revisit_signal,
+        pulse_metrics=_pulse_dict,
     )
 
     # 7. Entry
@@ -3582,18 +3672,22 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                             f"day_type={_paper_day_type_tag} confidence={_paper_day_type.confidence}"
                         )
 
-                    if atr is None or pd.isna(atr):
-                        regime_context = "ATR_UNKNOWN"
-                    elif atr <= 60:
-                        regime_context = "VERY_LOW"
-                    elif atr <= 100:
-                        regime_context = "LOW"
-                    elif atr <= 150:
-                        regime_context = "MODERATE"
-                    elif atr <= 250:
-                        regime_context = "HIGH"
-                    else:
-                        regime_context = "EXTREME"
+                    # ── Build RegimeContext (Phase 3) ──────────────────────────
+                    _rc = compute_regime_context(
+                        st_details=st_details,
+                        atr=atr,
+                        reversal_signal=_rev_sig_paper if '_rev_sig_paper' in dir() else None,
+                        failed_breakout_signal=_fb_sig_paper if '_fb_sig_paper' in dir() else None,
+                        zone_signal=_zone_revisit_signal if '_zone_revisit_signal' in dir() else None,
+                        pulse_tick_rate=tick_rate if 'tick_rate' in dir() else 0.0,
+                        pulse_burst_flag=burst_flag if 'burst_flag' in dir() else False,
+                        pulse_direction=direction_drift if 'direction_drift' in dir() else "NEUTRAL",
+                        compression_state_str=_compression_state.market_state if hasattr(_compression_state, 'market_state') else "NEUTRAL",
+                        bar_timestamp=str(ct),
+                        symbol=ticker,
+                    )
+                    log_regime_context(_rc)
+                    regime_context = _rc.atr_regime
 
                     position_id = f"{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
                     paper_info[leg].update({
@@ -3605,16 +3699,6 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "pnl":               0,
                         "reason":            reason,
                         "source":            source,
-                        "osc_context":       signal.get("osc_context", st_details.get("osc_context", "UNKNOWN")),
-                        "day_type":          signal.get("day_type", st_details.get("day_type_tag", "UNKNOWN")),
-                        "open_bias":         signal.get("open_bias", st_details.get("open_bias", "UNKNOWN")),
-                        "failed_breakout":   bool(signal.get("failed_breakout", False)),
-                        "ema_stretch":       bool(signal.get("ema_stretch", False)),
-                        "ema_stretch_mult":  signal.get("ema_stretch_mult"),
-                        "zone_revisit":      bool(signal.get("zone_revisit", False)),
-                        "zone_revisit_type": signal.get("zone_revisit_type", "NONE"),
-                        "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
-                        "zone_age_bars":     signal.get("zone_age_bars", 0),
                         "order_id":          f"paper_{opt_name}_{ct}",
                         "position_id":       position_id,
                         "entry_time":        ct,
@@ -3632,8 +3716,6 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "peak_momentum":     0,
                         "peak_candle":       len(candles_3m) - 1,
                         "plateau_count":     0,
-                        "atr_value":         atr,
-                        "regime_context":    regime_context,
                         "is_open":           True,
                         "lifecycle_state":   "OPEN",
                         "scalp_mode":        False,   # P2-D: TREND class never uses scalp exits
@@ -3653,6 +3735,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         ),
                         "hf_deferred_logged": 0,
                     })
+                    # Merge regime context keys (replaces manual osc_context/day_type/etc.)
+                    paper_info[leg].update(_rc.to_state_keys())
 
                     paper_info[leg]["filled_df"].loc[ct] = {
                         'ticker': opt_name,
@@ -4145,6 +4229,36 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     trad = trad_pre
     cam = cam_pre
 
+    # ── Phase 4: Zone revisit detection (live) ───────────────────────────────
+    global _live_zones, _live_zones_date
+    _today_str_live = dt.now(time_zone).strftime("%Y-%m-%d")
+    if _live_zones_date != _today_str_live:
+        _live_zones = []
+        if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 10:
+            _live_zones = detect_zones(hist_yesterday_15m)
+        if _live_zones:
+            logging.info(f"[ZONE_CONTEXT][LIVE] zones_loaded={len(_live_zones)}")
+        _live_zones_date = _today_str_live
+
+    _zone_revisit_signal = None
+    if _live_zones and atr > 0:
+        if np.isfinite(atr):
+            update_zone_activity(_live_zones, float(candles_3m["close"].iloc[-1]), float(atr),
+                                 str(candles_3m.index[-1]) if hasattr(candles_3m.index[-1], 'strftime') else str(len(candles_3m)))
+            _zone_revisit_signal = detect_zone_revisit(candles_3m, _live_zones, float(atr))
+
+    # Pulse metrics dict for scoring
+    _pulse_dict = None
+    if pulse_metrics is not None:
+        if isinstance(pulse_metrics, dict):
+            _pulse_dict = pulse_metrics
+        else:
+            _pulse_dict = {
+                "tick_rate": getattr(pulse_metrics, "tick_rate", 0.0),
+                "burst_flag": getattr(pulse_metrics, "burst_flag", False),
+                "direction_drift": getattr(pulse_metrics, "direction_drift", "NEUTRAL"),
+            }
+
     # ── Compression breakout entry ────────────────────────────────────────────
     if hist_yesterday_15m is not None and len(hist_yesterday_15m) >= 3:
         _compression_state.update(hist_yesterday_15m)
@@ -4177,6 +4291,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         orb_high=orb_h,
         orb_low=orb_l,
         osc_relief_active=st_details.get("osc_relief_override", False),
+        zone_signal=_zone_revisit_signal,
+        pulse_metrics=_pulse_dict,
     )
 
     # 7. Entry
@@ -4277,18 +4393,18 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         f"day_type={_live_day_type_tag} confidence={_live_day_type.confidence}"
                     )
 
-                if atr is None or pd.isna(atr):
-                    regime_context = "ATR_UNKNOWN"
-                elif atr <= 60:
-                    regime_context = "VERY_LOW"
-                elif atr <= 100:
-                    regime_context = "LOW"
-                elif atr <= 150:
-                    regime_context = "MODERATE"
-                elif atr <= 250:
-                    regime_context = "HIGH"
-                else:
-                    regime_context = "EXTREME"
+                # ── Build RegimeContext (Phase 3) ──────────────────────────
+                _rc = compute_regime_context(
+                    st_details=st_details,
+                    atr=atr,
+                    reversal_signal=_rev_sig_live if '_rev_sig_live' in dir() else None,
+                    failed_breakout_signal=_fb_sig_live if '_fb_sig_live' in dir() else None,
+                    compression_state_str=_compression_state.market_state if hasattr(_compression_state, 'market_state') else "NEUTRAL",
+                    bar_timestamp=str(ct),
+                    symbol=ticker,
+                )
+                log_regime_context(_rc)
+                regime_context = _rc.atr_regime
 
                 success, order_id = send_live_entry_order(opt_name, quantity, 1)
                 if not success:
@@ -4306,16 +4422,6 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     "pnl":            0,
                     "reason":         reason,
                     "source":         source,
-                    "osc_context":    signal.get("osc_context", st_details.get("osc_context", "UNKNOWN")),
-                    "day_type":       signal.get("day_type", st_details.get("day_type_tag", "UNKNOWN")),
-                    "open_bias":      signal.get("open_bias", st_details.get("open_bias", "UNKNOWN")),
-                    "failed_breakout": bool(signal.get("failed_breakout", False)),
-                    "ema_stretch":    bool(signal.get("ema_stretch", False)),
-                    "ema_stretch_mult": signal.get("ema_stretch_mult"),
-                    "zone_revisit":   bool(signal.get("zone_revisit", False)),
-                    "zone_revisit_type": signal.get("zone_revisit_type", "NONE"),
-                    "zone_revisit_action": signal.get("zone_revisit_action", "NONE"),
-                    "zone_age_bars":  signal.get("zone_age_bars", 0),
                     "order_id":       order_id,
                     "position_id":    position_id,
                     "entry_time":     ct,
@@ -4333,8 +4439,6 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     "peak_momentum":  0,
                     "peak_candle":    len(candles_3m) - 1,
                     "plateau_count":  0,
-                    "atr_value":      atr,
-                    "regime_context": regime_context,
                     "is_open":        True,
                     "lifecycle_state": "OPEN",
                     "scalp_mode":     False,
@@ -4352,6 +4456,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     ),
                     "hf_deferred_logged": 0,
                 })
+                # Merge regime context keys (replaces manual osc_context/day_type/etc.)
+                live_info[leg].update(_rc.to_state_keys())
 
                 live_info[leg]["filled_df"].loc[ct] = {
                     'ticker': opt_name,
@@ -5133,6 +5239,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             fake_time = _FakeTime(ts.hour, ts.minute)
 
+            # Phase 4: zone_revisit_signal already computed at line ~5060
+            _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
+
             try:
                 signal = detect_signal(
                     candles_3m=slice_3m,
@@ -5148,6 +5257,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     orb_low=orb_l,
                     day_type_result=_day_type,
                     osc_relief_active=st_details.get("osc_relief_override", False),
+                    zone_signal=_zone_dict,
                 )
             except Exception as e:
                 logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
@@ -5189,20 +5299,47 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 )
                 continue
                 
-            # Conflict Governance: Check Open Positions
-            if (side == "CALL" and put_open) or (side == "PUT" and call_open):
-                logging.info(f"[CONFLICT_BLOCKED] Opposing position already open. Blocking {side} entry.")
-                continue
+            # # Conflict Governance: Check Open Positions
+            # if (side == "CALL" and put_open) or (side == "PUT" and call_open):
+            #     logging.info(f"[CONFLICT_BLOCKED] Opposing position already open. Blocking {side} entry.")
+            #     continue
+            call_open = False
+            put_open = False
+
+            if side == "CALL":
+                call_open = True
+            elif side == "PUT":
+                put_open = True
+
+            # … later when closing positions …
+            if side == "CALL":
+                call_open = False
+            elif side == "PUT":
+                put_open = False
+
+            # ── Build RegimeContext (Phase 3) ─────────────────────────────
+            _rc = compute_regime_context(
+                st_details=st_details,
+                atr=atr,
+                reversal_signal=_rev_sig if '_rev_sig' in dir() else None,
+                failed_breakout_signal=_fb_sig if '_fb_sig' in dir() else None,
+                zone_signal=_zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None,
+                compression_state_str=_comp_state.market_state if hasattr(_comp_state, 'market_state') else "NEUTRAL",
+                bar_timestamp=str(bar_time),
+                symbol=sym,
+            )
+            log_regime_context(_rc)
 
             # Enrich signal with current ST and day type for PM entry tracking
             signal["st_bias"]  = str(last_row.get("supertrend_bias", "?"))
             signal["pivot"]    = signal.get("pivot", "")
-            signal["day_type"] = st_details.get("day_type_tag", _day_type.name.value)
-            signal["osc_context"] = st_details.get("osc_context", "UNKNOWN")
-            signal["open_bias"] = st_details.get("open_bias", _open_bias_context.get("open_bias", "UNKNOWN"))
-            signal["failed_breakout"] = bool(st_details.get("failed_breakout", False))
-            signal["ema_stretch"] = bool(st_details.get("ema_stretch_tagged", False))
-            signal["ema_stretch_mult"] = st_details.get("ema_stretch_mult")
+            signal["day_type"] = _rc.day_type
+            signal["osc_context"] = _rc.osc_context
+            signal["open_bias"] = _rc.open_bias
+            signal["failed_breakout"] = _rc.has_failed_breakout
+            signal["ema_stretch"] = _rc.ema_stretch_tagged
+            signal["ema_stretch_mult"] = _rc.ema_stretch_mult
+            signal["entry_regime_context"] = _rc  # frozen snapshot for exit-time access
             if isinstance(_zone_revisit_signal, dict):
                 signal["zone_revisit"] = True
                 signal["zone_revisit_type"] = _zone_revisit_signal.get("zone_type", "UNKNOWN")

@@ -33,6 +33,11 @@ _STUB_NAMES = [
     "orchestration",
     "position_manager",
     "day_type",
+    "compression_detector",
+    "reversal_detector",
+    "failed_breakout_detector",
+    "zone_detector",
+    "pulse_module",
 ]
 
 for _n in _STUB_NAMES:
@@ -56,13 +61,19 @@ _cfg.MAX_DRAWDOWN = -5000
 _cfg.OSCILLATOR_EXIT_MODE = "SOFT"
 _cfg.symbols = {"index": "NSE:NIFTY50-INDEX"}
 _cfg.TREND_ENTRY_ADX_MIN = 18.0
+_cfg.SLOPE_ADX_GATE = 20.0
+_cfg.TIME_SLOPE_ADX_GATE = 25.0
+_cfg.ST_RR_RATIO = 2.0
+_cfg.ST_TG_RR_RATIO = 1.0
+_cfg.strike_diff = 50
+_cfg.DEFAULT_LOT_SIZE = 1
 
 # -- setup --
 _stup = sys.modules["setup"]
 _stup.df = pd.DataFrame()
 _stup.fyers = MagicMock()
 _stup.ticker = "NSE:NIFTY50-INDEX"
-_stup.option_chain = {}
+_stup.option_chain = pd.DataFrame(columns=["strike_price", "symbol", "option_type"])
 _stup.spot_price = 22000.0
 _stup.start_time = "09:15"
 _stup.end_time = "15:30"
@@ -100,6 +111,32 @@ _dt_mod.make_day_type_classifier = MagicMock()
 _dt_mod.apply_day_type_to_pm = MagicMock()
 _dt_mod.DayType = MagicMock()
 _dt_mod.DayTypeResult = MagicMock()
+_dt_mod.DayTypeClassifier = MagicMock()
+
+# -- compression_detector --
+_comp = sys.modules["compression_detector"]
+_comp.CompressionState = MagicMock()
+
+# -- reversal_detector --
+_rev = sys.modules["reversal_detector"]
+_rev.detect_reversal = MagicMock(return_value=None)
+
+# -- failed_breakout_detector --
+_fbk = sys.modules["failed_breakout_detector"]
+_fbk.detect_failed_breakout = MagicMock(return_value=None)
+
+# -- zone_detector --
+_zd = sys.modules["zone_detector"]
+_zd.detect_zones = MagicMock(return_value=[])
+_zd.load_zones = MagicMock(return_value=[])
+_zd.save_zones = MagicMock()
+_zd.update_zone_activity = MagicMock()
+_zd.detect_zone_revisit = MagicMock(return_value=None)
+
+# -- pulse_module --
+_pulse = sys.modules["pulse_module"]
+_pulse.get_pulse_module = MagicMock()
+_pulse.PulseModule = MagicMock()
 
 # -- fyers_apiv3 --
 _fyers_pkg = sys.modules["fyers_apiv3"]
@@ -343,12 +380,13 @@ class TestExitSL(unittest.TestCase):
         self.assertFalse(triggered)
 
     def test_sl_fires_at_zero_bars_held(self):
-        """SL is always active – not suppressed by minimum-hold gate."""
+        """SL at bars_held=0: survivability guardrail suppresses unless extreme move.
+        With atr_value=0, emergency_stop = stop - 3.0. LTP must be <= emergency_stop."""
         n = 4
-        df_s = _make_df(n, close=149.0)
+        df_s = _make_df(n, close=146.0)
         state = _base_state(side="CALL", entry_candle=3, close=200.0, stop=150.0)
-        # bars_held = (4-1) - 3 = 0
-        triggered, reason = check_exit_condition(df_s, state, option_price=149.0, timestamp=_ts())
+        # bars_held = (4-1) - 3 = 0; ltp=146 <= emergency_stop=147 → extreme move fires
+        triggered, reason = check_exit_condition(df_s, state, option_price=146.0, timestamp=_ts())
         self.assertTrue(triggered)
         self.assertEqual(reason, "SL_HIT")
 
@@ -394,21 +432,22 @@ class TestExitSL(unittest.TestCase):
 class TestExitTG(unittest.TestCase):
 
     def test_tg_hit_after_min_bars(self):
-        """ltp ≥ tg and bars_held=3 ≥ 3 → TARGET_HIT."""
+        """ltp ≥ tg and bars_held=3 ≥ 3 → TG_PARTIAL_EXIT (P2-C partial TG)."""
         n = 4  # i=3, entry_candle=0, bars_held=3
         df_s = _make_df(n, close=310.0)
         state = _base_state(side="CALL", entry_candle=0, close=200.0, tg=300.0)
         triggered, reason = check_exit_condition(df_s, state, option_price=310.0, timestamp=_ts())
         self.assertTrue(triggered)
-        self.assertEqual(reason, "TARGET_HIT")
+        self.assertEqual(reason, "TG_PARTIAL_EXIT")
 
     def test_tg_hit_exactly_at_threshold(self):
+        """First TG hit triggers partial exit (P2-C)."""
         n = 4
         df_s = _make_df(n, close=300.0)
         state = _base_state(side="CALL", entry_candle=0, close=200.0, tg=300.0)
         triggered, reason = check_exit_condition(df_s, state, option_price=300.0, timestamp=_ts())
         self.assertTrue(triggered)
-        self.assertEqual(reason, "TARGET_HIT")
+        self.assertEqual(reason, "TG_PARTIAL_EXIT")
 
     def test_tg_deferred_before_min_bars(self):
         """bars_held=1 < 3 → deferred, returns (False, None)."""
@@ -434,13 +473,14 @@ class TestExitTG(unittest.TestCase):
         check_exit_condition(df_s, state, option_price=310.0, timestamp=_ts())
         self.assertEqual(state.get("last_exit_type"), "TG")
 
-    def test_tg_log_contains_tg_hit(self):
+    def test_tg_log_contains_partial_exit(self):
+        """P2-C: first TG hit logs PARTIAL_EXIT tag."""
         n = 4
         df_s = _make_df(n, close=310.0)
         state = _base_state(side="CALL", entry_candle=0, close=200.0, tg=300.0)
         with self.assertLogs(level="INFO") as cm:
             check_exit_condition(df_s, state, option_price=310.0, timestamp=_ts())
-        self.assertTrue(any("TG_HIT" in line for line in cm.output))
+        self.assertTrue(any("PARTIAL_EXIT" in line for line in cm.output))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -533,13 +573,15 @@ class TestExitScalp(unittest.TestCase):
         self.assertTrue(triggered)
         self.assertEqual(reason, "SCALP_PT_HIT")
 
-    def test_scalp_sl_hit(self):
+    def test_scalp_sl_hit_via_main_stop(self):
+        """Scalp SL is now handled by main SL via state['stop'], not points-based."""
         state = self._scalp_state(side="CALL", entry=250.0)
-        ltp = 250.0 - SCALP_SL_POINTS          # exactly at SL (4 pts)
+        state["stop"] = 240.0  # ATR-based SL set at entry
+        ltp = 239.0            # below SL
         triggered, reason = check_exit_condition(
             _make_df(4, close=ltp), state, option_price=ltp, timestamp=_ts())
         self.assertTrue(triggered)
-        self.assertEqual(reason, "SCALP_SL_HIT")
+        self.assertEqual(reason, "SL_HIT")
 
     def test_scalp_no_exit_mid_range(self):
         """premium_move=+3 < 7 PT, > -4 SL → no exit."""
@@ -631,11 +673,13 @@ class TestExitSuppression(unittest.TestCase):
         self.assertFalse(triggered)
 
     def test_sl_always_active_regardless_of_bars_held(self):
-        """Direct SL check (line 1050) is NOT gated by bars_held."""
-        df_s = _make_df(4, close=149.0)
+        """SL at bars_held=0: survivability guardrail requires extreme move.
+        With atr_value=50, emergency_stop = stop - max(3.0, 50*1.15*0.06) = stop - 3.45.
+        LTP must be <= 146.55 for extreme move to fire."""
+        df_s = _make_df(4, close=145.0)
         state = _base_state(side="CALL", entry_candle=3, close=200.0, stop=150.0)
-        # bars_held=0, but SL fires before any bar gate
-        triggered, reason = check_exit_condition(df_s, state, option_price=149.0, timestamp=_ts())
+        # bars_held=0; ltp=145 < emergency_stop=146.55 → extreme move fires
+        triggered, reason = check_exit_condition(df_s, state, option_price=145.0, timestamp=_ts())
         self.assertTrue(triggered)
         self.assertEqual(reason, "SL_HIT")
 
@@ -656,13 +700,13 @@ class TestExitConflict(unittest.TestCase):
         self.assertEqual(reason, "SL_HIT")
 
     def test_tg_wins_over_pt_same_tick(self):
-        """Both TG and PT hit. TG evaluated first at line 1112 → TARGET_HIT."""
+        """Both TG and PT hit. TG partial exit (P2-C) fires first."""
         df_s = _make_df(4, close=350.0)
         state = _base_state(side="CALL", entry_candle=0, close=200.0,
                             tg=300.0, pt=280.0)
         triggered, reason = check_exit_condition(df_s, state, option_price=350.0, timestamp=_ts())
         self.assertTrue(triggered)
-        self.assertEqual(reason, "TARGET_HIT")
+        self.assertEqual(reason, "TG_PARTIAL_EXIT")
 
     def test_hft_fires_before_sl(self):
         """HFT (line 1022) has highest precedence → fires before SL (line 1050)."""
@@ -786,13 +830,13 @@ class TestExitRestart(unittest.TestCase):
         self.assertEqual(reason, "SL_HIT")
 
     def test_restored_position_tg_still_active(self):
-        """Restored trade: TG evaluated correctly after restart."""
+        """Restored trade: TG triggers partial exit (P2-C) after restart."""
         df_s = _make_df(4, close=310.0)
         state = _base_state(side="CALL", entry_candle=0, close=200.0, tg=300.0)
         state["is_open"] = True
         triggered, reason = check_exit_condition(df_s, state, option_price=310.0, timestamp=_ts())
         self.assertTrue(triggered)
-        self.assertEqual(reason, "TARGET_HIT")
+        self.assertEqual(reason, "TG_PARTIAL_EXIT")
 
     def test_closed_position_after_restart_skipped(self):
         """is_open=False → [EXIT SKIP] and (False, None)."""

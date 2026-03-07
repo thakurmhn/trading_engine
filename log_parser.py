@@ -219,6 +219,12 @@ _P_TAGS = [
     "TG_HIT_EXIT_SUPPRESSED",
     "SURVIVABILITY_OVERRIDE",
     "ENTRY_ALLOWED_BUT_NOT_EXECUTED",
+    # Phase 4: Zone + Pulse scoring attribution
+    "ZONE",
+    "PULSE",
+    # Phase 5: Regime context attribution
+    "REGIME_CONTEXT",
+    "REGIME_ADAPTIVE",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 
@@ -355,6 +361,25 @@ _RE_ENTRY_ALLOWED_ZONE = re.compile(
     re.IGNORECASE,
 )
 
+# [REGIME_CONTEXT] 2026-03-05 09:45:00 NSE:NIFTY ATR=120.5(ATR_MODERATE) ADX=28.3(ADX_DEFAULT) day=TREND_DAY cpr=NARROW ...
+_RE_REGIME_CONTEXT = re.compile(
+    r"\[REGIME_CONTEXT\]"
+    r"(?:.*?ATR=[\d.]+\((?P<atr_regime>\w+)\))?"
+    r"(?:.*?ADX=[\d.]+\((?P<adx_tier>\w+)\))?"
+    r"(?:.*?day=(?P<day_type>\w+))?"
+    r"(?:.*?cpr=(?P<cpr_width>\w+))?",
+    re.IGNORECASE,
+)
+
+# [EXIT AUDIT][REGIME_ADAPTIVE] day_type=TREND_DAY adx_tier=ADX_STRONG_40 gap_tag=NO_GAP ...
+_RE_EXIT_AUDIT_REGIME = re.compile(
+    r"\[EXIT AUDIT\]\[REGIME_ADAPTIVE\]"
+    r"(?:.*?day_type=(?P<day_type>\w+))?"
+    r"(?:.*?adx_tier=(?P<adx_tier>\w+))?"
+    r"(?:.*?gap_tag=(?P<gap_tag>\w+))?",
+    re.IGNORECASE,
+)
+
 # [REVERSAL_OVERRIDE] RSI=22.3 oscillator extreme flipped ...
 _RE_REVERSAL_OVERRIDE = re.compile(r"\[REVERSAL_OVERRIDE\]", re.IGNORECASE)
 
@@ -396,6 +421,12 @@ class SessionSummary:
     expiry_roll_count:       int = 0   # [CONTRACT_ROLL] events
     lot_size_mismatch_count: int = 0   # [CONTRACT_METADATA][LOT_MISMATCH] events
     intrinsic_filter_count:  int = 0   # [CONTRACT_FILTER]...SKIPPED events
+
+    # ── Regime context attribution (Phase 5) ────────────────────────────────
+    regime_context_count: int = 0   # [REGIME_CONTEXT] per-bar log count
+    regime_adaptive_count: int = 0  # [EXIT AUDIT][REGIME_ADAPTIVE] per-trade
+    regime_trade_breakdown: Dict[str, Dict[str, list]] = field(default_factory=dict)
+    # Structure: {"day_type": {"TREND_DAY": [pnl1, ...], ...}, "adx_tier": {...}, ...}
 
     # ── Volatility context tracking ───────────────────────────────────────────
     vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
@@ -495,6 +526,38 @@ class SessionSummary:
         }
 
     @property
+    def regime_performance(self) -> Dict[str, Dict[str, dict]]:
+        """Performance breakdown by regime dimensions (Phase 5).
+
+        Returns dict like:
+        {
+            "day_type": {
+                "TREND_DAY": {"trades": 5, "winners": 3, "win_rate": 60.0, "net_pnl": 12.5},
+                ...
+            },
+            "adx_tier": {...},
+            "atr_regime": {...},
+            "cpr_width": {...},
+        }
+        """
+        result = {}
+        for dim in ("day_type", "adx_tier", "atr_regime", "cpr_width"):
+            dim_data = self.regime_trade_breakdown.get(dim, {})
+            dim_perf = {}
+            for label, pnl_list in dim_data.items():
+                total = len(pnl_list)
+                wins = sum(1 for p in pnl_list if p > 0)
+                net = round(sum(pnl_list), 2)
+                dim_perf[label] = {
+                    "trades": total,
+                    "winners": wins,
+                    "win_rate": round(wins / total * 100, 1) if total else 0.0,
+                    "net_pnl": net,
+                }
+            result[dim] = dim_perf
+        return result
+
+    @property
     def lot_cap_count(self) -> int:
         """Trades blocked (or capped) by MAX_TRADES_CAP gate."""
         return self.tag_counts.get("MAX_TRADES_CAP", 0)
@@ -570,6 +633,9 @@ class SessionSummary:
             "survivability_count":       self.survivability_count,
             "survivability_ratio":       self.survivability_ratio,
             "avg_pnl_pts":               self.avg_pnl_pts,
+            "regime_context_count":      self.regime_context_count,
+            "regime_adaptive_count":     self.regime_adaptive_count,
+            "regime_performance":        self.regime_performance,
         }
 
 
@@ -609,6 +675,7 @@ class LogParser:
          vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
          vol_context_align_count, greeks_align_count, score_matrix_usage_count,
          reversal_signal_count, zone_entry_counts,
+         regime_context_count, regime_adaptive_count, regime_trade_breakdown,
          ) = self._scan_file()
 
         if session_types:
@@ -649,6 +716,9 @@ class LogParser:
             greeks_align_count=greeks_align_count,
             score_matrix_usage_count=score_matrix_usage_count,
             zone_entry_counts=zone_entry_counts,
+            regime_context_count=regime_context_count,
+            regime_adaptive_count=regime_adaptive_count,
+            regime_trade_breakdown=regime_trade_breakdown,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -670,7 +740,8 @@ class LogParser:
          expiry_roll_count, lot_size_mismatch_count, intrinsic_filter_count,
          vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
          vol_context_align_count, greeks_align_count, score_matrix_usage_count,
-         reversal_signal_count, zone_entry_counts)
+         reversal_signal_count, zone_entry_counts,
+         regime_context_count, regime_adaptive_count, regime_trade_breakdown)
         """
         trades: List[dict] = []
         open_queue: List[dict] = []   # pending TRADE OPEN records (FIFO)
@@ -706,6 +777,16 @@ class LogParser:
         score_matrix_usage_count: int = 0         # [SCORE_MATRIX] per-side events
         reversal_signal_count: int = 0            # [REVERSAL_SIGNAL] detector firings
         zone_entry_counts: Dict[str, int] = defaultdict(int)  # ZoneA/B/C allowed entries
+        regime_context_count: int = 0            # [REGIME_CONTEXT] per-bar count
+        regime_adaptive_count: int = 0           # [EXIT AUDIT][REGIME_ADAPTIVE] per-trade
+        # Last-seen regime context for trade attribution
+        _last_regime: dict = {"atr_regime": "UNKNOWN", "adx_tier": "UNKNOWN",
+                              "day_type": "UNKNOWN", "cpr_width": "UNKNOWN"}
+        # Regime breakdown: dim -> label -> [pnl_list]
+        regime_breakdown: Dict[str, Dict[str, list]] = {
+            "day_type": defaultdict(list), "adx_tier": defaultdict(list),
+            "atr_regime": defaultdict(list), "cpr_width": defaultdict(list),
+        }
 
         # Keep EXIT AUDIT records as fallback when no TRADE OPEN+EXIT pairs found
         audit_records: List[dict] = []
@@ -742,6 +823,8 @@ class LogParser:
                         "zone_revisit_type": _zt.group(1).upper() if _zt else "NONE",
                         "zone_revisit_action": _za.group(1).upper() if _za else "NONE",
                         "zone_age_bars": int(_zage.group(1)) if _zage else 0,
+                        # Phase 5: regime at entry (snapshot of last-seen context)
+                        "regime_at_entry": dict(_last_regime),
                     }
                     continue
 
@@ -788,6 +871,7 @@ class LogParser:
                         "pnl_rs":       float(d["pnl_rs"]),
                         "bars_held":    int(d["bars_held"]),
                         "exit_reason":  d["exit_reason"].upper(),
+                        "regime_at_entry": dict(_last_regime),
                     })
                     continue
 
@@ -811,6 +895,7 @@ class LogParser:
                         "day_type":     d.get("day") or "",
                         "lot":          int(d["lot"]) if d.get("lot") else 0,
                         "option_name":  d.get("option_name") or "",
+                        "regime_at_entry": dict(_last_regime),
                     })
                     session_types.add(d["session_type"].upper())
                     continue
@@ -1068,6 +1153,39 @@ class LogParser:
                     osc_blocks += 1
                     # Fall through to _RE_ENTRY_BLOCKED which handles it too
 
+                # ── [REGIME_CONTEXT] per-bar regime snapshot (Phase 5) ─────
+                m = _RE_REGIME_CONTEXT.search(line)
+                if m:
+                    regime_context_count += 1
+                    _ar = m.group("atr_regime")
+                    _at = m.group("adx_tier")
+                    _dt = m.group("day_type")
+                    _cw = m.group("cpr_width")
+                    if _ar:
+                        _last_regime["atr_regime"] = _ar.upper()
+                    if _at:
+                        _last_regime["adx_tier"] = _at.upper()
+                    if _dt:
+                        _last_regime["day_type"] = _dt.upper()
+                    if _cw:
+                        _last_regime["cpr_width"] = _cw.upper()
+                    tags["REGIME_CONTEXT"] = tags.get("REGIME_CONTEXT", 0) + 1
+                    continue
+
+                # ── [EXIT AUDIT][REGIME_ADAPTIVE] per-trade regime (Phase 5)
+                m = _RE_EXIT_AUDIT_REGIME.search(line)
+                if m:
+                    regime_adaptive_count += 1
+                    _dt = m.group("day_type")
+                    _at = m.group("adx_tier")
+                    _gt = m.group("gap_tag")
+                    if _dt:
+                        _last_regime["day_type"] = _dt.upper()
+                    if _at:
+                        _last_regime["adx_tier"] = _at.upper()
+                    tags["REGIME_ADAPTIVE"] = tags.get("REGIME_ADAPTIVE", 0) + 1
+                    continue
+
                 # ── P1–P5 tags ────────────────────────────────────────────
                 m = _RE_TAG_ANY.search(line)
                 if m:
@@ -1121,6 +1239,14 @@ class LogParser:
             else:
                 trade["open_bias_aligned"] = "MISALIGNED"
 
+        # Phase 5: build regime trade breakdown from trade-level regime_at_entry
+        for trade in effective_trades:
+            _regime = trade.get("regime_at_entry", {})
+            _pnl = trade.get("pnl_pts", 0.0)
+            for dim in ("day_type", "adx_tier", "atr_regime", "cpr_width"):
+                _label = _regime.get(dim, "UNKNOWN")
+                regime_breakdown[dim][_label].append(_pnl)
+
         return (effective_trades, session_types, blocked, tags, signals_fired, entry_ok_count,
                 open_bias_tag, vs_close_tag, gap_tag, balance_tag,
                 day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
@@ -1128,7 +1254,9 @@ class LogParser:
                 expiry_roll_count, lot_size_mismatch_count, intrinsic_filter_count,
                 vix_tier_count, greeks_usage_count, theta_penalty_count, vega_penalty_count,
                 vol_context_align_count, greeks_align_count, score_matrix_usage_count,
-                reversal_signal_count, dict(zone_entry_counts))
+                reversal_signal_count, dict(zone_entry_counts),
+                regime_context_count, regime_adaptive_count,
+                {dim: dict(labels) for dim, labels in regime_breakdown.items()})
 
     @staticmethod
     def _log_ts(line: str) -> str:

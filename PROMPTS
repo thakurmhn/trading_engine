@@ -1,0 +1,303 @@
+- Walk throuh the entire codebase, list out all the available functions in all the essential .py files and the features related to the functions.
+- Problem: currenlty the the bot is showing 60% of winning rate as per eod dashboard report, however overall it apprears a loss making engine
+- Expectations: Need to identify and report why the bot is not making profit, and report complete solution
+- provide complete report in paste ready markdown format
+
+# Code Audit report 
+
+You are a coding auditor AI tasked with analyzing a modular Python trading engine. 
+Your responsibilities are:
+
+1. **Codebase Walkthrough**
+   - Traverse the entire repository.
+   - For each essential `.py` file, list all available functions.
+   - Document the purpose and features tied to each function.
+   - Present findings in a structured, hierarchical format.
+
+2. **Performance Diagnosis**
+   - Current state: The bot shows ~60% win rate in the EOD dashboard report.
+   - Problem: Despite the win rate, the engine is overall loss-making.
+   - Expectation: Identify and explain why profitability is negative.
+   - Analyze risk/reward imbalance, stop-loss vs target logic, survivability gaps, and trade attribution.
+
+3. **Solution Report**
+   - Provide a complete solution to address profitability issues.
+   - Recommend refinements in modules (scalp, trend, reversal, breakout detection, order management).
+   - Suggest governance improvements (conflict handling, attribution clarity, survivability scaling).
+   - Ensure all recommendations are empirically testable and auditable.
+
+4. **Output Format**
+   - Deliver the final report in **paste-ready Markdown**.
+   - Use clear section headings: *Codebase Functions*, *Diagnosis*, *Root Causes*, *Proposed Solutions*, *Action Checklist*.
+   - Include bullet points, tables, and examples where relevant.
+   - Ensure the report is comprehensive, structured, and ready for direct use in documentation or dashboards.
+
+Constraints:
+- Do not modify code autonomously; only report and recommend.
+- Maintain strict governance boundaries: evidence must be tied to dashboard outputs and replay validation.
+- Ensure transparency and reproducibility in all findings.
+
+
+# Prompt :
+
+# Prompt :
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Your task is to autonomously recompile and refactor all strategic functions  
+into a unified regime-adaptive strategy engine by making best use of available strategic functons and indicators. The final goal is to convert the engine from a loss‑making system into a profit‑making one.
+
+---
+
+## Scope
+1. Walk through all strategy-related modules:
+   - execution.py
+   - entry_logic.py
+   - reversal_detector.py
+   - failed_breakout_detector.py
+   - zone_detector.py
+   - pulse_module.py
+
+2. Recompile functions into a modular scoring engine that adapts to:
+   - Pivot relationships with previous pivots
+   - Day type classification (TRENDING, RANGE, GAP, BALANCE, NEUTRAL)
+   - CPR width and status
+   - Daily pivot width
+   - Opening bias
+   - Indicator configurations (ATR, RSI, CCI, ADX, EMA stretch, Supertrend, VWAP)
+   - Zone Detector outputs (demand/supply zones, persistence across sessions)
+   - Pulse Module outputs (tick_rate, burst_flag, drift, suppression reasons)
+
+3. Ensure strategies are robust across market conditions by dynamically weighting  
+   pivots, CPR, bias, zone context, and pulse signals.
+
+4. Output a complete paste-ready Markdown report with:
+   - Function map
+   - Refactored strategy design
+   - Context–Strategy Matrix (including zone + pulse integration)
+   - Replay validation plan
+   - Dashboard attribution requirements
+
+5. Governance boundaries:
+   - Do not deploy changes silently
+   - Provide evidence via replay and dashboard metrics
+   - Ensure transparency and reproducibility
+
+---
+
+## Scope of Refactor
+- Cover all strategic modules listed above.
+- Recompile functions into a regime‑adaptive scoring engine that dynamically weights:
+  - Pivot relationships (previous vs current pivots, breakout/acceptance/failed breakout).
+  - Day type classification (TRENDING, RANGE, GAP, BALANCE, NEUTRAL).
+  - CPR width and status (narrow/wide).
+  - Daily pivot width (ATR‑scaled).
+  - Opening bias (gap up/down, oscillator relief).
+  - Zone Detector outputs (demand/supply zones, persistence).
+  - Pulse Module outputs (tick_rate, burst_flag, drift, suppression reasons).
+  - Indicator configurations (ATR, RSI, CCI, ADX, EMA stretch, Supertrend, VWAP).
+
+---
+
+## Deliverables
+- Paste‑ready Markdown report containing:
+  - Function map (all refactored functions and their purpose).
+  - Context–Strategy Matrix (rows = contexts like day type, CPR, pivots, zones, pulse; columns = scalp, trend, reversal, exit).
+  - Refactored strategy design (how modules interact under different regimes).
+  - Replay validation plan (sessions to run, metrics to compare).
+  - Dashboard attribution requirements (new tags, W/L splits, survivability metrics).
+
+---
+
+## Validation Requirements
+- Must run `run_offline_replay()` on recent sessions to prove improvements.
+- Must log attribution for every suppression, entry, and exit reason.
+- Must show dashboard evidence: win rate, avg win/loss size, profit factor, TG reach %, zone‑based W/L splits.
+
+---
+
+## Governance Boundaries
+- No silent deployment — all changes reported first.
+- Transparency: every refactor tied to replay and dashboard metrics.
+- Reproducibility: outputs must be auditable and empirically validated.
+
+---
+
+# 📊 Context–Strategy Matrix Scaffold (Two Paths: Scalp & Trend)
+
+| **Context** | **Scalp Module** | **Trend Module** | **Reversal Module** | **Exit Logic** |
+|-------------|------------------|------------------|----------------------|----------------|
+| **Day Type** (TRENDING / RANGE / GAP / BALANCE / NEUTRAL) | Entry suppression in RANGE/NEUTRAL; opportunistic bursts in TRENDING | Trend entries favored in TRENDING; must hold through momentum until option price peak | Reversal trades allowed in RANGE/NEUTRAL; blocked in TRENDING | Exit suppression adaptive to day type (longer holds in TRENDING) |
+| **CPR Status** (Narrow / Wide) | Narrow CPR → scalp bursts; Wide CPR → suppression | Narrow CPR → trend TG widened (2.5–3×ATR); Wide CPR → trend entries suppressed | Reversal overrides when CPR narrow + oscillator extreme | Exit trail widened when CPR narrow |
+| **Pivot Relationships** (Prev pivot acceptance / breakout / failed breakout) | Scalp dip/rally signals at pivots; avoid failed breakouts | Trend entries aligned with breakout acceptance; run through trend until option price peak | Failed breakout detection triggers reversal entries | Exit tightening when pivot rejection occurs |
+| **Daily Pivot Width** (ATR-scaled) | PT/SL scaled to pivot width | TG scaled wider when pivot width narrow; SL tightened | Reversal strength scoring higher with wide pivots | Exit guardrails adjusted to pivot width |
+| **Opening Bias** (Gap up/down, oscillator relief) | Scalp gating aligned with gap bias | Trend entries aligned with opening bias; must hold through gap momentum | Reversal overrides when gap + oscillator extreme | Exit suppression when opening bias persists |
+| **Zone Detector** (Demand/Supply zones, persistence) | Scalp suppression near strong zones | Trend entries aligned with zone breakouts; must run through zone momentum until peak | Reversal triggers at zone rejections | Exit tightening when zone retest occurs |
+| **Pulse Module** (tick_rate, burst_flag, drift) | Scalp entry allowed only if tick_rate ≥ burst_threshold | Trend entry quality adjusted by drift signals; momentum confirmation via pulse | Reversal confirmation when pulse shows exhaustion | Exit attribution tags: pulse suppression, burst fade |
+| **Indicators** (ATR, RSI, CCI, ADX, EMA stretch, Supertrend, VWAP) | ATR scaling for PT/SL; oscillator gating | Trend scoring weights: ADX, EMA stretch, ST alignment; must hold until option price peak when ADX high | Reversal detection: EMA stretch + RSI/CCI extremes | Exit triggers: oscillator exit, DTS trail, momentum exhaustion |
+
+---
+
+## 🎯 Expectations
+
+- **Two Paths**:  
+  1. **Scalp Path** → Opportunistic bursts, tightly governed by tick_rate and suppression logic.  
+  2. **Trend Path** → Momentum‑driven, designed to run through the trend and book profit at option price peaks when momentum is high.
+
+- **Trend Module Specifics**:  
+  - Must not cut winners early.  
+  - TG widened in strong momentum regimes (ADX > 35, narrow CPR, zone breakout).  
+  - SL tightened relative to TG, ensuring losses are smaller than wins.  
+  - Dashboard attribution must show % of trend trades reaching TG/peak vs truncated exits.
+
+---
+
+## 🏆 Final Goal
+Convert the trading engine from a **loss‑making system into a profit‑making one**, validated through replay sessions and dashboard attribution metrics.
+
+# =====================================
+
+# System Prompt: Phase 4 + Regime‑Adaptive Exits
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Your task is to implement **Phase 4 – Zone + Pulse Integration** and **Regime‑Adaptive Exits**.  
+These changes improve entry quality and exit survivability, directly pushing the engine toward profitability.
+
+---
+
+## Phase 4 – Zone + Pulse Integration
+1. Wire zone_detector outputs into `entry_logic.py` scoring:
+   - Suppress entries near strong demand/supply zones.
+   - Boost trend entries on zone breakouts.
+   - Trigger reversals on zone rejections.
+2. Wire pulse_module outputs into scoring:
+   - Scalp entries gated by tick_rate ≥ burst_threshold.
+   - Trend entries confirmed by drift direction.
+   - Reversal confirmation when pulse shows exhaustion.
+3. Add `[ZONE]` and `[PULSE]` attribution tags to entry logs.
+
+---
+
+## Regime‑Adaptive Exits
+1. Refactor `check_exit_condition()` to use regime context:
+   - **Day type**: TREND_DAY → longer min_hold; RANGE_DAY → shorter exits.
+   - **ADX tier**: Strong ADX → wider TG, trailing SL; Weak ADX → tighter exits.
+   - **Gap days**: Override thresholds to avoid premature exits.
+2. Add `[EXIT AUDIT]` tags showing regime‑adaptive hold times and thresholds.
+
+---
+
+## Validation
+- Run replay sessions across TRENDING, RANGE, GAP, narrow CPR, high‑volatility days.
+- Confirm `[ZONE]`, `[PULSE]`, and `[EXIT AUDIT]` logs appear with regime context.
+- Verify TG reach % and profit factor uplift compared to Phase 3 baseline.
+- All regression tests must pass.
+
+---
+
+## Final Goal
+Enhance **entry quality** (Phase 4) and **exit survivability** (Regime‑Adaptive Exits) to ensure the trading engine transitions from loss‑making to profit‑making, validated through replay sessions and dashboard attribution.
+
+
+# =========================================================================================
+
+
+# System Prompt: Resume Incomplete Task (Phase 4 + Regime‑Adaptive Exits)
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Pick up from the last completed step: Phase 3 (RegimeContext Engine) is fully done and verified.  
+Now continue with **Phase 4 (Zone + Pulse integration)** and **Regime‑Adaptive Exits**.
+
+---
+
+## Tasks
+
+### Phase 4A – Zone Integration
+- Read and understand `entry_logic.py` and `zone_detector.py`.
+- Wire zone_detector outputs into `entry_logic.py` scoring:
+  - Suppress entries near strong demand/supply zones.
+  - Boost trend entries on zone breakouts.
+  - Trigger reversals on zone rejections.
+- Add `[ZONE]` attribution tags to entry logs.
+
+### Phase 4B – Pulse Integration
+- Read and understand `pulse_module.py`.
+- Wire pulse_module outputs into `entry_logic.py` scoring:
+  - Scalp entries gated by tick_rate ≥ burst_threshold.
+  - Trend entries confirmed by drift direction.
+  - Reversal confirmation when pulse shows exhaustion.
+- Add `[PULSE]` attribution tags to entry logs.
+
+### Regime‑Adaptive Exits
+- Refactor `check_exit_condition()` in `execution.py`:
+  - **Day type**: TREND_DAY → longer min_hold; RANGE_DAY → shorter exits.
+  - **ADX tier**: Strong ADX → wider TG, trailing SL; Weak ADX → tighter exits.
+  - **Gap days**: Override thresholds to avoid premature exits.
+- Add `[EXIT AUDIT]` tags showing regime‑adaptive hold times and thresholds.
+
+---
+
+## Validation
+- Update test suites to cover zone/pulse attribution and regime‑adaptive exits.
+- Run replay sessions across TRENDING, RANGE, GAP, narrow CPR, high‑volatility days.
+- Confirm `[ZONE]`, `[PULSE]`, and `[EXIT AUDIT]` logs appear with correct regime context.
+- Ensure all regression tests pass.
+
+---
+
+## Final Goal
+Enhance **entry quality** (Phase 4) and **exit survivability** (Regime‑Adaptive Exits) to lift profit factor and move the engine toward **consistent profitability**, validated through replay sessions and dashboard attribution.
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# System Prompt: Phase 5 — Dashboard Regime Attribution & Replay Test
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Phases 3 and 4 are complete. Your task is to implement **Phase 5 — Dashboard Regime Attribution** and validate via replay tests.
+
+---
+
+## Scope
+
+### 1. Log Parser Enhancements (`log_parser.py`)
+- Parse `[REGIME_CONTEXT]` and `[EXIT AUDIT] regime=...` tags.
+- Extract fields: ATR regime, ADX tier, day type, CPR width.
+- Add parser outputs:
+  - `regime_at_entry`
+  - `adx_tier_at_entry`
+  - `day_type_at_entry`
+  - `cpr_width_at_entry`
+
+### 2. Dashboard Extensions (`dashboard.py`)
+- Add **REGIME BREAKDOWN**: win rate, avg P&L by ATR regime.
+- Add **ADX TIER PERFORMANCE**: win rate, avg P&L by ADX tier.
+- Add **DAY TYPE PERFORMANCE**: win rate, avg P&L by TREND/RANGE/GAP/BALANCE.
+- Add **CPR WIDTH IMPACT**: trade count, win rate by CPR width.
+- Preserve backward compatibility with existing dashboard views.
+
+### 3. Replay Validation
+- Run `run_offline_replay()` across TRENDING, RANGE, GAP, narrow CPR, high‑volatility sessions.
+- Confirm `[REGIME_CONTEXT]` logs emitted per bar and `[EXIT AUDIT]` includes regime labels.
+- Verify dashboard attribution sections populate correctly.
+- Ensure reproducibility: same bar → same regime context → same attribution.
+
+---
+
+## Deliverables
+- Updated `log_parser.py` and `dashboard.py` with regime attribution.
+- Replay validation logs showing `[REGIME_CONTEXT]` and `[EXIT AUDIT]` tags.
+- Dashboard output with regime breakdown tables.
+- Test suite additions for parser and dashboard attribution.
+
+---
+
+## Validation Requirements
+- All new parser/dashboard tests must pass.
+- Replay sessions must show regime attribution consistently.
+- Dashboard metrics must align with replay logs.
+- Backward compatibility confirmed.
+
+---
+
+## Final Goal
+Provide **empirical visibility** into how trades perform across regimes (ATR, ADX, day type, CPR width).  
+This closes the loop between architecture and profitability by quantifying the impact of Phases 3–4 enhancements.

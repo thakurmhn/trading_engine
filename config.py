@@ -93,8 +93,8 @@ ATR_VALUE = 15                      # Default is 20
 
 # ============ Risk Management ===========================
 
-MAX_DAILY_LOSS = -5000      # stop trading if net PnL < -5000
-MAX_DRAWDOWN   = -3000      # stop trading if drawdown exceeds 3000
+MAX_DAILY_LOSS = -15000     # stop trading if net PnL < -15000 (scaled to position size)
+MAX_DRAWDOWN   = -10000     # stop trading if drawdown exceeds 10000
 
 # =============================================================
 
@@ -102,7 +102,7 @@ MAX_DRAWDOWN   = -3000      # stop trading if drawdown exceeds 3000
 # 	HARD → when oscillator exit triggers, you close the entire position immediately.
 # 	TRAIL → instead of closing, you tighten stop-loss to entry and let trailing logic handle the exit.
 
-OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
+OSCILLATOR_EXIT_MODE = "TRAIL"   # "HARD" → close immediately; "TRAIL" → lock SL at entry
 
 # ===================================================================
 
