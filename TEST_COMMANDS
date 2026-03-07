@@ -1,0 +1,1 @@
+c:/Users/mohan/trading_engine/execution.py --date 2026-03-02 --sym NSE:NIFTY50-INDEX --db C:\SQLite\ticks\ticks_2026-03-02.db

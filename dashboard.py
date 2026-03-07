@@ -800,6 +800,41 @@ def _write_text_report(session, output_path: Path) -> Path:
     lines.append(f"  Gap tag            : {session.gap_tag}")
     lines.append(f"  Balance tag        : {session.balance_tag}")
 
+    # Phase 5: Regime performance breakdown
+    _regime_perf = getattr(session, "regime_performance", {})
+    _has_regime_data = any(
+        bool(dim_data) and not (len(dim_data) == 1 and "UNKNOWN" in dim_data)
+        for dim_data in _regime_perf.values()
+    )
+    if _has_regime_data:
+        _dim_labels = {
+            "day_type":   "DAY TYPE PERFORMANCE",
+            "adx_tier":   "ADX TIER PERFORMANCE",
+            "atr_regime": "ATR REGIME PERFORMANCE",
+            "cpr_width":  "CPR WIDTH PERFORMANCE",
+        }
+        for dim, title in _dim_labels.items():
+            dim_data = _regime_perf.get(dim, {})
+            # Skip if only UNKNOWN
+            if not dim_data or (len(dim_data) == 1 and "UNKNOWN" in dim_data):
+                continue
+            lines.append("")
+            lines.append(f"  {title}")
+            lines.append(sep2)
+            lines.append(f"  {'Label':<20} {'Trades':>6} {'Wins':>5} {'WR%':>6} {'Net P&L':>10}")
+            lines.append(f"  {'─' * 20} {'─' * 6} {'─' * 5} {'─' * 6} {'─' * 10}")
+            for label in sorted(dim_data.keys()):
+                perf = dim_data[label]
+                lines.append(
+                    f"  {label:<20} {perf['trades']:>6} {perf['winners']:>5}"
+                    f" {perf['win_rate']:>5.1f}% {perf['net_pnl']:>+10.2f}"
+                )
+        _rc_count = getattr(session, "regime_context_count", 0)
+        _ra_count = getattr(session, "regime_adaptive_count", 0)
+        lines.append("")
+        lines.append(f"  Regime context logs  : {_rc_count}")
+        lines.append(f"  Regime adaptive logs : {_ra_count}")
+
     # Reversal detection section
     rev_count = getattr(session, "reversal_trades_count", 0)
     rev_signal_count = getattr(session, "reversal_signal_count", 0)
@@ -1278,6 +1313,8 @@ def compare_sessions(
             "bias_aligned_losses":       bias_aligned_losses,
             "bias_misalign_wins":        bias_misalign_wins,
             "bias_misalign_losses":      bias_misalign_losses,
+            "regime_context_count":      sum(getattr(s, "regime_context_count", 0) for s in sessions),
+            "regime_adaptive_count":     sum(getattr(s, "regime_adaptive_count", 0) for s in sessions),
         }
 
     base = _aggregate(baseline_sessions)

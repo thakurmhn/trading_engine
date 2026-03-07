@@ -445,7 +445,9 @@ def detect_signal(candles_3m, candles_15m,
                   orb_high=None,      # opening range high
                   orb_low=None,       # opening range low
                   day_type_result=None,  # NEW: DayTypeResult for threshold modifier
-                  osc_relief_active=False):  # NEW: S4/R4 relief override from gate
+                  osc_relief_active=False,  # NEW: S4/R4 relief override from gate
+                  zone_signal=None,      # Phase 4A: zone_detector output
+                  pulse_metrics=None):   # Phase 4B: pulse_module metrics dict
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -610,6 +612,8 @@ def detect_signal(candles_3m, candles_15m,
         current_time=current_time,
         day_type_result=day_type_result,
         osc_relief_active=osc_relief_active,
+        zone_signal=zone_signal,
+        pulse_metrics=pulse_metrics,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────

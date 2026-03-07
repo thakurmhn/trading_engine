@@ -507,6 +507,103 @@ def _score_open_bias(indicators, side):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ZONE SCORING — Phase 4A
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_zone(zone_signal, side):
+    """Score based on zone_detector output (zone_signal dict or None).
+
+    Zone BREAKOUT aligned with side → +10 (strong continuation signal)
+    Zone REVERSAL aligned with side → +8  (mean-reversion confirmation)
+    Zone touch opposing side → -5 (suppress entry into opposing zone)
+    No zone signal → 0
+
+    Max: 10 pts.
+    """
+    if zone_signal is None:
+        return 0
+
+    action = zone_signal.get("action", "")
+    zone_side = zone_signal.get("side", "")
+
+    if zone_side == side:
+        if action == "BREAKOUT":
+            logging.debug(
+                f"[ZONE][SCORE][{side}] BREAKOUT aligned +10 "
+                f"zone_type={zone_signal.get('zone_type')}"
+            )
+            return 10
+        if action == "REVERSAL":
+            logging.debug(
+                f"[ZONE][SCORE][{side}] REVERSAL aligned +8 "
+                f"zone_type={zone_signal.get('zone_type')}"
+            )
+            return 8
+    elif zone_side and zone_side != side:
+        # Zone favours opposite side — suppress this side
+        logging.debug(
+            f"[ZONE][SCORE][{side}] opposing zone_side={zone_side} -5"
+        )
+        return -5
+
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PULSE SCORING — Phase 4B
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score_pulse(pulse_metrics, side):
+    """Score based on pulse_module output (dict or None).
+
+    Burst + drift aligned with side → +8 (momentum confirmation)
+    Burst + drift opposing           → -5 (momentum against us)
+    Burst + neutral drift            → +3 (tick activity, no direction)
+    No burst / no metrics            → 0
+
+    Max: 8 pts.
+    """
+    if pulse_metrics is None:
+        return 0
+
+    burst = pulse_metrics.get("burst_flag", False)
+    drift = pulse_metrics.get("direction_drift", "NEUTRAL")
+    tick_rate = pulse_metrics.get("tick_rate", 0.0)
+
+    if not burst:
+        return 0
+
+    # Map drift to side alignment
+    drift_aligned = (
+        (side == "CALL" and drift == "UP") or
+        (side == "PUT" and drift == "DOWN")
+    )
+    drift_opposing = (
+        (side == "CALL" and drift == "DOWN") or
+        (side == "PUT" and drift == "UP")
+    )
+
+    if drift_aligned:
+        logging.debug(
+            f"[PULSE][SCORE][{side}] burst+drift={drift} aligned +8 "
+            f"tick_rate={tick_rate:.1f}"
+        )
+        return 8
+    if drift_opposing:
+        logging.debug(
+            f"[PULSE][SCORE][{side}] burst+drift={drift} opposing -5 "
+            f"tick_rate={tick_rate:.1f}"
+        )
+        return -5
+
+    # Burst but neutral drift
+    logging.debug(
+        f"[PULSE][SCORE][{side}] burst+NEUTRAL +3 tick_rate={tick_rate:.1f}"
+    )
+    return 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -520,7 +617,9 @@ def check_entry_condition(candle, indicators, bias_15m,
                           is_expiry_roll=False,
                           symbol=None,
                           vix_tier=None,
-                          greeks=None):
+                          greeks=None,
+                          zone_signal=None,
+                          pulse_metrics=None):
     """
     Scoring engine v5 — complete spec implementation.
 
@@ -759,6 +858,8 @@ def check_entry_condition(candle, indicators, bias_15m,
             "cpr_width":        _score_cpr_width(indicators),
             "adx_strength":     _score_adx(indicators),
             "open_bias_score":  _score_open_bias(indicators, side),
+            "zone_score":       _score_zone(zone_signal, side),
+            "pulse_score":      _score_pulse(pulse_metrics, side),
         }
 
         # Reversal bonus: HIGH-strength reversal signal aligned with this side
@@ -995,6 +1096,19 @@ def check_entry_condition(candle, indicators, bias_15m,
         _ob_s    = f" OB={_ob_val}({_ob_pts:+d})" if _ob_val != "NONE" else ""
         _rev_pts = best_bd.get("reversal_override", 0)
         _rev_s   = f" [REVERSAL_OVERRIDE+{_rev_pts}]" if _rev_pts > 0 else ""
+        # Phase 4: Zone + Pulse attribution tags
+        _zone_pts = best_bd.get("zone_score", 0)
+        _zone_s = ""
+        if _zone_pts != 0 and zone_signal is not None:
+            _zt = zone_signal.get("zone_type", "?")
+            _za = zone_signal.get("action", "?")
+            _zone_s = f" [ZONE]{_zt}_{_za}({_zone_pts:+d})"
+        _pulse_pts = best_bd.get("pulse_score", 0)
+        _pulse_s = ""
+        if _pulse_pts != 0 and pulse_metrics is not None:
+            _pd = pulse_metrics.get("direction_drift", "?")
+            _pr = pulse_metrics.get("tick_rate", 0.0)
+            _pulse_s = f" [PULSE]{_pd}_{_pr:.0f}t/s({_pulse_pts:+d})"
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
             f"{surcharge_note} {regime} {strength}"
@@ -1003,7 +1117,7 @@ def check_entry_condition(candle, indicators, bias_15m,
             f" VWAP={best_bd.get('vwap_position',0)}/5"
             f" PIV={best_bd.get('pivot_structure',0)}/15"
             f" {_mom_s} {_cpr_s} {_adx_s}"
-            f"{_ob_s}{_rev_s}{_piv_s}{RESET}"
+            f"{_ob_s}{_rev_s}{_piv_s}{_zone_s}{_pulse_s}{RESET}"
         )
     else:
         result["reason"] = (
