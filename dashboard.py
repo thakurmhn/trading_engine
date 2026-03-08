@@ -1038,6 +1038,27 @@ def _write_text_report(session, output_path: Path) -> Path:
                 age_avg = (sum(ages) / len(ages)) if ages else 0.0
                 lines.append(f"  Zone age avg (bars)    : {age_avg:.1f}")
 
+    # Phase 6.2: Trend continuation section
+    tc_activations = getattr(session, "trend_continuation_activations", 0)
+    tc_entries     = getattr(session, "trend_continuation_entries", 0)
+    tc_deactivations = getattr(session, "trend_continuation_deactivations", 0)
+    tc_side        = getattr(session, "trend_continuation_side", "")
+    if tc_activations > 0 or tc_entries > 0:
+        tc_trades = [t for t in session.trades if t.get("reason") == "TREND_CONTINUATION" or t.get("source") == "TREND_CONTINUATION"]
+        tc_wins   = sum(1 for t in tc_trades if t.get("pnl_pts", 0) > 0)
+        tc_losses = sum(1 for t in tc_trades if t.get("pnl_pts", 0) <= 0)
+        tc_pnl    = sum(t.get("pnl_pts", 0) for t in tc_trades)
+        lines.append("")
+        lines.append("  TREND CONTINUATION (Phase 6.2)")
+        lines.append(sep2)
+        lines.append(f"  Activations            : {tc_activations}  (directional tilt detected)")
+        lines.append(f"  Continuation entries   : {tc_entries}  (re-entries in trend direction)")
+        lines.append(f"  Deactivations          : {tc_deactivations}  (price returned to S4-R4 range)")
+        lines.append(f"  Active side            : {tc_side or 'N/A'}")
+        if tc_trades:
+            lines.append(f"  W/L                    : {tc_wins}/{tc_losses}")
+            lines.append(f"  Total P&L (pts)        : {tc_pnl:+.1f}")
+
     # Exit governance attribution
     tg_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"})
     rev_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"REVERSAL_EXIT", "MOMENTUM_EXHAUSTION"})
@@ -1400,6 +1421,9 @@ def compare_sessions(
             "governance_easy_count":     sum(getattr(s, "governance_easy_count", 0) for s in sessions),
             "governance_strict_count":   sum(getattr(s, "governance_strict_count", 0) for s in sessions),
             "tilt_bias_override_count":  sum(getattr(s, "tilt_bias_override_count", 0) for s in sessions),
+            # Phase 6.2
+            "trend_continuation_activations": sum(getattr(s, "trend_continuation_activations", 0) for s in sessions),
+            "trend_continuation_entries":     sum(getattr(s, "trend_continuation_entries", 0) for s in sessions),
         }
 
     base = _aggregate(baseline_sessions)

@@ -55,7 +55,7 @@ from indicators import (
     classify_cpr_width,
 )
 
-from signals import detect_signal, get_opening_range, compute_tilt_state
+from signals import detect_signal, get_opening_range, compute_tilt_state, TrendContinuationState
 # from tickdb import tick_db
 from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
 from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
@@ -5163,6 +5163,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         # ── Compression state — fresh per symbol/session ───────────────────────
         _comp_state = CompressionState()
 
+        # ── Trend continuation state (Phase 6.2) ────────────────────────────
+        _trend_cont = TrendContinuationState()
+        _trend_cont_trades = 0  # total continuation entries this session
+
         # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
         class _FakeTime:
             __slots__ = ("hour", "minute")
@@ -5286,6 +5290,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if not slice_15m.empty and len(slice_15m) >= 3:
                 _comp_state.update(slice_15m)
 
+            # ── Trend continuation update (Phase 6.2) ────────────────────────
+            if _daily_cam is not None:
+                _tc_s4 = float(_daily_cam.get("s4", float("nan")))
+                _tc_r4 = float(_daily_cam.get("r4", float("nan")))
+                _tc_adx = float(last_row.get("adx14", 0) or 0)
+                _trend_cont.update(bar_close, _tc_s4, _tc_r4, _tc_adx, i)
+
             # ── POSITION MONITOR — runs every bar when a trade is open ─────────
             # Works in both signal_only=True AND False modes.
             # While pm.is_open(): detect_signal is bypassed — no repeated orders.
@@ -5311,16 +5322,23 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     record = pm.close(i, bar_time, bar_close,
                                       decision.exit_px, decision.reason, quantity)
                     trade_log.append(record)
+                    # Phase 6.2: Record exit for trend continuation spacing
+                    _trend_cont.record_exit(bar_close)
                     # Cooldown: 5 bars minimum (15 min).
                     # After a LOSING trade (pnl_points <= 0): extend to 10 bars (30 min).
-                    # Prevents immediate revenge entries in choppy/ranging conditions.
+                    # Phase 6.2: When trend continuation active, reduce cooldown
+                    #   to 3 bars (9 min) for wins, 5 bars (15 min) for losses.
                     _is_loss = record.get("pnl_points", 0) <= 0
-                    cooldown_until = i + (10 if _is_loss else 5)
+                    if _trend_cont.is_active:
+                        cooldown_until = i + (5 if _is_loss else 3)
+                    else:
+                        cooldown_until = i + (10 if _is_loss else 5)
                     if _is_loss:
                         logging.info(
                             f"  [LOSS COOLDOWN] {record.get('exit_reason','?')} "
                             f"pnl={record.get('pnl_points',0):.1f} — "
-                            f"next entry allowed after bar {cooldown_until} (30 min)"
+                            f"next entry allowed after bar {cooldown_until} "
+                            f"({'trend_cont' if _trend_cont.is_active else 'standard'})"
                         )
                     # After exit: don't evaluate entry on the same bar
                 continue
@@ -5344,6 +5362,55 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             # ── ENTRY EVALUATION — only runs when no position is open ──────────
             atr, _ = resolve_atr(slice_3m)
+
+            # ── TREND CONTINUATION RE-ENTRY (Phase 6.2) ──────────────────────
+            # When trend continuation is active and spacing satisfied,
+            # bypass quality gate and enter directly in the trend direction.
+            if _trend_cont.is_active and _trend_cont.can_re_enter(bar_close, atr):
+                _tc_side = _trend_cont.active_side
+                entry_premium = round(bar_close * 0.006, 1)
+                _tc_signal = {
+                    "side": _tc_side,
+                    "reason": "TREND_CONTINUATION",
+                    "source": "TREND_CONTINUATION",
+                    "score": 70,
+                    "strength": "HIGH",
+                    "atr_entry": atr,
+                    "entry_candle": len(slice_3m) - 1,
+                    "prev_gap": 0,
+                    "momentum": 0,
+                    "trail_updates": 0,
+                    "consec_count": 0,
+                    "peak_momentum": 0,
+                    "peak_candle": len(slice_3m) - 1,
+                    "plateau_count": 0,
+                    "partial_booked": False,
+                    "trend_continuation": True,
+                    "continuation_num": _trend_cont.continuation_count + 1,
+                    "open_bias_aligned": "ALIGNED",
+                }
+                logging.info(
+                    f"  {GREEN}[TREND_CONTINUATION][ENTRY] bar={i} {bar_time} | "
+                    f"{_tc_side} #{_trend_cont.continuation_count + 1} "
+                    f"close={bar_close:.2f} atr={atr:.1f} "
+                    f"premium={entry_premium:.1f}{RESET}"
+                )
+                apply_day_type_to_pm(pm, _day_type)
+                pm.open(i, bar_time, bar_close, entry_premium, _tc_signal)
+                _trend_cont.record_entry()
+                _trend_cont_trades += 1
+                signals_fired.append({
+                    "bar":         i,
+                    "time":        bar_time,
+                    "side":        _tc_side,
+                    "score":       70,
+                    "reason":      "TREND_CONTINUATION",
+                    "source":      "TREND_CONTINUATION",
+                    "pivot":       "",
+                    "underlying":  bar_close,
+                    "est_premium": entry_premium,
+                })
+                continue
 
             # ── Compression breakout entry — bypasses scoring gate ────────────
             if _comp_state.has_entry:
@@ -5688,6 +5755,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             logging.info(f"\n  Signal blockers:")
             for reason, cnt in blocker_counts.most_common(10):
                 logging.info(f"    {reason:30s}: {cnt} bars")
+
+        # Phase 6.2: Trend continuation summary
+        if _trend_cont_trades > 0:
+            logging.info(f"\n  Trend Continuation:")
+            logging.info(f"    Continuation entries : {_trend_cont_trades}")
+            logging.info(f"    Active side          : {_trend_cont.active_side or 'N/A'}")
+            logging.info(f"    Still active at EOD  : {_trend_cont.is_active}")
 
         logging.info("-" * 80 + "\n")
 

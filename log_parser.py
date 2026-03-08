@@ -239,6 +239,8 @@ _P_TAGS = [
     "TILT_STATE",
     "GOVERNANCE_EASY",
     "GOVERNANCE_STRICT",
+    # Phase 6.2: Trend continuation
+    "TREND_CONTINUATION",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 
@@ -436,6 +438,22 @@ _RE_TILT_BIAS_OVERRIDE = re.compile(r"\[GOVERNANCE_EASY\]\[BIAS_MISALIGN_BYPASSE
 # [ENTRY ALLOWED][ST_SLOPE_OVERRIDE]
 _RE_ST_SLOPE_OVERRIDE = re.compile(r"\[ENTRY ALLOWED\]\[ST_SLOPE_OVERRIDE\]", re.IGNORECASE)
 
+# Phase 6.2: Trend continuation
+# [TREND_CONTINUATION][ACTIVATED] bar=120 side=PUT consec_bars=15 ADX=28.3 ...
+_RE_TREND_CONT_ACTIVATED = re.compile(
+    r"\[TREND_CONTINUATION\]\[ACTIVATED\].*?side=(?P<side>CALL|PUT)",
+    re.IGNORECASE,
+)
+# [TREND_CONTINUATION][ENTRY] bar=130 PUT #2 close=22100.00 ...
+_RE_TREND_CONT_ENTRY = re.compile(
+    r"\[TREND_CONTINUATION\]\[ENTRY\].*?(?P<side>CALL|PUT)\s+#(?P<num>\d+)",
+    re.IGNORECASE,
+)
+# [TREND_CONTINUATION][DEACTIVATED] bar=200 ...
+_RE_TREND_CONT_DEACTIVATED = re.compile(
+    r"\[TREND_CONTINUATION\]\[DEACTIVATED\]", re.IGNORECASE,
+)
+
 
 # ── SessionSummary dataclass ──────────────────────────────────────────────────
 
@@ -492,6 +510,12 @@ class SessionSummary:
     governance_easy_count: int = 0       # [GOVERNANCE_EASY] events
     governance_strict_count: int = 0     # [GOVERNANCE_STRICT] events
     tilt_bias_override_count: int = 0    # [GOVERNANCE_EASY][BIAS_MISALIGN_BYPASSED] events
+
+    # ── Phase 6.2: Trend continuation ────────────────────────────────────────
+    trend_continuation_activations: int = 0  # [TREND_CONTINUATION][ACTIVATED]
+    trend_continuation_entries: int = 0      # [TREND_CONTINUATION][ENTRY] count
+    trend_continuation_deactivations: int = 0  # [TREND_CONTINUATION][DEACTIVATED]
+    trend_continuation_side: str = ""        # last activated side (CALL/PUT)
 
     # ── Volatility context tracking ───────────────────────────────────────────
     vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
@@ -767,6 +791,11 @@ class SessionSummary:
             "governance_strict_count":   self.governance_strict_count,
             "tilt_bias_override_count":  self.tilt_bias_override_count,
             "tilt_performance":          self.tilt_performance,
+            # Phase 6.2
+            "trend_continuation_activations": self.trend_continuation_activations,
+            "trend_continuation_entries":     self.trend_continuation_entries,
+            "trend_continuation_deactivations": self.trend_continuation_deactivations,
+            "trend_continuation_side":       self.trend_continuation_side,
         }
 
 
@@ -813,6 +842,9 @@ class LogParser:
          # Phase 6.1
          p61_tilt_state, p61_gov_easy, p61_gov_strict,
          p612_tilt_bias_override,
+         # Phase 6.2
+         p62_tc_activations, p62_tc_entries,
+         p62_tc_deactivations, p62_tc_side,
          ) = self._scan_file()
 
         if session_types:
@@ -869,6 +901,11 @@ class LogParser:
             governance_easy_count=p61_gov_easy,
             governance_strict_count=p61_gov_strict,
             tilt_bias_override_count=p612_tilt_bias_override,
+            # Phase 6.2
+            trend_continuation_activations=p62_tc_activations,
+            trend_continuation_entries=p62_tc_entries,
+            trend_continuation_deactivations=p62_tc_deactivations,
+            trend_continuation_side=p62_tc_side,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -942,6 +979,11 @@ class LogParser:
         governance_easy_count: int = 0
         governance_strict_count: int = 0
         tilt_bias_override_count: int = 0
+        # Phase 6.2 counters
+        trend_cont_activations: int = 0
+        trend_cont_entries: int = 0
+        trend_cont_deactivations: int = 0
+        trend_cont_side: str = ""
         _last_tilt_state: str = "NEUTRAL"        # last-seen for trade attribution
         _last_bias_alignment: str = "NEUTRAL"   # last-seen for trade attribution
         # Last-seen regime context for trade attribution
@@ -1423,6 +1465,22 @@ class LogParser:
                     tags["GOVERNANCE_STRICT"] = tags.get("GOVERNANCE_STRICT", 0) + 1
                     continue
 
+                # ── Phase 6.2: Trend continuation ───────────────────────
+                m = _RE_TREND_CONT_ACTIVATED.search(line)
+                if m:
+                    trend_cont_activations += 1
+                    trend_cont_side = m.group("side")
+                    tags["TREND_CONTINUATION"] = tags.get("TREND_CONTINUATION", 0) + 1
+                    continue
+                m = _RE_TREND_CONT_ENTRY.search(line)
+                if m:
+                    trend_cont_entries += 1
+                    tags["TREND_CONTINUATION"] = tags.get("TREND_CONTINUATION", 0) + 1
+                    continue
+                if _RE_TREND_CONT_DEACTIVATED.search(line):
+                    trend_cont_deactivations += 1
+                    continue
+
                 # ── P1–P5 tags ────────────────────────────────────────────
                 m = _RE_TAG_ANY.search(line)
                 if m:
@@ -1500,7 +1558,10 @@ class LogParser:
                 pulse_exhaustion_count, zone_absorption_count, spread_noise_count,
                 # Phase 6.1
                 tilt_state_count, governance_easy_count, governance_strict_count,
-                tilt_bias_override_count)
+                tilt_bias_override_count,
+                # Phase 6.2
+                trend_cont_activations, trend_cont_entries,
+                trend_cont_deactivations, trend_cont_side)
 
     @staticmethod
     def _log_ts(line: str) -> str:

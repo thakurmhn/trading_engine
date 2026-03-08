@@ -96,6 +96,7 @@ _sig = sys.modules["signals"]
 _sig.detect_signal = MagicMock(return_value=None)
 _sig.get_opening_range = MagicMock(return_value=(None, None))
 _sig.compute_tilt_state = MagicMock(return_value="NEUTRAL")
+_sig.TrendContinuationState = MagicMock()
 
 # -- orchestration --
 _orch = sys.modules["orchestration"]
