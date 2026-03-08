@@ -6,7 +6,10 @@ import re
 import numpy as np
 import pandas as pd
 import pendulum as dt
-from fyers_apiv3 import fyersModel
+try:
+    from fyers_apiv3 import fyersModel
+except ImportError:
+    fyersModel = None  # offline replay doesn't need fyers SDK
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -18,10 +21,28 @@ from config import (
     SLOPE_ADX_GATE,
     TIME_SLOPE_ADX_GATE,
 )
-from setup import (
-    df, fyers, ticker, option_chain, spot_price,
-    start_time, end_time, hist_data
-)
+# Lazy import: setup.py makes live API calls at module level.
+# For offline replay (--db flag), these aren't needed and would fail
+# without a valid Fyers session.  Imported on demand in _ensure_setup().
+_setup_loaded = False
+df = fyers = ticker = option_chain = spot_price = None
+start_time = end_time = hist_data = None
+
+
+def _ensure_setup():
+    """Import setup.py globals on first use (live/paper mode only)."""
+    global _setup_loaded, df, fyers, ticker, option_chain, spot_price
+    global start_time, end_time, hist_data
+    if _setup_loaded:
+        return
+    from setup import (
+        df as _df, fyers as _fyers, ticker as _ticker,
+        option_chain as _oc, spot_price as _sp,
+        start_time as _st, end_time as _et, hist_data as _hd
+    )
+    df, fyers, ticker, option_chain, spot_price = _df, _fyers, _ticker, _oc, _sp
+    start_time, end_time, hist_data = _st, _et, _hd
+    _setup_loaded = True
 from indicators import (
     calculate_cpr,
     calculate_traditional_pivots,
@@ -34,7 +55,7 @@ from indicators import (
     classify_cpr_width,
 )
 
-from signals import detect_signal, get_opening_range
+from signals import detect_signal, get_opening_range, compute_tilt_state, TrendContinuationState
 # from tickdb import tick_db
 from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
 from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
@@ -108,8 +129,8 @@ DEFAULT_OSC_CCI_CALL = 130.0
 DEFAULT_OSC_CCI_PUT = -130.0
 DEFAULT_OSC_WR_CALL = -10.0
 DEFAULT_OSC_WR_PUT = -88.0
-EMA_STRETCH_BLOCK_MULT = 3.0
-EMA_STRETCH_TAG_MULT = 2.0
+EMA_STRETCH_BLOCK_MULT = 2.5   # Block entries > 2.5x ATR from EMA (mean reversion risk)
+EMA_STRETCH_TAG_MULT = 1.8
 MAX_TRADE_TREND = 8
 MAX_TRADE_SCALP = 12
 
@@ -126,6 +147,9 @@ except NameError:
 today_str = dt.now(time_zone).strftime("%Y-%m-%d")
 
 _compression_state = CompressionState()   # for paper_order / live_order
+
+# Phase 6: Slope conflict persistence counter {symbol: consecutive_bars_blocked}
+_slope_conflict_bars = {}
 
 # Phase 4: Zone cache for paper/live order (loaded once per session)
 _paper_zones = []        # List[Zone] for paper_order zone revisit detection
@@ -970,6 +994,7 @@ def _trend_entry_quality_gate(
     failed_breakout_signal=None,
     day_type_result=None,
     open_bias_context=None,
+    daily_camarilla_levels=None,
 ):
     """Hard quality gate for trend entries.
 
@@ -1061,6 +1086,16 @@ def _trend_entry_quality_gate(
     st_details["close_below_s4"] = close_below_s4
     st_details["close_above_r4"] = close_above_r4
     st_details["osc_override_s4"] = osc_override
+
+    # Phase 6.1: Compute tilt state for governance relaxation
+    _tilt_state = compute_tilt_state(close_val, cpr_levels, camarilla_levels)
+    st_details["tilt_state"] = _tilt_state
+    _tilt_aligned = (
+        (_tilt_state == "BULLISH_TILT" and allowed_side == "CALL")
+        or (_tilt_state == "BEARISH_TILT" and allowed_side == "PUT")
+    )
+    st_details["tilt_aligned"] = _tilt_aligned
+
     logging.info(
         "[ENTRY DIAG][S4_R4_BREAK] "
         f"timestamp={timestamp} symbol={symbol} close={close_val} s4={s4_val} r4={r4_val} "
@@ -1069,6 +1104,32 @@ def _trend_entry_quality_gate(
         f"close_below_s4={close_below_s4} close_above_r4={close_above_r4} "
         f"cpr_width={cpr_width} compressed_cam={compressed_cam}"
     )
+
+    # ── Daily Camarilla S4/R4 directional filter (hard block) ──────────────
+    # Uses FIXED previous-day Camarilla levels (not rolling 3m recalculation).
+    # If price is below daily S4 → bearish regime → block CALL entries.
+    # If price is above daily R4 → bullish regime → block PUT entries.
+    if daily_camarilla_levels and np.isfinite(close_val):
+        _daily_s4 = float(daily_camarilla_levels.get("s4", float("nan")))
+        _daily_r4 = float(daily_camarilla_levels.get("r4", float("nan")))
+        st_details["daily_s4"] = _daily_s4
+        st_details["daily_r4"] = _daily_r4
+        if np.isfinite(_daily_s4) and close_val < _daily_s4 and allowed_side == "CALL":
+            logging.info(
+                f"[ENTRY BLOCKED][DAILY_S4_FILTER] timestamp={timestamp} symbol={symbol} "
+                f"side=CALL close={close_val:.1f} daily_s4={_daily_s4:.1f} "
+                f"reason=Price below daily S4, bearish regime — CALL blocked"
+            )
+            st_details["blocked_by"] = "DAILY_S4_FILTER"
+            return False, allowed_side, "Price below daily S4 — CALL blocked in bearish regime.", st_details
+        if np.isfinite(_daily_r4) and close_val > _daily_r4 and allowed_side == "PUT":
+            logging.info(
+                f"[ENTRY BLOCKED][DAILY_R4_FILTER] timestamp={timestamp} symbol={symbol} "
+                f"side=PUT close={close_val:.1f} daily_r4={_daily_r4:.1f} "
+                f"reason=Price above daily R4, bullish regime — PUT blocked"
+            )
+            st_details["blocked_by"] = "DAILY_R4_FILTER"
+            return False, allowed_side, "Price above daily R4 — PUT blocked in bullish regime.", st_details
 
     if not aligned:
         candidate_side = None
@@ -1080,6 +1141,27 @@ def _trend_entry_quality_gate(
             candidate_side = "CALL"
         elif close_below_s4:
             candidate_side = "PUT"
+
+        # Apply daily S4/R4 filter to conflict candidates too
+        if daily_camarilla_levels and np.isfinite(close_val) and candidate_side:
+            _daily_s4 = float(daily_camarilla_levels.get("s4", float("nan")))
+            _daily_r4 = float(daily_camarilla_levels.get("r4", float("nan")))
+            if np.isfinite(_daily_s4) and close_val < _daily_s4 and candidate_side == "CALL":
+                logging.info(
+                    f"[ENTRY BLOCKED][DAILY_S4_FILTER] timestamp={timestamp} symbol={symbol} "
+                    f"side=CALL close={close_val:.1f} daily_s4={_daily_s4:.1f} "
+                    f"reason=ST conflict candidate CALL blocked — price below daily S4"
+                )
+                st_details["blocked_by"] = "DAILY_S4_FILTER"
+                return False, candidate_side, "Price below daily S4 — CALL blocked.", st_details
+            if np.isfinite(_daily_r4) and close_val > _daily_r4 and candidate_side == "PUT":
+                logging.info(
+                    f"[ENTRY BLOCKED][DAILY_R4_FILTER] timestamp={timestamp} symbol={symbol} "
+                    f"side=PUT close={close_val:.1f} daily_r4={_daily_r4:.1f} "
+                    f"reason=ST conflict candidate PUT blocked — price above daily R4"
+                )
+                st_details["blocked_by"] = "DAILY_R4_FILTER"
+                return False, candidate_side, "Price above daily R4 — PUT blocked.", st_details
 
         st_conflict_override = False
         st_conflict_reason = None
@@ -1201,7 +1283,31 @@ def _trend_entry_quality_gate(
                 f"TREND_ADX_BIAS_OVERRIDE: adx={adx_val:.1f} > 40 and open_bias_aligned=True"
             )
 
+        # Path F: persistent slope conflict override — if slope conflict has persisted
+        # > N bars, allow entry since the signal is likely still valid but slope is lagging.
+        if _slope_override_reason is None:
+            _sym_key = str(symbol)
+            _slope_conflict_bars[_sym_key] = _slope_conflict_bars.get(_sym_key, 0) + 1
+            _slope_time_limit = int(globals().get("SLOPE_CONFLICT_TIME_BARS", 5))
+            if _slope_conflict_bars[_sym_key] >= _slope_time_limit:
+                _slope_override_reason = (
+                    f"SLOPE_OVERRIDE_TIME: conflict persisted {_slope_conflict_bars[_sym_key]} bars "
+                    f">= limit={_slope_time_limit}"
+                )
+                _slope_conflict_bars[_sym_key] = 0  # reset after override
+
+        # Path G: tilt-based governance relaxation — when price is decisively
+        # above R3+CPR (BULLISH_TILT) or below S3+CPR (BEARISH_TILT), slope
+        # conflict is less meaningful because price structure confirms direction.
+        if _slope_override_reason is None and _tilt_aligned:
+            _slope_override_reason = (
+                f"TILT_GOVERNANCE_OVERRIDE: tilt={_tilt_state} side={allowed_side} "
+                f"close={close_val:.2f} r3={r3_val} s3={s3_val}"
+            )
+
         if _slope_override_reason:
+            # Reset slope conflict counter on override
+            _slope_conflict_bars[str(symbol)] = 0
             _entry_log(
                 "[ENTRY ALLOWED][ST_SLOPE_OVERRIDE] "
                 f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
@@ -1215,6 +1321,11 @@ def _trend_entry_quality_gate(
                 f"open_bias_aligned={_bias_aligned_fast} "
                 f"reason={_slope_override_reason}"
             )
+            if "SLOPE_OVERRIDE_TIME" in _slope_override_reason:
+                logging.info(
+                    f"[SLOPE_OVERRIDE_TIME] timestamp={timestamp} symbol={symbol} "
+                    f"side={allowed_side} bars={_slope_time_limit}"
+                )
             st_details["slope_override_reason"] = _slope_override_reason
         else:
             logging.info(
@@ -1228,7 +1339,14 @@ def _trend_entry_quality_gate(
                 f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
                 f"ST3m_bias={st_details['ST3m_bias']} ST3m_slope={st_details['ST3m_slope']}"
             )
+            logging.info(
+                f"[CONFLICT_BLOCKED] timestamp={timestamp} symbol={symbol} "
+                f"side={allowed_side} type=ST_SLOPE_CONFLICT "
+                f"conflict_bars={_slope_conflict_bars.get(str(symbol), 0)}"
+            )
             return False, allowed_side, "Slope mismatch, entry suppressed.", st_details
+    # Reset slope conflict counter when slope is aligned
+    _slope_conflict_bars[str(symbol)] = 0
     logging.info(
         "[ENTRY CHECK][ST_BIAS_OK] "
         f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
@@ -1248,6 +1366,9 @@ def _trend_entry_quality_gate(
         elif allowed_side == "PUT" and close_below_s4 and compressed_cam:
             adx_override = True
             adx_override_reason = "CPR_PIVOT_ADX_OVERRIDE PUT close_below_s4 with compressed_cam"
+        elif _tilt_aligned:
+            adx_override = True
+            adx_override_reason = f"TILT_ADX_OVERRIDE: tilt={_tilt_state} side={allowed_side}"
 
         if adx_override:
             st_details["weak_adx_override"] = True
@@ -1307,12 +1428,27 @@ def _trend_entry_quality_gate(
             and reversal_signal.get("side") == allowed_side
             and float(reversal_signal.get("score", 0)) >= 70.0
         )
-        if _ema_override:
+        # Daily Camarilla override: if price below daily S4 (PUT) or above daily R4 (CALL),
+        # the EMA stretch is trend continuation on a gap/breakout day, not overextension.
+        _ema_daily_override = False
+        if daily_camarilla_levels and np.isfinite(close_val):
+            _d_s4 = float(daily_camarilla_levels.get("s4", float("nan")))
+            _d_r4 = float(daily_camarilla_levels.get("r4", float("nan")))
+            if allowed_side == "PUT" and np.isfinite(_d_s4) and close_val < _d_s4:
+                _ema_daily_override = True
+            elif allowed_side == "CALL" and np.isfinite(_d_r4) and close_val > _d_r4:
+                _ema_daily_override = True
+        if _ema_override or _ema_daily_override:
+            _ovr_reason = (
+                "Aligned high-score reversal override."
+                if _ema_override
+                else f"Daily Camarilla trend continuation: {'below S4' if allowed_side == 'PUT' else 'above R4'}"
+            )
             st_details["ema_stretch_override"] = True
             logging.info(
                 "[EMA_STRETCH][OVERRIDE] "
                 f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
-                f"stretch={ema_stretch_mult:.2f}x reason=Aligned high-score reversal override."
+                f"stretch={ema_stretch_mult:.2f}x reason={_ovr_reason}"
             )
         else:
             st_details["ema_stretch_blocked"] = True
@@ -1501,6 +1637,13 @@ def _trend_entry_quality_gate(
         f"thresholds=RSI[{_eff_rsi_min:.1f},{_eff_rsi_max:.1f}] "
         f"CCI[{_eff_cci_min:.1f},{_eff_cci_max:.1f}]"
     )
+    # Phase 6.1: Governance attribution
+    _gov_tag = "GOVERNANCE_EASY" if _tilt_aligned else "GOVERNANCE_STRICT"
+    st_details["governance"] = "EASY" if _tilt_aligned else "STRICT"
+    logging.info(
+        f"[{_gov_tag}] timestamp={timestamp} symbol={symbol} "
+        f"side={allowed_side} tilt={_tilt_state}"
+    )
     logging.info(
         "[ENTRY_GATE_CONTEXT] "
         f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
@@ -1577,15 +1720,29 @@ def _trend_entry_quality_gate(
     _bias_misaligned = not merged_ctx.get("bias_aligned", True)
 
     if _bias_misaligned and _osc_in_extreme:
-        logging.info(
-            "[ENTRY BLOCKED][BIAS_MISALIGN_BLOCKED] "
-            f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
-            f"bias={merged_ctx.get('bias', 'UNKNOWN')} gap={merged_ctx.get('gap_tag', 'UNKNOWN')} "
-            f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
-            f"rsi_expanded={_rsi_in_expanded} cci_expanded={_cci_in_expanded} "
-            "reason=Bias misaligned AND oscillator in extreme zone, entry suppressed."
-        )
-        return False, allowed_side, "Bias misalignment with oscillator extreme, entry suppressed.", st_details
+        # Phase 6.1.2: Tilt-aligned entries bypass bias misalignment block —
+        # price structure (above R3+TC or below S3+BC) overrides day bias when
+        # both tilt and entry side agree.
+        if _tilt_aligned:
+            logging.info(
+                "[GOVERNANCE_EASY][BIAS_MISALIGN_BYPASSED] "
+                f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                f"tilt={_tilt_state} bias={merged_ctx.get('bias', 'UNKNOWN')} "
+                f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
+                "reason=Tilt-aligned, bias misalignment block bypassed"
+            )
+            st_details["governance"] = "EASY"
+            st_details["tilt_bias_override"] = True
+        else:
+            logging.info(
+                "[ENTRY BLOCKED][BIAS_MISALIGN_BLOCKED] "
+                f"timestamp={timestamp} symbol={symbol} allowed_side={allowed_side} "
+                f"bias={merged_ctx.get('bias', 'UNKNOWN')} gap={merged_ctx.get('gap_tag', 'UNKNOWN')} "
+                f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
+                f"rsi_expanded={_rsi_in_expanded} cci_expanded={_cci_in_expanded} "
+                "reason=Bias misaligned AND oscillator in extreme zone, entry suppressed."
+            )
+            return False, allowed_side, "Bias misalignment with oscillator extreme, entry suppressed.", st_details
 
     # Case 4: S4/R4 breakout relief — price below S4−ATR (PUT) or above R4+ATR (CALL)
     # When price trades decisively outside the Camarilla extreme levels, oscillator
@@ -1634,6 +1791,19 @@ def _trend_entry_quality_gate(
             "reason=Price above R4+ATR relief."
         )
         st_details["osc_relief_override"] = True
+        return True, allowed_side, "OK", st_details
+
+    # Phase 6.1: Tilt-based oscillator relaxation — when tilt is aligned with side,
+    # oscillator extremes reflect momentum continuation, not exhaustion.
+    if _tilt_aligned:
+        logging.info(
+            f"[GOVERNANCE_EASY] timestamp={timestamp} symbol={symbol} "
+            f"side={allowed_side} tilt={_tilt_state} "
+            f"RSI={rsi_val:.1f} CCI={cci_val:.1f} "
+            "reason=Tilt-aligned oscillator extreme bypassed"
+        )
+        st_details["governance"] = "EASY"
+        st_details["tilt_osc_override"] = True
         return True, allowed_side, "OK", st_details
 
     # All cases exhausted — genuinely blocked (log only here so relief is not counted as block)
@@ -2337,7 +2507,14 @@ risk_info = {
     "halt_trading": False
 }
 
-if account_type == 'PAPER':
+# Detect offline replay mode: skip paper/live init that needs setup.py (Fyers API)
+import sys as _sys
+_is_offline_replay = ("--db" in _sys.argv) if hasattr(_sys, "argv") else False
+
+paper_info = None
+live_info = None
+
+if not _is_offline_replay and account_type == 'PAPER':
     try:
         paper_info = load(account_type)
     except Exception:
@@ -2445,7 +2622,7 @@ if account_type == 'PAPER':
         }
     paper_info = _hydrate_runtime_state(paper_info, account_type, "PAPER")
 
-else:
+elif not _is_offline_replay:
     try:
         live_info = load(account_type)
     except Exception:
@@ -3451,6 +3628,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     # This logic is implicitly handled by _trend_entry_quality_gate which takes reversal_signal
     # and allows overrides. We just need to ensure we don't fire conflicting orders.
 
+    # ── LATE-ENTRY GATE (paper/live) — no entries within 25 min of EOD exit ──
+    _bar_min_now = ct.hour * 60 + ct.minute
+    if _bar_min_now >= 14 * 60 + 45:
+        logging.info(
+            f"[ENTRY BLOCKED][LATE_ENTRY] timestamp={ct} symbol={ticker} "
+            f"time={ct.hour:02d}:{ct.minute:02d} reason=Too close to EOD (15:10), entry suppressed"
+        )
+        _save_trades_paper()
+        store(paper_info, account_type)
+        return
+
     log_entry_green(
         f"[ENTRY ATTEMPT][TREND][PAPER] symbol={ticker} "
         f"atr={atr:.2f} trade_count={paper_info.get('trade_count', 0)} "
@@ -4176,6 +4364,17 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         logging.info("[REVERSAL_SIGNAL_DEFAULT] No reversal signal detected")
         
     _fb_sig_live = detect_failed_breakout(candles_3m, cam_pre)
+
+    # ── LATE-ENTRY GATE (live) — no entries within 25 min of EOD exit ──────
+    _bar_min_live = ct.hour * 60 + ct.minute
+    if _bar_min_live >= 14 * 60 + 45:
+        logging.info(
+            f"[ENTRY BLOCKED][LATE_ENTRY] timestamp={ct} symbol={ticker} "
+            f"time={ct.hour:02d}:{ct.minute:02d} reason=Too close to EOD (15:10), entry suppressed"
+        )
+        store(live_info, account_type)
+        return
+
     log_entry_green(
         f"[ENTRY ATTEMPT][TREND][LIVE] symbol={ticker} "
         f"atr={atr:.2f} trade_count={live_info.get('trade_count', 0)} "
@@ -4657,6 +4856,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
     # ── Resolve DB path: explicit arg → tick_db attributes → give up ──────────
     _db_path = db_path
+    # Auto-append .db extension if missing — prevents connecting to empty stub files
+    if _db_path and not str(_db_path).endswith(".db"):
+        _db_path = str(_db_path) + ".db"
     if _db_path is None:
         for _attr in ("db_path", "path", "database", "db_file", "_db_path"):
             _val = getattr(tick_db, _attr, None)
@@ -4933,6 +5135,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         # DTC is updated every bar; locked at 12:00 (midday — classification stable).
         _dtc      = None   # populated on first bar below
         _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
+        _daily_cam = None  # fixed daily Camarilla levels from previous day OHLC
         _opening_bias_logged = False
         _session_open_price = None
         _session_prev_close = None
@@ -4959,6 +5162,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
         # ── Compression state — fresh per symbol/session ───────────────────────
         _comp_state = CompressionState()
+
+        # ── Trend continuation state (Phase 6.2) ────────────────────────────
+        _trend_cont = TrendContinuationState()
+        _trend_cont_trades = 0  # total continuation entries this session
 
         # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
         class _FakeTime:
@@ -5014,6 +5221,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                         float(prev_bar["close"]),
                     )
                     _session_prev_close = float(prev_bar["close"])
+                    _daily_cam = _cam0  # fixed for entire session
                     logging.info(
                         f"[DAY TYPE] Classifier initialized "
                         f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
@@ -5082,6 +5290,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if not slice_15m.empty and len(slice_15m) >= 3:
                 _comp_state.update(slice_15m)
 
+            # ── Trend continuation update (Phase 6.2) ────────────────────────
+            if _daily_cam is not None:
+                _tc_s4 = float(_daily_cam.get("s4", float("nan")))
+                _tc_r4 = float(_daily_cam.get("r4", float("nan")))
+                _tc_adx = float(last_row.get("adx14", 0) or 0)
+                _trend_cont.update(bar_close, _tc_s4, _tc_r4, _tc_adx, i)
+
             # ── POSITION MONITOR — runs every bar when a trade is open ─────────
             # Works in both signal_only=True AND False modes.
             # While pm.is_open(): detect_signal is bypassed — no repeated orders.
@@ -5107,16 +5322,23 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     record = pm.close(i, bar_time, bar_close,
                                       decision.exit_px, decision.reason, quantity)
                     trade_log.append(record)
+                    # Phase 6.2: Record exit for trend continuation spacing
+                    _trend_cont.record_exit(bar_close)
                     # Cooldown: 5 bars minimum (15 min).
                     # After a LOSING trade (pnl_points <= 0): extend to 10 bars (30 min).
-                    # Prevents immediate revenge entries in choppy/ranging conditions.
+                    # Phase 6.2: When trend continuation active, reduce cooldown
+                    #   to 3 bars (9 min) for wins, 5 bars (15 min) for losses.
                     _is_loss = record.get("pnl_points", 0) <= 0
-                    cooldown_until = i + (10 if _is_loss else 5)
+                    if _trend_cont.is_active:
+                        cooldown_until = i + (5 if _is_loss else 3)
+                    else:
+                        cooldown_until = i + (10 if _is_loss else 5)
                     if _is_loss:
                         logging.info(
                             f"  [LOSS COOLDOWN] {record.get('exit_reason','?')} "
                             f"pnl={record.get('pnl_points',0):.1f} — "
-                            f"next entry allowed after bar {cooldown_until} (30 min)"
+                            f"next entry allowed after bar {cooldown_until} "
+                            f"({'trend_cont' if _trend_cont.is_active else 'standard'})"
                         )
                     # After exit: don't evaluate entry on the same bar
                 continue
@@ -5131,8 +5353,64 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 blocker_counts["POST_MARKET"] = blocker_counts.get("POST_MARKET", 0) + 1
                 continue
 
+            # ── LATE-ENTRY GATE — no new entries within 25 min of EOD exit ────
+            # EOD exit at 15:10, PRE_EOD at ~15:01. Entries after 14:45 have
+            # insufficient time to reach profit targets before forced exit.
+            if bar_t >= 14 * 60 + 45:
+                blocker_counts["LATE_ENTRY"] = blocker_counts.get("LATE_ENTRY", 0) + 1
+                continue
+
             # ── ENTRY EVALUATION — only runs when no position is open ──────────
             atr, _ = resolve_atr(slice_3m)
+
+            # ── TREND CONTINUATION RE-ENTRY (Phase 6.2) ──────────────────────
+            # When trend continuation is active and spacing satisfied,
+            # bypass quality gate and enter directly in the trend direction.
+            if _trend_cont.is_active and _trend_cont.can_re_enter(bar_close, atr):
+                _tc_side = _trend_cont.active_side
+                entry_premium = round(bar_close * 0.006, 1)
+                _tc_signal = {
+                    "side": _tc_side,
+                    "reason": "TREND_CONTINUATION",
+                    "source": "TREND_CONTINUATION",
+                    "score": 70,
+                    "strength": "HIGH",
+                    "atr_entry": atr,
+                    "entry_candle": len(slice_3m) - 1,
+                    "prev_gap": 0,
+                    "momentum": 0,
+                    "trail_updates": 0,
+                    "consec_count": 0,
+                    "peak_momentum": 0,
+                    "peak_candle": len(slice_3m) - 1,
+                    "plateau_count": 0,
+                    "partial_booked": False,
+                    "trend_continuation": True,
+                    "continuation_num": _trend_cont.continuation_count + 1,
+                    "open_bias_aligned": "ALIGNED",
+                }
+                logging.info(
+                    f"  {GREEN}[TREND_CONTINUATION][ENTRY] bar={i} {bar_time} | "
+                    f"{_tc_side} #{_trend_cont.continuation_count + 1} "
+                    f"close={bar_close:.2f} atr={atr:.1f} "
+                    f"premium={entry_premium:.1f}{RESET}"
+                )
+                apply_day_type_to_pm(pm, _day_type)
+                pm.open(i, bar_time, bar_close, entry_premium, _tc_signal)
+                _trend_cont.record_entry()
+                _trend_cont_trades += 1
+                signals_fired.append({
+                    "bar":         i,
+                    "time":        bar_time,
+                    "side":        _tc_side,
+                    "score":       70,
+                    "reason":      "TREND_CONTINUATION",
+                    "source":      "TREND_CONTINUATION",
+                    "pivot":       "",
+                    "underlying":  bar_close,
+                    "est_premium": entry_premium,
+                })
+                continue
 
             # ── Compression breakout entry — bypasses scoring gate ────────────
             if _comp_state.has_entry:
@@ -5206,18 +5484,23 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 failed_breakout_signal=_fb_sig_replay,
                 day_type_result=_day_type,
                 open_bias_context=_open_bias_context,
+                daily_camarilla_levels=_daily_cam,
             )
             if not quality_ok:
                 blocker_key = (
-                    "ST_CONFLICT"
-                    if "Supertrend conflict" in gate_reason
+                    "DAILY_CAM_FILTER"
+                    if "daily S4" in gate_reason or "daily R4" in gate_reason
                     else (
-                        "SLOPE_MISMATCH"
-                        if "Slope mismatch" in gate_reason
+                        "ST_CONFLICT"
+                        if "Supertrend conflict" in gate_reason
                         else (
-                            "WEAK_ADX" if "Weak trend strength" in gate_reason else (
-                                "FAILED_BREAKOUT" if "Failed breakout" in gate_reason else (
-                                    "EMA_STRETCH" if "EMA stretch" in gate_reason else "OSC_EXTREME"
+                            "SLOPE_MISMATCH"
+                            if "Slope mismatch" in gate_reason
+                            else (
+                                "WEAK_ADX" if "Weak trend strength" in gate_reason else (
+                                    "FAILED_BREAKOUT" if "Failed breakout" in gate_reason else (
+                                        "EMA_STRETCH" if "EMA stretch" in gate_reason else "OSC_EXTREME"
+                                    )
                                 )
                             )
                         )
@@ -5242,6 +5525,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             # Phase 4: zone_revisit_signal already computed at line ~5060
             _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
 
+
             try:
                 signal = detect_signal(
                     candles_3m=slice_3m,
@@ -5258,9 +5542,11 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     day_type_result=_day_type,
                     osc_relief_active=st_details.get("osc_relief_override", False),
                     zone_signal=_zone_dict,
+                    daily_camarilla_levels=_daily_cam,
                 )
             except Exception as e:
-                logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
+                logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
+                blocker_counts["SIGNAL_ERROR"] = blocker_counts.get("SIGNAL_ERROR", 0) + 1
                 continue
 
             if not signal:
@@ -5345,6 +5631,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 signal["zone_revisit_type"] = _zone_revisit_signal.get("zone_type", "UNKNOWN")
                 signal["zone_revisit_action"] = _zone_revisit_signal.get("action", "UNKNOWN")
                 signal["zone_age_bars"] = _zone_revisit_signal.get("zone_age_bars", 0)
+
+            # Phase 6.1.2: Attach tilt + governance state for replay attribution
+            signal["tilt_state"] = st_details.get("tilt_state", "NEUTRAL")
+            signal["governance"] = st_details.get("governance", "STRICT")
 
             # P3: Attach open_bias_aligned for log_parser trade attribution.
             # A CALL trade aligns with a bullish open (GAP_UP); PUT aligns with GAP_DOWN.
@@ -5466,6 +5756,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             for reason, cnt in blocker_counts.most_common(10):
                 logging.info(f"    {reason:30s}: {cnt} bars")
 
+        # Phase 6.2: Trend continuation summary
+        if _trend_cont_trades > 0:
+            logging.info(f"\n  Trend Continuation:")
+            logging.info(f"    Continuation entries : {_trend_cont_trades}")
+            logging.info(f"    Active side          : {_trend_cont.active_side or 'N/A'}")
+            logging.info(f"    Still active at EOD  : {_trend_cont.is_active}")
+
         logging.info("-" * 80 + "\n")
 
         # Auto-generate dashboard report
@@ -5541,6 +5838,9 @@ def run_strategy(symbols, tz=time_zone, end_time=None,
             db_path=db_path,
         )
         return
+
+    # ── LIVE / REPLAY need setup.py (API connection) ─────────────────────────
+    _ensure_setup()
 
     # ── LIVE (single-pass fallback) ───────────────────────────────────────────
     if mode == "LIVE":

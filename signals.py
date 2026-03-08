@@ -57,6 +57,29 @@ def _safe_float(val, default=None):
         return default
 
 
+def compute_tilt_state(close_price, cpr_levels, camarilla_levels):
+    """Compute market tilt state from current price vs CPR and Camarilla levels.
+
+    Returns:
+        str: "BULLISH_TILT", "BEARISH_TILT", or "NEUTRAL"
+    """
+    if close_price is None or not np.isfinite(close_price):
+        return "NEUTRAL"
+    tc = _safe_float((cpr_levels or {}).get("tc"))
+    bc = _safe_float((cpr_levels or {}).get("bc"))
+    r3 = _safe_float((camarilla_levels or {}).get("r3"))
+    s3 = _safe_float((camarilla_levels or {}).get("s3"))
+    if tc is None or bc is None or r3 is None or s3 is None:
+        return "NEUTRAL"
+    # BULLISH_TILT: price above CPR top AND above R3
+    if close_price > tc and close_price > r3:
+        return "BULLISH_TILT"
+    # BEARISH_TILT: price below CPR bottom AND below S3
+    if close_price < bc and close_price < s3:
+        return "BEARISH_TILT"
+    return "NEUTRAL"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC COUNTERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,7 +470,8 @@ def detect_signal(candles_3m, candles_15m,
                   day_type_result=None,  # NEW: DayTypeResult for threshold modifier
                   osc_relief_active=False,  # NEW: S4/R4 relief override from gate
                   zone_signal=None,      # Phase 4A: zone_detector output
-                  pulse_metrics=None):   # Phase 4B: pulse_module metrics dict
+                  pulse_metrics=None,    # Phase 4B: pulse_module metrics dict
+                  daily_camarilla_levels=None):  # Fixed daily S4/R4 for RSI bypass
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -569,6 +593,24 @@ def detect_signal(candles_3m, candles_15m,
         except Exception:
             pass
 
+    # 5. Previous bar close values (Phase 6: bar-close alignment)
+    close_prev_3m = None
+    if len(candles_3m) >= 2:
+        try:
+            _cpv = float(candles_3m.iloc[-2]["close"])
+            if not pd.isna(_cpv):
+                close_prev_3m = _cpv
+        except Exception:
+            pass
+    close_prev_15m = None
+    if has_15m and len(candles_15m) >= 2:
+        try:
+            _cpv15 = float(candles_15m.iloc[-2]["close"])
+            if not pd.isna(_cpv15):
+                close_prev_15m = _cpv15
+        except Exception:
+            pass
+
     # --- Build indicators dict ---
     def _safe(val):
         try:
@@ -596,6 +638,9 @@ def detect_signal(candles_3m, candles_15m,
         "cpr_width":           cpr_width,
         "entry_type":          entry_type,
         "rsi_prev":            rsi_prev,
+        # Phase 6: bar-close alignment inputs
+        "close_prev_3m":       close_prev_3m,
+        "close_prev_15m":      close_prev_15m,
     }
 
     logging.debug(
@@ -614,6 +659,7 @@ def detect_signal(candles_3m, candles_15m,
         osc_relief_active=osc_relief_active,
         zone_signal=zone_signal,
         pulse_metrics=pulse_metrics,
+        daily_camarilla_levels=daily_camarilla_levels,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────
@@ -690,10 +736,172 @@ def detect_signal(candles_3m, candles_15m,
     state["rsi"]          = _safe_float(last_3m.get("rsi14") or last_3m.get("rsi")) or "?"
     state["cci"]          = _safe_float(last_3m.get("cci20") or last_3m.get("cci")) or "?"
 
+    # Phase 6: Bias alignment attribution
+    _bd = lz_signal.get("breakdown", {})
+    _bias_align = _bd.get("_bar_align_status", "NEUTRAL")
+    _bias_tf = _bd.get("_bar_align_tf")
+    state["bias_alignment"] = _bias_align
+    state["bias_alignment_tf"] = _bias_tf
+    state["spread_noise"] = _bd.get("_spread_noise", False)
+    _ba_tag = f" [BIAS_ALIGNMENT]{_bias_align}"
+    if _bias_tf:
+        _ba_tag += f" TF={_bias_tf}"
+    logging.info(
+        f"[BIAS_ALIGNMENT] side={side} status={_bias_align} "
+        f"tf={_bias_tf or 'NONE'} "
+        f"bias15m={st_bias} bias3m={st_bias_3m}"
+    )
+
+    # Phase 6.1: Tilt state
+    _close_for_tilt = float(last_3m.get("close", 0))
+    _tilt_state = compute_tilt_state(_close_for_tilt, cpr_levels, camarilla_levels)
+    state["tilt_state"] = _tilt_state
+    logging.info(f"[TILT_STATE={_tilt_state}] side={side} close={_close_for_tilt:.2f}")
+
     logging.info(
         f"{GREEN}[SIGNAL FIRED] {side} source={source} "
         f"score={state['score']} strength={state['strength']} "
         f"bias15m={st_bias} bias3m={st_bias_3m} "
-        f"pivot={pivot_reason} {vwap_pos} | {reason}{RESET}"
+        f"pivot={pivot_reason} {vwap_pos}{_ba_tag} | {reason}{RESET}"
     )
     return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 6.2: TREND CONTINUATION STATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TrendContinuationState:
+    """Tracks persistent directional tilt for repeated entries in strong trends.
+
+    Activates TREND_CONTINUATION after `activation_bars` consecutive bars
+    where price stays below daily S4 (bearish) or above daily R4 (bullish),
+    with ADX above `adx_min`.
+
+    Once active, the replay loop can re-enter in the trend direction after
+    an exit, bypassing the normal "one entry per trade" lockout.
+    """
+
+    def __init__(
+        self,
+        activation_bars: int = 15,
+        adx_min: float = 25.0,
+        max_continuation_trades: int = 6,
+        re_entry_atr_spacing: float = 0.5,
+    ):
+        self.activation_bars = activation_bars
+        self.adx_min = adx_min
+        self.max_continuation_trades = max_continuation_trades
+        self.re_entry_atr_spacing = re_entry_atr_spacing
+
+        # Internal state
+        self._consec_below_s4: int = 0
+        self._consec_above_r4: int = 0
+        self._active_side: str | None = None  # "PUT" or "CALL"
+        self._continuation_count: int = 0
+        self._last_exit_price: float | None = None
+        self._activated: bool = False
+
+    def reset(self):
+        self._consec_below_s4 = 0
+        self._consec_above_r4 = 0
+        self._active_side = None
+        self._continuation_count = 0
+        self._last_exit_price = None
+        self._activated = False
+
+    def update(self, close: float, daily_s4: float, daily_r4: float,
+               adx: float, bar_idx: int) -> None:
+        """Call every bar to update tilt tracking."""
+        if not np.isfinite(close) or not np.isfinite(daily_s4) or not np.isfinite(daily_r4):
+            return
+
+        # Track consecutive bars below S4
+        if close < daily_s4:
+            self._consec_below_s4 += 1
+            self._consec_above_r4 = 0
+        elif close > daily_r4:
+            self._consec_above_r4 += 1
+            self._consec_below_s4 = 0
+        else:
+            # Price returned inside S4-R4 range — deactivate
+            if self._activated:
+                logging.info(
+                    f"[TREND_CONTINUATION][DEACTIVATED] bar={bar_idx} "
+                    f"close={close:.2f} returned inside S4-R4 range"
+                )
+            self._consec_below_s4 = 0
+            self._consec_above_r4 = 0
+            self._activated = False
+            self._active_side = None
+
+        # Check activation
+        if not self._activated:
+            if self._consec_below_s4 >= self.activation_bars and adx >= self.adx_min:
+                self._activated = True
+                self._active_side = "PUT"
+                logging.info(
+                    f"[TREND_CONTINUATION][ACTIVATED] bar={bar_idx} side=PUT "
+                    f"consec_bars={self._consec_below_s4} ADX={adx:.1f} "
+                    f"close={close:.2f} daily_s4={daily_s4:.2f}"
+                )
+            elif self._consec_above_r4 >= self.activation_bars and adx >= self.adx_min:
+                self._activated = True
+                self._active_side = "CALL"
+                logging.info(
+                    f"[TREND_CONTINUATION][ACTIVATED] bar={bar_idx} side=CALL "
+                    f"consec_bars={self._consec_above_r4} ADX={adx:.1f} "
+                    f"close={close:.2f} daily_r4={daily_r4:.2f}"
+                )
+
+    @property
+    def is_active(self) -> bool:
+        return self._activated
+
+    @property
+    def active_side(self) -> str | None:
+        return self._active_side
+
+    @property
+    def continuation_count(self) -> int:
+        return self._continuation_count
+
+    def can_re_enter(self, close: float, atr: float) -> bool:
+        """Check if a continuation re-entry is allowed."""
+        if not self._activated or self._active_side is None:
+            return False
+        if self._continuation_count >= self.max_continuation_trades:
+            logging.debug(
+                f"[TREND_CONTINUATION] cap reached: {self._continuation_count}"
+                f"/{self.max_continuation_trades}"
+            )
+            return False
+        # ATR spacing: require price to move at least re_entry_atr_spacing * ATR
+        # from the last exit before re-entering
+        if self._last_exit_price is not None and atr > 0:
+            spacing = self.re_entry_atr_spacing * atr
+            if self._active_side == "PUT":
+                # For PUT: price should be at or below last_exit - spacing
+                if close > self._last_exit_price - spacing:
+                    return False
+            else:
+                # For CALL: price should be at or above last_exit + spacing
+                if close < self._last_exit_price + spacing:
+                    return False
+        return True
+
+    def record_entry(self):
+        """Call when a continuation entry is taken."""
+        self._continuation_count += 1
+        logging.info(
+            f"[TREND_CONTINUATION][RE_ENTRY] #{self._continuation_count} "
+            f"side={self._active_side}"
+        )
+
+    def record_exit(self, exit_price: float):
+        """Call when a continuation trade exits — stores exit price for spacing."""
+        self._last_exit_price = exit_price
+        logging.info(
+            f"[TREND_CONTINUATION][EXIT_RECORDED] exit_price={exit_price:.2f} "
+            f"trades_taken={self._continuation_count}"
+        )

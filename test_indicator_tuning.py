@@ -57,6 +57,10 @@ _cfg.symbols            = {"index": "NSE:NIFTY50-INDEX"}
 _cfg.TREND_ENTRY_ADX_MIN = 18.0   # ← the key tuned value
 _cfg.ST_RR_RATIO         = 2.0
 _cfg.ST_TG_RR_RATIO      = 1.0
+_cfg.SLOPE_ADX_GATE      = 20.0
+_cfg.TIME_SLOPE_ADX_GATE = 25.0
+_cfg.strike_diff         = 50
+_cfg.DEFAULT_LOT_SIZE    = 1
 
 # -- setup stub --
 _stup = sys.modules["setup"]
@@ -85,6 +89,7 @@ _ind.classify_cpr_width = MagicMock(return_value="NORMAL")
 _sig = sys.modules["signals"]
 _sig.detect_signal    = MagicMock(return_value=None)
 _sig.get_opening_range = MagicMock(return_value=(None, None))
+_sig.compute_tilt_state = MagicMock(return_value="NEUTRAL")
 
 # -- orchestration stub --
 _orch = sys.modules["orchestration"]
@@ -99,6 +104,9 @@ _pm.make_replay_pm = MagicMock()
 _dt_mod = sys.modules["day_type"]
 _dt_mod.make_day_type_classifier = MagicMock()
 _dt_mod.apply_day_type_to_pm     = MagicMock()
+_dt_mod.DayType = MagicMock()
+_dt_mod.DayTypeResult = MagicMock()
+_dt_mod.DayTypeClassifier = MagicMock()
 _dt_mod.DayType        = MagicMock()
 _dt_mod.DayTypeResult  = MagicMock()
 

@@ -7,7 +7,6 @@ import pendulum as dt
 import datetime
 
 from config import time_zone, ATR_VALUE
-from setup import spot_price
 from tickdb import TickDatabase
 tick_db = TickDatabase()
 from tickdb import tick_db

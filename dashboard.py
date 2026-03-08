@@ -835,6 +835,78 @@ def _write_text_report(session, output_path: Path) -> Path:
         lines.append(f"  Regime context logs  : {_rc_count}")
         lines.append(f"  Regime adaptive logs : {_ra_count}")
 
+    # Phase 6: Bias Alignment Performance
+    _ba_perf = getattr(session, "bias_alignment_performance", {})
+    _has_ba = any(
+        status in _ba_perf and _ba_perf[status].get("trades", 0) > 0
+        for status in ("ALIGNED", "MISALIGNED")
+    )
+    if _has_ba:
+        lines.append("")
+        lines.append("  BIAS ALIGNMENT PERFORMANCE (Phase 6)")
+        lines.append(sep2)
+        lines.append(f"  {'Status':<15} {'Trades':>6} {'Wins':>5} {'WR%':>6} {'Net P&L':>10}")
+        lines.append(f"  {'─' * 15} {'─' * 6} {'─' * 5} {'─' * 6} {'─' * 10}")
+        for status in ("ALIGNED", "MISALIGNED", "NEUTRAL"):
+            perf = _ba_perf.get(status)
+            if perf and perf["trades"] > 0:
+                lines.append(
+                    f"  {status:<15} {perf['trades']:>6} {perf['winners']:>5}"
+                    f" {perf['win_rate']:>5.1f}% {perf['net_pnl']:>+10.2f}"
+                )
+        _ba_count = getattr(session, "bias_alignment_count", 0)
+        _bc_count = getattr(session, "bar_close_alignment_count", 0)
+        lines.append("")
+        lines.append(f"  Bias alignment logs     : {_ba_count}")
+        lines.append(f"  Bar-close alignment logs: {_bc_count}")
+
+    # Phase 6: Microstructure Attribution
+    _mc = getattr(session, "microstructure_counts", {})
+    _pe = _mc.get("pulse_exhaustion", 0)
+    _za = _mc.get("zone_absorption", 0)
+    _sn = _mc.get("spread_noise", 0)
+    _slope_time = getattr(session, "slope_override_time_count", 0)
+    _conflict_bl = getattr(session, "conflict_blocked_count", 0)
+    if _pe > 0 or _za > 0 or _sn > 0 or _slope_time > 0 or _conflict_bl > 0:
+        lines.append("")
+        lines.append("  MICROSTRUCTURE ATTRIBUTION (Phase 6)")
+        lines.append(sep2)
+        lines.append(f"  Pulse exhaustion events  : {_pe}")
+        lines.append(f"  Zone absorption events   : {_za}")
+        lines.append(f"  Spread noise entries     : {_sn}")
+        lines.append(f"  Slope time overrides     : {_slope_time}")
+        lines.append(f"  Conflict blocked         : {_conflict_bl}")
+
+    # Phase 6.1: Tilt Performance
+    _tilt_perf = getattr(session, "tilt_performance", {})
+    _has_tilt = any(
+        tilt in _tilt_perf and _tilt_perf[tilt].get("trades", 0) > 0
+        for tilt in ("BULLISH_TILT", "BEARISH_TILT")
+    )
+    if _has_tilt:
+        lines.append("")
+        lines.append("  TILT PERFORMANCE (Phase 6.1)")
+        lines.append(sep2)
+        lines.append(f"  {'Tilt State':<15} {'Trades':>6} {'Wins':>5} {'WR%':>6} {'Net P&L':>10}")
+        lines.append(f"  {'─' * 15} {'─' * 6} {'─' * 5} {'─' * 6} {'─' * 10}")
+        for tilt in ("BULLISH_TILT", "BEARISH_TILT", "NEUTRAL"):
+            perf = _tilt_perf.get(tilt)
+            if perf and perf["trades"] > 0:
+                lines.append(
+                    f"  {tilt:<15} {perf['trades']:>6} {perf['winners']:>5}"
+                    f" {perf['win_rate']:>5.1f}% {perf['net_pnl']:>+10.2f}"
+                )
+        _gov_easy = getattr(session, "governance_easy_count", 0)
+        _gov_strict = getattr(session, "governance_strict_count", 0)
+        _tilt_total = getattr(session, "tilt_state_count", 0)
+        lines.append("")
+        lines.append(f"  Tilt state logs          : {_tilt_total}")
+        lines.append(f"  Governance EASY entries   : {_gov_easy}")
+        lines.append(f"  Governance STRICT entries : {_gov_strict}")
+        _tilt_bias_ovr = getattr(session, "tilt_bias_override_count", 0)
+        if _tilt_bias_ovr > 0:
+            lines.append(f"  Bias misalign bypassed   : {_tilt_bias_ovr}  (tilt-aligned override)")
+
     # Reversal detection section
     rev_count = getattr(session, "reversal_trades_count", 0)
     rev_signal_count = getattr(session, "reversal_signal_count", 0)
@@ -965,6 +1037,27 @@ def _write_text_report(session, output_path: Path) -> Path:
                 ages = [float(t.get("zone_age_bars", 0)) for t in zone_trades]
                 age_avg = (sum(ages) / len(ages)) if ages else 0.0
                 lines.append(f"  Zone age avg (bars)    : {age_avg:.1f}")
+
+    # Phase 6.2: Trend continuation section
+    tc_activations = getattr(session, "trend_continuation_activations", 0)
+    tc_entries     = getattr(session, "trend_continuation_entries", 0)
+    tc_deactivations = getattr(session, "trend_continuation_deactivations", 0)
+    tc_side        = getattr(session, "trend_continuation_side", "")
+    if tc_activations > 0 or tc_entries > 0:
+        tc_trades = [t for t in session.trades if t.get("reason") == "TREND_CONTINUATION" or t.get("source") == "TREND_CONTINUATION"]
+        tc_wins   = sum(1 for t in tc_trades if t.get("pnl_pts", 0) > 0)
+        tc_losses = sum(1 for t in tc_trades if t.get("pnl_pts", 0) <= 0)
+        tc_pnl    = sum(t.get("pnl_pts", 0) for t in tc_trades)
+        lines.append("")
+        lines.append("  TREND CONTINUATION (Phase 6.2)")
+        lines.append(sep2)
+        lines.append(f"  Activations            : {tc_activations}  (directional tilt detected)")
+        lines.append(f"  Continuation entries   : {tc_entries}  (re-entries in trend direction)")
+        lines.append(f"  Deactivations          : {tc_deactivations}  (price returned to S4-R4 range)")
+        lines.append(f"  Active side            : {tc_side or 'N/A'}")
+        if tc_trades:
+            lines.append(f"  W/L                    : {tc_wins}/{tc_losses}")
+            lines.append(f"  Total P&L (pts)        : {tc_pnl:+.1f}")
 
     # Exit governance attribution
     tg_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"})
@@ -1315,6 +1408,22 @@ def compare_sessions(
             "bias_misalign_losses":      bias_misalign_losses,
             "regime_context_count":      sum(getattr(s, "regime_context_count", 0) for s in sessions),
             "regime_adaptive_count":     sum(getattr(s, "regime_adaptive_count", 0) for s in sessions),
+            # Phase 6
+            "bias_alignment_count":      sum(getattr(s, "bias_alignment_count", 0) for s in sessions),
+            "bar_close_alignment_count": sum(getattr(s, "bar_close_alignment_count", 0) for s in sessions),
+            "slope_override_time_count": sum(getattr(s, "slope_override_time_count", 0) for s in sessions),
+            "conflict_blocked_count":    sum(getattr(s, "conflict_blocked_count", 0) for s in sessions),
+            "pulse_exhaustion_count":    sum(getattr(s, "pulse_exhaustion_count", 0) for s in sessions),
+            "zone_absorption_count":     sum(getattr(s, "zone_absorption_count", 0) for s in sessions),
+            "spread_noise_count":        sum(getattr(s, "spread_noise_count", 0) for s in sessions),
+            # Phase 6.1
+            "tilt_state_count":          sum(getattr(s, "tilt_state_count", 0) for s in sessions),
+            "governance_easy_count":     sum(getattr(s, "governance_easy_count", 0) for s in sessions),
+            "governance_strict_count":   sum(getattr(s, "governance_strict_count", 0) for s in sessions),
+            "tilt_bias_override_count":  sum(getattr(s, "tilt_bias_override_count", 0) for s in sessions),
+            # Phase 6.2
+            "trend_continuation_activations": sum(getattr(s, "trend_continuation_activations", 0) for s in sessions),
+            "trend_continuation_entries":     sum(getattr(s, "trend_continuation_entries", 0) for s in sessions),
         }
 
     base = _aggregate(baseline_sessions)
