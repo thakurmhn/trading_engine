@@ -471,7 +471,8 @@ def detect_signal(candles_3m, candles_15m,
                   osc_relief_active=False,  # NEW: S4/R4 relief override from gate
                   zone_signal=None,      # Phase 4A: zone_detector output
                   pulse_metrics=None,    # Phase 4B: pulse_module metrics dict
-                  daily_camarilla_levels=None):  # Fixed daily S4/R4 for RSI bypass
+                  daily_camarilla_levels=None,  # Fixed daily S4/R4 for RSI bypass
+                  st_details=None):      # Phase 6.3: gate context for momentum path + scoring
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -648,6 +649,39 @@ def detect_signal(candles_3m, candles_15m,
         f"CPR={cpr_width} ET={entry_type} RSI_prev={rsi_prev}"
     )
 
+    # ── Phase 6.3: Momentum Entry Path (Fix 4) ───────────────────────────
+    # When no pullback/pivot pattern is detected but we have extreme
+    # directional momentum (ATR stretch > 2.0, ADX > 30, bias+slope
+    # confirm direction), synthesize a MOMENTUM_ENTRY pivot signal.
+    # This captures gap-down/gap-up moves that don't produce pullback
+    # patterns but are clearly trending.
+    _momentum_entry_fired = False
+    if pivot_signal is None:
+        _adx_for_mom = _safe(last_3m.get("adx14")) or 0
+        _st_det = st_details or {}
+        _atr_stretch_mom = float(_st_det.get("atr_stretch", 0) or 0)
+        _slope_3m = str(last_3m.get("supertrend_slope", "")).upper()
+        if (
+            _atr_stretch_mom > 2.0
+            and _adx_for_mom > 30
+        ):
+            _mom_side = None
+            if st_bias_3m == "BEARISH" and _slope_3m == "DOWN" and put_allowed:
+                _mom_side = "PUT"
+            elif st_bias_3m == "BULLISH" and _slope_3m == "UP" and call_allowed:
+                _mom_side = "CALL"
+            if _mom_side:
+                pivot_signal = (_mom_side, "MOMENTUM_ENTRY")
+                entry_type = "BREAKOUT"
+                indicators["entry_type"] = entry_type
+                _momentum_entry_fired = True
+                logging.info(
+                    f"[MOMENTUM_ENTRY] side={_mom_side} "
+                    f"atr_stretch={_atr_stretch_mom:.2f} adx={_adx_for_mom:.1f} "
+                    f"slope_3m={_slope_3m} bias_3m={st_bias_3m} "
+                    "reason=No pullback detected but extreme momentum confirms direction"
+                )
+
     # --- Scoring engine ---
     lz_signal = check_entry_condition(
         candle=last_3m,
@@ -660,6 +694,7 @@ def detect_signal(candles_3m, candles_15m,
         zone_signal=zone_signal,
         pulse_metrics=pulse_metrics,
         daily_camarilla_levels=daily_camarilla_levels,
+        st_details=st_details,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────

@@ -241,6 +241,8 @@ _P_TAGS = [
     "GOVERNANCE_STRICT",
     # Phase 6.2: Trend continuation
     "TREND_CONTINUATION",
+    "TREND_CONTINUATION_OVERRIDE",
+    "REPLAY_TREND_REENTRY",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 
@@ -439,6 +441,14 @@ _RE_TILT_BIAS_OVERRIDE = re.compile(r"\[GOVERNANCE_EASY\]\[BIAS_MISALIGN_BYPASSE
 _RE_ST_SLOPE_OVERRIDE = re.compile(r"\[ENTRY ALLOWED\]\[ST_SLOPE_OVERRIDE\]", re.IGNORECASE)
 
 # Phase 6.2: Trend continuation
+# ── Phase 6.3 regex patterns ──────────────────────────────────────────────────
+_RE_OSC_TREND_OVERRIDE = re.compile(r"\[OSC_TREND_OVERRIDE\]", re.IGNORECASE)
+_RE_TREND_ALIGN_OVERRIDE = re.compile(r"\[TREND_ALIGN_OVERRIDE\]", re.IGNORECASE)
+_RE_DAY_BIAS_PENALTY = re.compile(r"\[DAY_BIAS_PENALTY\]", re.IGNORECASE)
+_RE_MOMENTUM_ENTRY = re.compile(r"\[MOMENTUM_ENTRY\]", re.IGNORECASE)
+_RE_SIGNAL_SKIP = re.compile(r"\[SIGNAL_SKIP\]", re.IGNORECASE)
+_RE_COOLDOWN_REDUCED = re.compile(r"\[COOLDOWN_REDUCED\]", re.IGNORECASE)
+
 # [TREND_CONTINUATION][ACTIVATED] bar=120 side=PUT consec_bars=15 ADX=28.3 ...
 _RE_TREND_CONT_ACTIVATED = re.compile(
     r"\[TREND_CONTINUATION\]\[ACTIVATED\].*?side=(?P<side>CALL|PUT)",
@@ -516,6 +526,14 @@ class SessionSummary:
     trend_continuation_entries: int = 0      # [TREND_CONTINUATION][ENTRY] count
     trend_continuation_deactivations: int = 0  # [TREND_CONTINUATION][DEACTIVATED]
     trend_continuation_side: str = ""        # last activated side (CALL/PUT)
+
+    # ── Phase 6.3: Regime-aware fixes ──────────────────────────────────────────
+    osc_trend_override_count: int = 0       # [OSC_TREND_OVERRIDE] RSI floor removed
+    trend_align_override_count: int = 0     # [TREND_ALIGN_OVERRIDE] ADX-based alignment
+    day_bias_penalty_count: int = 0         # [DAY_BIAS_PENALTY] counter-trend penalized
+    momentum_entry_count: int = 0           # [MOMENTUM_ENTRY] momentum path fired
+    signal_skip_count: int = 0              # [SIGNAL_SKIP] gate open but no signal
+    cooldown_reduced_count: int = 0         # [COOLDOWN_REDUCED] regime cooldown applied
 
     # ── Volatility context tracking ───────────────────────────────────────────
     vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
@@ -796,6 +814,13 @@ class SessionSummary:
             "trend_continuation_entries":     self.trend_continuation_entries,
             "trend_continuation_deactivations": self.trend_continuation_deactivations,
             "trend_continuation_side":       self.trend_continuation_side,
+            # Phase 6.3
+            "osc_trend_override_count":      self.osc_trend_override_count,
+            "trend_align_override_count":    self.trend_align_override_count,
+            "day_bias_penalty_count":        self.day_bias_penalty_count,
+            "momentum_entry_count":          self.momentum_entry_count,
+            "signal_skip_count":             self.signal_skip_count,
+            "cooldown_reduced_count":        self.cooldown_reduced_count,
         }
 
 
@@ -845,6 +870,10 @@ class LogParser:
          # Phase 6.2
          p62_tc_activations, p62_tc_entries,
          p62_tc_deactivations, p62_tc_side,
+         # Phase 6.3
+         osc_trend_override_count, trend_align_override_count,
+         day_bias_penalty_count, momentum_entry_count,
+         signal_skip_count, cooldown_reduced_count,
          ) = self._scan_file()
 
         if session_types:
@@ -906,6 +935,13 @@ class LogParser:
             trend_continuation_entries=p62_tc_entries,
             trend_continuation_deactivations=p62_tc_deactivations,
             trend_continuation_side=p62_tc_side,
+            # Phase 6.3
+            osc_trend_override_count=osc_trend_override_count,
+            trend_align_override_count=trend_align_override_count,
+            day_bias_penalty_count=day_bias_penalty_count,
+            momentum_entry_count=momentum_entry_count,
+            signal_skip_count=signal_skip_count,
+            cooldown_reduced_count=cooldown_reduced_count,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -979,6 +1015,13 @@ class LogParser:
         governance_easy_count: int = 0
         governance_strict_count: int = 0
         tilt_bias_override_count: int = 0
+        # Phase 6.3 counters
+        osc_trend_override_count: int = 0
+        trend_align_override_count: int = 0
+        day_bias_penalty_count: int = 0
+        momentum_entry_count: int = 0
+        signal_skip_count: int = 0
+        cooldown_reduced_count: int = 0
         # Phase 6.2 counters
         trend_cont_activations: int = 0
         trend_cont_entries: int = 0
@@ -1465,6 +1508,32 @@ class LogParser:
                     tags["GOVERNANCE_STRICT"] = tags.get("GOVERNANCE_STRICT", 0) + 1
                     continue
 
+                # ── Phase 6.3: Regime-aware fixes ──────────────────────
+                if _RE_OSC_TREND_OVERRIDE.search(line):
+                    osc_trend_override_count += 1
+                    tags["OSC_TREND_OVERRIDE"] = tags.get("OSC_TREND_OVERRIDE", 0) + 1
+                    continue
+                if _RE_TREND_ALIGN_OVERRIDE.search(line):
+                    trend_align_override_count += 1
+                    tags["TREND_ALIGN_OVERRIDE"] = tags.get("TREND_ALIGN_OVERRIDE", 0) + 1
+                    continue
+                if _RE_DAY_BIAS_PENALTY.search(line):
+                    day_bias_penalty_count += 1
+                    tags["DAY_BIAS_PENALTY"] = tags.get("DAY_BIAS_PENALTY", 0) + 1
+                    continue
+                if _RE_MOMENTUM_ENTRY.search(line):
+                    momentum_entry_count += 1
+                    tags["MOMENTUM_ENTRY"] = tags.get("MOMENTUM_ENTRY", 0) + 1
+                    continue
+                if _RE_SIGNAL_SKIP.search(line):
+                    signal_skip_count += 1
+                    tags["SIGNAL_SKIP"] = tags.get("SIGNAL_SKIP", 0) + 1
+                    continue
+                if _RE_COOLDOWN_REDUCED.search(line):
+                    cooldown_reduced_count += 1
+                    tags["COOLDOWN_REDUCED"] = tags.get("COOLDOWN_REDUCED", 0) + 1
+                    continue
+
                 # ── Phase 6.2: Trend continuation ───────────────────────
                 m = _RE_TREND_CONT_ACTIVATED.search(line)
                 if m:
@@ -1561,7 +1630,11 @@ class LogParser:
                 tilt_bias_override_count,
                 # Phase 6.2
                 trend_cont_activations, trend_cont_entries,
-                trend_cont_deactivations, trend_cont_side)
+                trend_cont_deactivations, trend_cont_side,
+                # Phase 6.3
+                osc_trend_override_count, trend_align_override_count,
+                day_bias_penalty_count, momentum_entry_count,
+                signal_skip_count, cooldown_reduced_count)
 
     @staticmethod
     def _log_ts(line: str) -> str:

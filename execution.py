@@ -134,6 +134,40 @@ EMA_STRETCH_TAG_MULT = 1.8
 MAX_TRADE_TREND = 8
 MAX_TRADE_SCALP = 12
 
+# ── Phase 6.3: Regime Matrix Constants ────────────────────────────────────────
+# Per-day-type overrides for oscillator floors, cooldowns, and score thresholds.
+# Keys: RSI_FLOOR (min RSI for trend-aligned entries), COUNTER_PENALTY (score
+# penalty for counter-trend entries), COOLDOWN_LOSS (bars after losing trade),
+# COOLDOWN_WIN (bars after winning trade), SCORE_THRESHOLD_MOD (additive mod).
+REGIME_MATRIX = {
+    "TRENDING_DAY": {
+        "RSI_FLOOR": 0,        # No RSI floor for trend-aligned entries
+        "COUNTER_PENALTY": -15, # Strong penalty for counter-trend
+        "COOLDOWN_LOSS": 5,     # 15 min cooldown (reduced from 10)
+        "COOLDOWN_WIN": 3,      # 9 min cooldown
+    },
+    "RANGE_DAY": {
+        "RSI_FLOOR": None,      # Standard oscillator bounds
+        "COUNTER_PENALTY": 0,   # Both sides valid
+        "COOLDOWN_LOSS": 10,    # Standard
+        "COOLDOWN_WIN": 5,
+    },
+    "GAP_DAY": {
+        "RSI_FLOOR": 5,        # Near-zero for gap-aligned
+        "COUNTER_PENALTY": -10, # Penalty first 30 min, relaxes later
+        "COOLDOWN_LOSS": 10,
+        "COOLDOWN_WIN": 5,
+    },
+    "BALANCE_DAY": {
+        "RSI_FLOOR": None,      # Tightened bounds (standard)
+        "COUNTER_PENALTY": 0,   # Both sides valid
+        "COOLDOWN_LOSS": 7,     # Moderate
+        "COOLDOWN_WIN": 5,
+    },
+}
+# Fallback for HIGH_VOL or unclassified days — uses standard logic.
+_REGIME_DEFAULT = {"RSI_FLOOR": None, "COUNTER_PENALTY": 0, "COOLDOWN_LOSS": 10, "COOLDOWN_WIN": 5}
+
 #===========================================================
 # Initalize filled_df
 try:
@@ -1663,6 +1697,48 @@ def _trend_entry_quality_gate(
         f"r4={r4_val if np.isfinite(r4_val) else 'N/A'} s3={s3_val if np.isfinite(s3_val) else 'N/A'} "
         f"s4={s4_val if np.isfinite(s4_val) else 'N/A'}"
     )
+
+    # ── Phase 6.3: Trend Day RSI Floor Override ─────────────────────────────
+    # On TRENDING days, oscillator extremes in the trend direction are
+    # confirmation, not exhaustion.  Remove the RSI floor entirely for
+    # trend-aligned entries so the gate doesn't block momentum continuation.
+    _day_tag = merged_ctx.get("day_type_tag", "UNKNOWN")
+    _bias_dir = merged_ctx.get("bias", "Unknown")
+    _trend_aligned_entry = (
+        (_day_tag in ("TRENDING_DAY", "TRENDING") and (
+            (allowed_side == "PUT"  and _bias_dir in ("Negative", "BEARISH"))
+            or (allowed_side == "CALL" and _bias_dir in ("Positive", "BULLISH"))
+        ))
+        or (_day_tag in ("GAP_DAY",) and (
+            (allowed_side == "PUT"  and _gap_ctx == "GAP_DOWN")
+            or (allowed_side == "CALL" and _gap_ctx == "GAP_UP")
+        ))
+    )
+    _regime_cfg = REGIME_MATRIX.get(_day_tag, REGIME_MATRIX.get(_day_tag + "_DAY", _REGIME_DEFAULT))
+    _osc_trend_override_applied = False
+    if _trend_aligned_entry:
+        _rsi_floor = _regime_cfg.get("RSI_FLOOR")
+        if _rsi_floor is not None:
+            _old_rsi_min = _eff_rsi_min
+            _old_rsi_max = _eff_rsi_max
+            if allowed_side == "PUT":
+                _eff_rsi_min = min(_eff_rsi_min, float(_rsi_floor))
+            else:
+                _eff_rsi_max = max(_eff_rsi_max, 100.0 - float(_rsi_floor))
+            if _eff_rsi_min != _old_rsi_min or _eff_rsi_max != _old_rsi_max:
+                _osc_trend_override_applied = True
+                logging.info(
+                    "[OSC_TREND_OVERRIDE] "
+                    f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
+                    f"day_type={_day_tag} bias={_bias_dir} "
+                    f"rsi_floor={_rsi_floor} "
+                    f"rsi_range_before=[{_old_rsi_min:.1f},{_old_rsi_max:.1f}] "
+                    f"rsi_range_after=[{_eff_rsi_min:.1f},{_eff_rsi_max:.1f}] "
+                    "reason=Trend-aligned entry on trending day, RSI floor removed"
+                )
+    st_details["osc_trend_override"] = _osc_trend_override_applied
+    st_details["regime_day_type"] = _day_tag
+    st_details["trend_aligned_entry"] = _trend_aligned_entry
 
     _rsi_in_default = (not np.isfinite(rsi_val)) or (_default_rsi_min <= rsi_val <= _default_rsi_max)
     _cci_in_default = (not np.isfinite(cci_val)) or (_default_cci_min <= cci_val <= _default_cci_max)
@@ -3756,6 +3832,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         osc_relief_active=st_details.get("osc_relief_override", False),
         zone_signal=_zone_revisit_signal,
         pulse_metrics=_pulse_dict,
+        st_details=st_details,
     )
 
     # 7. Entry
@@ -4492,6 +4569,7 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         osc_relief_active=st_details.get("osc_relief_override", False),
         zone_signal=_zone_revisit_signal,
         pulse_metrics=_pulse_dict,
+        st_details=st_details,
     )
 
     # 7. Entry
@@ -5314,6 +5392,9 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     last_row_enriched["adx14_15m"]      = last_15m.get("adx14", float("nan"))
                 else:
                     last_row_enriched["st_bias_15m"]  = "NEUTRAL"
+
+
+
                     last_row_enriched["st_slope_15m"] = "FLAT"
                     last_row_enriched["adx14_15m"]    = float("nan")
 
@@ -5329,16 +5410,31 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     # Phase 6.2: When trend continuation active, reduce cooldown
                     #   to 3 bars (9 min) for wins, 5 bars (15 min) for losses.
                     _is_loss = record.get("pnl_points", 0) <= 0
+                    # Phase 6.3: Regime-aware cooldown
+                    _cd_day_tag = getattr(getattr(_day_type, "name", None), "value", "UNKNOWN") if _day_type else "UNKNOWN"
+                    _cd_regime = REGIME_MATRIX.get(_cd_day_tag + "_DAY", REGIME_MATRIX.get(_cd_day_tag, _REGIME_DEFAULT))
                     if _trend_cont.is_active:
                         cooldown_until = i + (5 if _is_loss else 3)
+                        _cd_source = "trend_cont"
+                    elif _cd_regime.get("COOLDOWN_LOSS", 10) < 10:
+                        # Regime matrix specifies reduced cooldown (e.g. TRENDING_DAY)
+                        cooldown_until = i + (_cd_regime["COOLDOWN_LOSS"] if _is_loss else _cd_regime.get("COOLDOWN_WIN", 5))
+                        _cd_source = f"regime_{_cd_day_tag}"
+                        logging.info(
+                            f"  [COOLDOWN_REDUCED] day_type={_cd_day_tag} "
+                            f"cooldown={_cd_regime['COOLDOWN_LOSS'] if _is_loss else _cd_regime.get('COOLDOWN_WIN', 5)} bars "
+                            f"(standard would be {10 if _is_loss else 5}) "
+                            f"reason=Regime matrix reduces cooldown on {_cd_day_tag}"
+                        )
                     else:
                         cooldown_until = i + (10 if _is_loss else 5)
+                        _cd_source = "standard"
                     if _is_loss:
                         logging.info(
                             f"  [LOSS COOLDOWN] {record.get('exit_reason','?')} "
                             f"pnl={record.get('pnl_points',0):.1f} — "
                             f"next entry allowed after bar {cooldown_until} "
-                            f"({'trend_cont' if _trend_cont.is_active else 'standard'})"
+                            f"({_cd_source})"
                         )
                     # After exit: don't evaluate entry on the same bar
                 continue
@@ -5389,6 +5485,16 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     "continuation_num": _trend_cont.continuation_count + 1,
                     "open_bias_aligned": "ALIGNED",
                 }
+                logging.info(
+                    f"[TREND_CONTINUATION_OVERRIDE] bar={i} {bar_time} "
+                    f"side={_tc_side} — quality gate + oscillator gate bypassed "
+                    f"(tilt active, consec={_trend_cont._consec_below_s4 or _trend_cont._consec_above_r4})"
+                )
+                logging.info(
+                    f"[REPLAY_TREND_REENTRY] bar={i} {bar_time} "
+                    f"side={_tc_side} #{_trend_cont.continuation_count + 1} "
+                    f"lockout bypassed for trend continuation"
+                )
                 logging.info(
                     f"  {GREEN}[TREND_CONTINUATION][ENTRY] bar={i} {bar_time} | "
                     f"{_tc_side} #{_trend_cont.continuation_count + 1} "
@@ -5543,6 +5649,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     osc_relief_active=st_details.get("osc_relief_override", False),
                     zone_signal=_zone_dict,
                     daily_camarilla_levels=_daily_cam,
+                    st_details=st_details,  # Phase 6.3: pass gate context for momentum path
                 )
             except Exception as e:
                 logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
@@ -5552,6 +5659,25 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if not signal:
                 blocked_by = signal.get("reason", "SCORE_LOW") if signal else "NO_SIGNAL"
                 blocker_counts[blocked_by] += 1
+                # Phase 6.3: Signal Skip Sentinel Audit — gate passed but signal scorer
+                # returned nothing.  Log for attribution when override was active.
+                _gate_override = (
+                    st_details.get("st_conflict_override")
+                    or st_details.get("osc_trend_override")
+                    or st_details.get("osc_relief_override")
+                    or st_details.get("tilt_osc_override")
+                )
+                if _gate_override:
+                    logging.info(
+                        f"[SIGNAL_SKIP] bar={i} timestamp={bar_time} symbol={sym} "
+                        f"allowed_side={allowed_side} gate_overrides="
+                        f"st_conflict={st_details.get('st_conflict_override', False)} "
+                        f"osc_trend={st_details.get('osc_trend_override', False)} "
+                        f"osc_relief={st_details.get('osc_relief_override', False)} "
+                        f"tilt={st_details.get('tilt_osc_override', False)} "
+                        f"reason=Quality gate passed with override but detect_signal returned no signal"
+                    )
+                    blocker_counts["SIGNAL_SKIP"] = blocker_counts.get("SIGNAL_SKIP", 0) + 1
                 continue
 
             # Block WEAK signals — only HIGH/MEDIUM strength allowed

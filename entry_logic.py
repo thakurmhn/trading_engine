@@ -736,7 +736,8 @@ def check_entry_condition(candle, indicators, bias_15m,
                           greeks=None,
                           zone_signal=None,
                           pulse_metrics=None,
-                          daily_camarilla_levels=None):
+                          daily_camarilla_levels=None,
+                          st_details=None):
     """
     Scoring engine v5 — complete spec implementation.
 
@@ -1005,6 +1006,49 @@ def check_entry_condition(candle, indicators, bias_15m,
 
         # Phase 6: Spread noise proxy
         bd["_spread_noise"] = detect_spread_noise(candle, indicators)
+
+        # ── Phase 6.3: Trend Alignment Override (Fix 2) ────────────────────
+        # When ST_CONFLICT_OVERRIDE is active (ADX confirmed trend despite ST
+        # timeframe disagreement), grant partial trend_alignment credit.
+        _st_conflict_ovr = (st_details or {}).get("st_conflict_override", False)
+        if _st_conflict_ovr and bd["trend_alignment"] < 10:
+            _ovr_adx = _safe_float(indicators.get("adx")) or 0
+            if _ovr_adx >= 25:
+                _old_ta = bd["trend_alignment"]
+                bd["trend_alignment"] = 10
+                logging.info(
+                    f"[TREND_ALIGN_OVERRIDE] side={side} "
+                    f"trend_alignment={_old_ta}->{bd['trend_alignment']} "
+                    f"adx={_ovr_adx:.1f} st_conflict_override=True "
+                    "reason=ADX confirms trend despite ST timeframe disagreement"
+                )
+
+        # ── Phase 6.3: Day-Bias Misalignment Penalty (Fix 3) ─────────────
+        # On TRENDING days, counter-trend entries receive a score penalty.
+        bd["day_bias_penalty"] = 0
+        if day_type_result is not None:
+            _dt_name = getattr(getattr(day_type_result, "name", None), "value", "UNKNOWN")
+            _open_bias_ctx = (st_details or {}).get("open_bias_context") or {}
+            _gap_ctx_p = str(_open_bias_ctx.get("gap_tag", "UNKNOWN")).upper()
+            _is_counter = False
+            if _dt_name in ("TRENDING",):
+                # Determine trend direction from bias context
+                _bias_ctx = (st_details or {}).get("bias", "Unknown")
+                if (side == "CALL" and _bias_ctx in ("Negative", "BEARISH")) or \
+                   (side == "PUT" and _bias_ctx in ("Positive", "BULLISH")):
+                    _is_counter = True
+                    bd["day_bias_penalty"] = -15
+            elif _dt_name in ("GAP_DAY",) or _gap_ctx_p in ("GAP_UP", "GAP_DOWN"):
+                if (side == "CALL" and _gap_ctx_p == "GAP_DOWN") or \
+                   (side == "PUT" and _gap_ctx_p == "GAP_UP"):
+                    _is_counter = True
+                    bd["day_bias_penalty"] = -10
+            if _is_counter:
+                logging.info(
+                    f"[DAY_BIAS_PENALTY] side={side} penalty={bd['day_bias_penalty']} "
+                    f"day_type={_dt_name} "
+                    "reason=Counter-trend entry penalized on directional day"
+                )
 
         # Reversal bonus: HIGH-strength reversal signal aligned with this side
         # adds up to 15 pts to confirm the mean-reversion conviction.

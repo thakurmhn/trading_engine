@@ -1059,6 +1059,25 @@ def _write_text_report(session, output_path: Path) -> Path:
             lines.append(f"  W/L                    : {tc_wins}/{tc_losses}")
             lines.append(f"  Total P&L (pts)        : {tc_pnl:+.1f}")
 
+    # Phase 6.3: Regime-aware fixes section
+    osc_trend_ov   = getattr(session, "osc_trend_override_count", 0)
+    trend_align_ov = getattr(session, "trend_align_override_count", 0)
+    day_bias_pen   = getattr(session, "day_bias_penalty_count", 0)
+    momentum_ent   = getattr(session, "momentum_entry_count", 0)
+    signal_skip    = getattr(session, "signal_skip_count", 0)
+    cooldown_red   = getattr(session, "cooldown_reduced_count", 0)
+    p63_total = osc_trend_ov + trend_align_ov + day_bias_pen + momentum_ent + signal_skip + cooldown_red
+    if p63_total > 0:
+        lines.append("")
+        lines.append("  REGIME-AWARE FIXES (Phase 6.3)")
+        lines.append(sep2)
+        lines.append(f"  OSC trend overrides    : {osc_trend_ov}  (RSI floor removed on trend days)")
+        lines.append(f"  Trend align overrides  : {trend_align_ov}  (alignment boosted via ST conflict override)")
+        lines.append(f"  Day-bias penalties     : {day_bias_pen}  (counter-trend score penalty applied)")
+        lines.append(f"  Momentum entries       : {momentum_ent}  (momentum path signal synthesized)")
+        lines.append(f"  Signal skips           : {signal_skip}  (gate open but detect_signal returned None)")
+        lines.append(f"  Cooldown reductions    : {cooldown_red}  (regime-specific shorter cooldown)")
+
     # Exit governance attribution
     tg_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"})
     rev_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"REVERSAL_EXIT", "MOMENTUM_EXHAUSTION"})
@@ -1424,6 +1443,13 @@ def compare_sessions(
             # Phase 6.2
             "trend_continuation_activations": sum(getattr(s, "trend_continuation_activations", 0) for s in sessions),
             "trend_continuation_entries":     sum(getattr(s, "trend_continuation_entries", 0) for s in sessions),
+            # Phase 6.3
+            "osc_trend_override_count":      sum(getattr(s, "osc_trend_override_count", 0) for s in sessions),
+            "trend_align_override_count":    sum(getattr(s, "trend_align_override_count", 0) for s in sessions),
+            "day_bias_penalty_count":        sum(getattr(s, "day_bias_penalty_count", 0) for s in sessions),
+            "momentum_entry_count":          sum(getattr(s, "momentum_entry_count", 0) for s in sessions),
+            "signal_skip_count":             sum(getattr(s, "signal_skip_count", 0) for s in sessions),
+            "cooldown_reduced_count":        sum(getattr(s, "cooldown_reduced_count", 0) for s in sessions),
         }
 
     base = _aggregate(baseline_sessions)

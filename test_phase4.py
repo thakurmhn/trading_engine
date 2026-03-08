@@ -1,7 +1,19 @@
 """Unit tests for Phase 4: Zone + Pulse integration and Regime-Adaptive Exits."""
 
+import sys
+import types
 import unittest
 import logging
+from unittest.mock import MagicMock
+
+# Stub day_type before importing entry_logic (it imports from day_type at module level)
+if "day_type" not in sys.modules:
+    sys.modules["day_type"] = types.ModuleType("day_type")
+_dt_early = sys.modules["day_type"]
+if not hasattr(_dt_early, "apply_day_type_to_threshold"):
+    _dt_early.apply_day_type_to_threshold = MagicMock(return_value=(50, ""))
+if not hasattr(_dt_early, "DayTypeResult"):
+    _dt_early.DayTypeResult = MagicMock()
 
 from entry_logic import _score_zone, _score_pulse, check_entry_condition
 
@@ -251,6 +263,7 @@ _sig = sys.modules["signals"]
 _sig.detect_signal = MagicMock(return_value=None)
 _sig.get_opening_range = MagicMock(return_value=(None, None))
 _sig.compute_tilt_state = MagicMock(return_value="NEUTRAL")
+_sig.TrendContinuationState = MagicMock()
 
 _orch = sys.modules["orchestration"]
 _orch.update_candles_and_signals = MagicMock()
@@ -262,6 +275,8 @@ _pm.make_replay_pm = MagicMock()
 _dt_mod = sys.modules["day_type"]
 _dt_mod.make_day_type_classifier = MagicMock()
 _dt_mod.apply_day_type_to_pm = MagicMock()
+_dt_mod.apply_day_type_to_threshold = MagicMock(return_value=(50, ""))
+_dt_mod.DayTypeResult = MagicMock()
 _dt_mod.DayType = MagicMock()
 _dt_mod.DayTypeResult = MagicMock()
 _dt_mod.DayTypeClassifier = MagicMock()
