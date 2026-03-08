@@ -229,6 +229,64 @@ def detect_zone_revisit(
     return None
 
 
+def detect_zone_absorption(
+    candles_3m: pd.DataFrame,
+    zones: List[Zone],
+    atr_value: float,
+    revisit_window: int = 10,
+) -> Optional[dict]:
+    """Detect zone absorption — multiple revisits within M bars.
+
+    If an active zone is touched >= 3 times in the last `revisit_window` bars,
+    it signals absorption (price is being absorbed at the zone).
+    Otherwise a single touch is a rejection.
+
+    Returns:
+        dict with type="ZONE_ABSORPTION" or "ZONE_REJECTION", or None.
+    """
+    if candles_3m is None or len(candles_3m) < revisit_window:
+        return None
+    if not np.isfinite(atr_value) or atr_value <= 0:
+        return None
+
+    window = candles_3m.iloc[-revisit_window:]
+
+    for z in zones:
+        if not z.active:
+            continue
+        touches = 0
+        for _, bar in window.iterrows():
+            bar_low = float(bar["low"])
+            bar_high = float(bar["high"])
+            if bar_low <= z.high and bar_high >= z.low:
+                touches += 1
+
+        if touches >= 3:
+            logging.info(
+                f"[ZONE_ABSORPTION] zone={z.zone_id} type={z.zone_type} "
+                f"touches={touches} window={revisit_window}"
+            )
+            return {
+                "type": "ZONE_ABSORPTION",
+                "zone_id": z.zone_id,
+                "zone_type": z.zone_type,
+                "touches": touches,
+            }
+        elif touches >= 1:
+            logging.debug(
+                f"[ZONE_REJECTION] zone={z.zone_id} type={z.zone_type} "
+                f"touches={touches} window={revisit_window}"
+            )
+            return {
+                "type": "ZONE_REJECTION",
+                "zone_id": z.zone_id,
+                "zone_type": z.zone_type,
+                "touches": touches,
+            }
+
+    return None
+
+
 __all__ = [
     "Zone",
     "fetch_fyers_15m_history",
@@ -237,4 +295,5 @@ __all__ = [
     "load_zones",
     "update_zone_activity",
     "detect_zone_revisit",
+    "detect_zone_absorption",
 ]

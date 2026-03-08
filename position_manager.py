@@ -673,11 +673,17 @@ class PositionManager:
         # v8: DYNAMIC THRESHOLDS (scaled by ATR / volatility)
         # ═══════════════════════════════════════════════════════════════
         # Rule constants (BASE values - will be scaled by ATR)
-        LOSS_CUT_PTS_BASE        = -10   # BASE: exit if loss < -10 pts
+        LOSS_CUT_PTS_BASE        = -10   # BASE: exit if loss < -10 pts (low-vol floor)
+        LOSS_CUT_PTS_CAP         = -20   # CAP: max room even in high-vol (prevents runaway losses)
         LOSS_CUT_MAX_BARS        = 5     # only in first 5 bars
         QUICK_PROFIT_UL_PTS_BASE = 10    # BASE: UL move >= 10 pts (≈₹1300 lot=130)
         DRAWDOWN_THRESHOLD_BASE  = 9     # BASE: exit if peak_gain - cur_gain >= 9 pts
-        
+
+        # Stale trade exit — catches trades that never become profitable
+        STALE_TRADE_BARS         = 10    # check after 10 bars
+        STALE_TRADE_MIN_PEAK     = 5.0   # peak must have reached at least 5pts
+        STALE_TRADE_CUR_LOSS     = -3.0  # current must be negative (at least -3pts)
+
         # v8: Dynamic scaling factors
         LOSS_CUT_SCALE         = 0.5  # LOSS_CUT scales with 0.5 × ATR(10)
         QUICK_PROFIT_SCALE     = 1.0  # QUICK_PROFIT scales with 1.0 × ATR(10)
@@ -704,9 +710,9 @@ class PositionManager:
         sustain_required = max(BREAKOUT_SUSTAIN_BASE, 
                               BREAKOUT_SUSTAIN_BASE + math.ceil(atr_val / BREAKOUT_SUSTAIN_SCALE))
         
-        # Dynamic threshold = min(BASE, SCALE × ATR) for loss cut
-        # (smaller = tighter, prevents exiting on volatility)
-        loss_cut_threshold = max(LOSS_CUT_PTS_BASE, -LOSS_CUT_SCALE * atr_val) if atr_val > 0 else LOSS_CUT_PTS_BASE
+        # Dynamic threshold: wider in high-vol (ATR-scaled), capped to prevent runaway
+        # Low ATR (<20): stays at BASE (-10); High ATR (40+): scales to -20 max
+        loss_cut_threshold = max(LOSS_CUT_PTS_CAP, min(LOSS_CUT_PTS_BASE, -LOSS_CUT_SCALE * atr_val)) if atr_val > 0 else LOSS_CUT_PTS_BASE
         
         # Dynamic threshold = min(BASE, SCALE × ATR) for quick profit
         # (smaller = tighter, more filters in high vol)
@@ -851,6 +857,31 @@ class PositionManager:
                 cur, "DRAWDOWN_EXIT",
                 f"Drawdown protection: peak={peak_gain:.2f}pts -> cur={cur_gain:.2f}pts "
                 f"(drawdown={drawdown_amount:.2f}pts >= {DRAWDOWN_THRESHOLD}pts threshold)",
+                cur_gain, peak_gain, t["bars_held"]
+            )
+
+        # ────────────────────────────────────────────────────────────────────
+        # RULE 3.5: STALE_TRADE (exit trades that never become profitable)
+        # ────────────────────────────────────────────────────────────────────
+        # Catches: entered on a valid signal but price never moved in our favor.
+        # If after STALE_TRADE_BARS bars the peak was minimal AND currently losing → exit.
+        if (t["bars_held"] >= STALE_TRADE_BARS
+            and peak_gain < STALE_TRADE_MIN_PEAK
+            and cur_gain <= STALE_TRADE_CUR_LOSS):
+            logging.info(
+                f"[STALE TRADE] bars_held={t['bars_held']} >= {STALE_TRADE_BARS} | "
+                f"peak={peak_gain:.2f}pts < {STALE_TRADE_MIN_PEAK}pts | "
+                f"cur_gain={cur_gain:.2f}pts <= {STALE_TRADE_CUR_LOSS}pts | "
+                f"bar={bar_idx} — never became profitable, exiting"
+            )
+            logging.info(
+                f"[EXIT DECISION] rule=STALE_TRADE priority=3.5 "
+                f"reason=never_profitable peak={peak_gain:.2f}pts cur={cur_gain:.2f}pts bars={t['bars_held']}"
+            )
+            return self._hard_exit(
+                cur, "STALE_TRADE",
+                f"Stale trade: never profitable after {t['bars_held']} bars "
+                f"(peak={peak_gain:.2f}pts, cur={cur_gain:.2f}pts)",
                 cur_gain, peak_gain, t["bars_held"]
             )
 

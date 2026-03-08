@@ -1,1 +1,10 @@
 c:/Users/mohan/trading_engine/execution.py --date 2026-03-02 --sym NSE:NIFTY50-INDEX --db C:\SQLite\ticks\ticks_2026-03-02.db
+
+
+cd /c/Users/mohan/trading_engine && for f in test_dashboard.py test_profitability_fixes.py test_phase6_bias.py test_phase6_parser.py test_phase6_dashboard.py test_phase6_entry_logic.py test_phase6_execution.py test_phase6_microstructure.py test_phase61_tilt.py; do echo "=== $f ===" && python -m pytest "$f" -q --tb=short 2>&1 | tail -1; done
+
+cd /c/Users/mohan/trading_engine && python -m pytest test_indicator_tuning.py::TestReplayProfiles::test_stress_high_cci_blocked -q --tb=long 2>&1 | tail -30
+cd /c/Users/mohan/trading_engine && python -m pytest test_indicator_tuning.py -q --tb=short 2>&1 | tail -5
+cd /c/Users/mohan/trading_engine && grep -n "day_type" test_indicator_tuning.py | head -10
+cd /c/Users/mohan/trading_engine && python -m pytest test_indicator_tuning.py -q --tb=short 2>&1 | tail -5
+cd /c/Users/mohan/trading_engine && grep -n "SLOPE_ADX_GATE\|TIME_SLOPE_ADX_GATE\|ST_RR_RATIO\|ST_TG_RR_RATIO\|strike_diff\|DEFAULT_LOT" test_indicator_tuning.py 2>&1

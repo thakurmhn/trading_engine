@@ -13,7 +13,7 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime as dt, timedelta, date as date_type
-from setup import fyers
+fyers = None  # lazy: loaded on first use in fetch_fyers_history()
 import pytz
 
 from indicators import (
@@ -317,6 +317,10 @@ def build_indicator_dataframe(symbol, df, interval="3m"):
 # FETCH CANDLES — with today's intraday data
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_fyers_history(symbol, resolution="15", days=5, include_today=False):
+    global fyers
+    if fyers is None:
+        from setup import fyers as _fyers
+        fyers = _fyers
     today      = dt.now(ist).date()
     start_date = today - timedelta(days=days)
     range_to   = (today + timedelta(days=1)) if include_today else today

@@ -604,6 +604,122 @@ def _score_pulse(pulse_metrics, side):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BAR-CLOSE ALIGNMENT (Phase 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_bar_close_alignment(candle, indicators, side):
+    """Check bar-close alignment on 3m and 15m timeframes.
+
+    Bullish (CALL): close_curr > close_prev near EMA9/EMA13 with BULLISH bias.
+    Bearish (PUT):  close_curr < close_prev near EMA9/EMA13 with BEARISH bias.
+
+    Returns:
+        tuple: (alignment_status, confirmed_tf)
+            alignment_status: "ALIGNED" | "MISALIGNED" | "NEUTRAL"
+            confirmed_tf: "15m" | "3m" | None
+    """
+    # 3m bar-close check
+    close_curr = _safe_float(candle.get("close"))
+    close_prev = _safe_float(indicators.get("close_prev_3m"))
+    ema9 = _safe_float(candle.get("ema9"))
+    ema13 = _safe_float(candle.get("ema13"))
+    atr = _safe_float(indicators.get("atr"))
+    st_bias_3m = str(indicators.get("st_bias_3m", "NEUTRAL")).upper()
+
+    confirmed_3m = False
+    if close_curr is not None and close_prev is not None and atr is not None and atr > 0:
+        near_ema = False
+        if ema9 is not None and abs(close_curr - ema9) <= 1.5 * atr:
+            near_ema = True
+        if ema13 is not None and abs(close_curr - ema13) <= 1.5 * atr:
+            near_ema = True
+
+        if near_ema:
+            if side == "CALL" and close_curr > close_prev and st_bias_3m == "BULLISH":
+                confirmed_3m = True
+            elif side == "PUT" and close_curr < close_prev and st_bias_3m == "BEARISH":
+                confirmed_3m = True
+
+    # 15m bar-close check
+    confirmed_15m = False
+    candle_15m = indicators.get("candle_15m")
+    if candle_15m is not None:
+        close_15m = _safe_float(candle_15m.get("close") if hasattr(candle_15m, "get") else getattr(candle_15m, "close", None))
+        close_prev_15m = _safe_float(indicators.get("close_prev_15m"))
+        ema9_15m = _safe_float(candle_15m.get("ema9") if hasattr(candle_15m, "get") else getattr(candle_15m, "ema9", None))
+        ema13_15m = _safe_float(candle_15m.get("ema13") if hasattr(candle_15m, "get") else getattr(candle_15m, "ema13", None))
+        bias_15m_raw = str(candle_15m.get("supertrend_bias") if hasattr(candle_15m, "get") else getattr(candle_15m, "supertrend_bias", "NEUTRAL")).upper()
+        if bias_15m_raw in ("UP",):
+            bias_15m_raw = "BULLISH"
+        elif bias_15m_raw in ("DOWN",):
+            bias_15m_raw = "BEARISH"
+
+        if close_15m is not None and close_prev_15m is not None and atr is not None and atr > 0:
+            near_ema_15m = False
+            if ema9_15m is not None and abs(close_15m - ema9_15m) <= 2.0 * atr:
+                near_ema_15m = True
+            if ema13_15m is not None and abs(close_15m - ema13_15m) <= 2.0 * atr:
+                near_ema_15m = True
+
+            if near_ema_15m:
+                if side == "CALL" and close_15m > close_prev_15m and bias_15m_raw == "BULLISH":
+                    confirmed_15m = True
+                elif side == "PUT" and close_15m < close_prev_15m and bias_15m_raw == "BEARISH":
+                    confirmed_15m = True
+
+    if confirmed_15m:
+        return "ALIGNED", "15m"
+    if confirmed_3m:
+        return "ALIGNED", "3m"
+
+    # Check for misalignment (bar close goes opposite to intended side)
+    if close_curr is not None and close_prev is not None:
+        if side == "CALL" and close_curr < close_prev:
+            return "MISALIGNED", None
+        if side == "PUT" and close_curr > close_prev:
+            return "MISALIGNED", None
+
+    return "NEUTRAL", None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPREAD NOISE PROXY (Phase 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_spread_noise(candle, indicators):
+    """Detect if entry premium drift is within spread noise.
+
+    If the candle's (high - low) ≤ 2 pts OR the close-to-open move ≤ 2 pts,
+    the entry is dominated by spread noise rather than genuine movement.
+
+    Returns:
+        True if spread noise detected, False otherwise.
+    """
+    close = _safe_float(candle.get("close"))
+    open_px = _safe_float(candle.get("open"))
+    high = _safe_float(candle.get("high"))
+    low = _safe_float(candle.get("low"))
+
+    if close is not None and open_px is not None:
+        drift = abs(close - open_px)
+        if drift <= 2.0:
+            logging.debug(
+                f"[SPREAD_NOISE] close_open_drift={drift:.2f} <= 2 pts"
+            )
+            return True
+
+    if high is not None and low is not None:
+        rng = high - low
+        if rng <= 2.0:
+            logging.debug(
+                f"[SPREAD_NOISE] bar_range={rng:.2f} <= 2 pts"
+            )
+            return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -619,7 +735,8 @@ def check_entry_condition(candle, indicators, bias_15m,
                           vix_tier=None,
                           greeks=None,
                           zone_signal=None,
-                          pulse_metrics=None):
+                          pulse_metrics=None,
+                          daily_camarilla_levels=None):
     """
     Scoring engine v5 — complete spec implementation.
 
@@ -677,12 +794,29 @@ def check_entry_condition(candle, indicators, bias_15m,
     _reversal_override_active = (
         reversal_signal is not None and reversal_signal.get("side") in ("CALL", "PUT")
     )
+    # Daily Camarilla trend confirmation: below daily S4 → RSI<30 is bearish momentum,
+    # not exhaustion. Above daily R4 → RSI>75 is bullish momentum, not overbought.
+    _close_val = _safe_float(candle.get("close"))
+    _daily_s4_f = (_safe_float(daily_camarilla_levels.get("s4"))
+                   if daily_camarilla_levels else None)
+    _daily_r4_f = (_safe_float(daily_camarilla_levels.get("r4"))
+                   if daily_camarilla_levels else None)
+    _daily_cam_trend = False
+    if _close_val is not None:
+        if _daily_s4_f is not None and _close_val < _daily_s4_f:
+            _daily_cam_trend = True  # below daily S4 → bearish confirmed
+        elif _daily_r4_f is not None and _close_val > _daily_r4_f:
+            _daily_cam_trend = True  # above daily R4 → bullish confirmed
     if _rsi_3m is not None and not _reversal_override_active:
-        if _rsi_3m < 30:
-            result["reason"] = f"RSI_OVERSOLD ({_rsi_3m:.1f}<30) — PUT into capitulation blocked"
+        # Daily Cam trend: relax RSI guard from 30 to 15 (don't block trend-following),
+        # but still block extreme capitulation (RSI<15) even on confirmed trend days.
+        _rsi_floor = 15.0 if _daily_cam_trend else 30.0
+        _rsi_ceil  = 88.0 if _daily_cam_trend else 75.0
+        if _rsi_3m < _rsi_floor:
+            result["reason"] = f"RSI_OVERSOLD ({_rsi_3m:.1f}<{_rsi_floor:.0f}) — PUT into capitulation blocked"
             return result
-        if _rsi_3m > 75:
-            result["reason"] = f"RSI_OVERBOUGHT ({_rsi_3m:.1f}>75) — CALL into exhaustion blocked"
+        if _rsi_3m > _rsi_ceil:
+            result["reason"] = f"RSI_OVERBOUGHT ({_rsi_3m:.1f}>{_rsi_ceil:.0f}) — CALL into exhaustion blocked"
             return result
     elif _rsi_3m is not None and _reversal_override_active:
         # Reversal detector is active: oscillator extremes become CONFIRMATION, not blockers
@@ -721,7 +855,8 @@ def check_entry_condition(candle, indicators, bias_15m,
             return result
 
         # ── 4. Early session RSI guard ────────────────────────────────────────
-        if t < 10 * 60 + 15 and _rsi_3m is not None:
+        # Bypassed when daily Camarilla confirms trend (gap day below S4/above R4)
+        if t < 10 * 60 + 15 and _rsi_3m is not None and not _daily_cam_trend:
             if _rsi_3m < 42:
                 result["reason"] = (
                     f"RSI_OVERSOLD_EARLY ({_rsi_3m:.1f}<42 pre-10:15) — early PUT blocked"
@@ -862,6 +997,15 @@ def check_entry_condition(candle, indicators, bias_15m,
             "pulse_score":      _score_pulse(pulse_metrics, side),
         }
 
+        # Phase 6: Bar-close alignment attribution
+        _bar_align, _bar_tf = _check_bar_close_alignment(candle, indicators, side)
+        bd["bar_close_alignment"] = 0  # no score impact — attribution only
+        bd["_bar_align_status"] = _bar_align
+        bd["_bar_align_tf"] = _bar_tf
+
+        # Phase 6: Spread noise proxy
+        bd["_spread_noise"] = detect_spread_noise(candle, indicators)
+
         # Reversal bonus: HIGH-strength reversal signal aligned with this side
         # adds up to 15 pts to confirm the mean-reversion conviction.
         if _rev_matches_side:
@@ -955,7 +1099,7 @@ def check_entry_condition(candle, indicators, bias_15m,
                 f"vega={_vega_val if _vega_val is not None else 'N/A'}"
             )
 
-        total = sum(bd.values())
+        total = sum(v for v in bd.values() if isinstance(v, (int, float)))
 
         # Scoring matrix audit: log base + each vol adjustment + final vs threshold
         if _vol_adj != 0 or _theta_adj != 0:
@@ -1109,6 +1253,17 @@ def check_entry_condition(candle, indicators, bias_15m,
             _pd = pulse_metrics.get("direction_drift", "?")
             _pr = pulse_metrics.get("tick_rate", 0.0)
             _pulse_s = f" [PULSE]{_pd}_{_pr:.0f}t/s({_pulse_pts:+d})"
+        # Phase 6: Bar-close alignment tag
+        _ba_status = best_bd.get("_bar_align_status", "NEUTRAL")
+        _ba_tf = best_bd.get("_bar_align_tf")
+        _ba_s = ""
+        if _ba_status == "ALIGNED" and _ba_tf:
+            _ba_s = f" [BAR_CLOSE_ALIGNMENT][TF={_ba_tf}]"
+        elif _ba_status == "MISALIGNED":
+            _ba_s = " [BAR_CLOSE_MISALIGNED]"
+        # Phase 6: Spread noise tag
+        _sn = best_bd.get("_spread_noise", False)
+        _sn_s = " [SPREAD_NOISE]" if _sn else ""
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
             f"{surcharge_note} {regime} {strength}"
@@ -1117,7 +1272,7 @@ def check_entry_condition(candle, indicators, bias_15m,
             f" VWAP={best_bd.get('vwap_position',0)}/5"
             f" PIV={best_bd.get('pivot_structure',0)}/15"
             f" {_mom_s} {_cpr_s} {_adx_s}"
-            f"{_ob_s}{_rev_s}{_piv_s}{_zone_s}{_pulse_s}{RESET}"
+            f"{_ob_s}{_rev_s}{_piv_s}{_zone_s}{_pulse_s}{_ba_s}{_sn_s}{RESET}"
         )
     else:
         result["reason"] = (
