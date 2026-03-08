@@ -358,19 +358,27 @@ class TestBackwardCompatibility(unittest.TestCase):
 class TestZonePulseTagCounting(unittest.TestCase):
     """Test that [ZONE] and [PULSE] tags are counted in tag_counts."""
 
-    def test_zone_tag_counted(self):
+    def test_zone_tag_counted_standalone(self):
+        """[ZONE] on a standalone line (not inside [ENTRY OK]) is counted."""
         log = _make_log("""\
-        2026-03-07 09:45:00,000 - INFO - [ENTRY OK] CALL score=83/50 MODERATE HIGH [ZONE]DEMAND_BREAKOUT(+10)
+        2026-03-07 09:45:00,000 - INFO - [ZONE][SCORE][CALL] breakout aligned +10 zone_type=DEMAND
         """)
         s = LogParser(log).parse()
         self.assertGreaterEqual(s.tag_counts.get("ZONE", 0), 1)
 
-    def test_pulse_tag_counted(self):
+    def test_pulse_tag_counted_standalone(self):
+        """[PULSE] on a standalone line (not inside [ENTRY OK]) is counted."""
         log = _make_log("""\
-        2026-03-07 09:45:00,000 - INFO - [ENTRY OK] CALL score=83/50 MODERATE HIGH [PULSE]UP_20t/s(+8)
+        2026-03-07 09:45:00,000 - INFO - [PULSE][SCORE][CALL] burst+drift=UP aligned +8 tick_rate=20.0
         """)
         s = LogParser(log).parse()
         self.assertGreaterEqual(s.tag_counts.get("PULSE", 0), 1)
+
+    def test_zone_pulse_in_p_tags_list(self):
+        """Verify ZONE and PULSE are in the _P_TAGS detection list."""
+        from log_parser import _P_TAGS
+        self.assertIn("ZONE", _P_TAGS)
+        self.assertIn("PULSE", _P_TAGS)
 
 
 if __name__ == "__main__":

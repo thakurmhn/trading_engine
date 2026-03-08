@@ -225,6 +225,20 @@ _P_TAGS = [
     # Phase 5: Regime context attribution
     "REGIME_CONTEXT",
     "REGIME_ADAPTIVE",
+    # Phase 6: Bias alignment & microstructure
+    "BAR_CLOSE_ALIGNMENT",
+    "BAR_CLOSE_MISALIGNED",
+    "BIAS_ALIGNMENT",
+    "SLOPE_OVERRIDE_TIME",
+    "CONFLICT_BLOCKED",
+    "PULSE_EXHAUSTION",
+    "ZONE_ABSORPTION",
+    "ZONE_REJECTION",
+    "SPREAD_NOISE",
+    # Phase 6.1: Tilt-based governance
+    "TILT_STATE",
+    "GOVERNANCE_EASY",
+    "GOVERNANCE_STRICT",
 ]
 _RE_TAG_ANY = re.compile(r"\[(" + "|".join(_P_TAGS) + r")\]")
 
@@ -383,6 +397,42 @@ _RE_EXIT_AUDIT_REGIME = re.compile(
 # [REVERSAL_OVERRIDE] RSI=22.3 oscillator extreme flipped ...
 _RE_REVERSAL_OVERRIDE = re.compile(r"\[REVERSAL_OVERRIDE\]", re.IGNORECASE)
 
+# Phase 6: Bias alignment & microstructure
+# [BIAS_ALIGNMENT] side=CALL status=ALIGNED tf=3m ...
+_RE_BIAS_ALIGNMENT = re.compile(
+    r"\[BIAS_ALIGNMENT\] side=(?P<side>CALL|PUT) "
+    r"status=(?P<status>ALIGNED|MISALIGNED|NEUTRAL)"
+    r"(?: tf=(?P<tf>\w+))?",
+    re.IGNORECASE,
+)
+# [SLOPE_OVERRIDE_TIME] timestamp=... symbol=... side=... bars=5
+_RE_SLOPE_OVERRIDE_TIME = re.compile(r"\[SLOPE_OVERRIDE_TIME\]", re.IGNORECASE)
+# [CONFLICT_BLOCKED] timestamp=... symbol=... side=... type=...
+_RE_CONFLICT_BLOCKED = re.compile(r"\[CONFLICT_BLOCKED\]", re.IGNORECASE)
+# [PULSE_EXHAUSTION] peak=... current=... decay_ratio=...
+_RE_PULSE_EXHAUSTION = re.compile(r"\[PULSE_EXHAUSTION\]", re.IGNORECASE)
+# [ZONE_ABSORPTION] zone=... type=... touches=... window=...
+_RE_ZONE_ABSORPTION = re.compile(r"\[ZONE_ABSORPTION\]", re.IGNORECASE)
+# [SPREAD_NOISE] close_open_drift=... or bar_range=...
+_RE_SPREAD_NOISE = re.compile(r"\[SPREAD_NOISE\]", re.IGNORECASE)
+# [BAR_CLOSE_ALIGNMENT][TF=3m] or [BAR_CLOSE_ALIGNMENT][TF=15m]
+_RE_BAR_CLOSE_ALIGNMENT = re.compile(
+    r"\[BAR_CLOSE_ALIGNMENT\]\[TF=(?P<tf>3m|15m)\]",
+    re.IGNORECASE,
+)
+
+# Phase 6.1: Tilt-based governance
+# [TILT_STATE=BULLISH_TILT] side=CALL close=22500.00
+_RE_TILT_STATE = re.compile(
+    r"\[TILT_STATE=(?P<tilt>BULLISH_TILT|BEARISH_TILT|NEUTRAL)\]",
+    re.IGNORECASE,
+)
+# [GOVERNANCE_EASY] or [GOVERNANCE_STRICT]
+_RE_GOVERNANCE_EASY = re.compile(r"\[GOVERNANCE_EASY\]", re.IGNORECASE)
+_RE_GOVERNANCE_STRICT = re.compile(r"\[GOVERNANCE_STRICT\]", re.IGNORECASE)
+# Phase 6.1.2: [GOVERNANCE_EASY][BIAS_MISALIGN_BYPASSED]
+_RE_TILT_BIAS_OVERRIDE = re.compile(r"\[GOVERNANCE_EASY\]\[BIAS_MISALIGN_BYPASSED\]", re.IGNORECASE)
+
 # [ENTRY ALLOWED][ST_SLOPE_OVERRIDE]
 _RE_ST_SLOPE_OVERRIDE = re.compile(r"\[ENTRY ALLOWED\]\[ST_SLOPE_OVERRIDE\]", re.IGNORECASE)
 
@@ -427,6 +477,21 @@ class SessionSummary:
     regime_adaptive_count: int = 0  # [EXIT AUDIT][REGIME_ADAPTIVE] per-trade
     regime_trade_breakdown: Dict[str, Dict[str, list]] = field(default_factory=dict)
     # Structure: {"day_type": {"TREND_DAY": [pnl1, ...], ...}, "adx_tier": {...}, ...}
+
+    # ── Phase 6: Bias alignment & microstructure ──────────────────────────────
+    bias_alignment_count: int = 0        # [BIAS_ALIGNMENT] events
+    bar_close_alignment_count: int = 0   # [BAR_CLOSE_ALIGNMENT][TF=...] events
+    slope_override_time_count: int = 0   # [SLOPE_OVERRIDE_TIME] events
+    conflict_blocked_count: int = 0      # [CONFLICT_BLOCKED] events
+    pulse_exhaustion_count: int = 0      # [PULSE_EXHAUSTION] events
+    zone_absorption_count: int = 0       # [ZONE_ABSORPTION] events
+    spread_noise_count: int = 0          # [SPREAD_NOISE] events
+
+    # ── Phase 6.1: Tilt-based governance ────────────────────────────────────────
+    tilt_state_count: int = 0            # [TILT_STATE=...] events
+    governance_easy_count: int = 0       # [GOVERNANCE_EASY] events
+    governance_strict_count: int = 0     # [GOVERNANCE_STRICT] events
+    tilt_bias_override_count: int = 0    # [GOVERNANCE_EASY][BIAS_MISALIGN_BYPASSED] events
 
     # ── Volatility context tracking ───────────────────────────────────────────
     vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
@@ -583,6 +648,59 @@ class SessionSummary:
             if self.total_trades else 0.0
         )
 
+    @property
+    def bias_alignment_performance(self) -> Dict[str, dict]:
+        """Performance breakdown by bias alignment status (Phase 6)."""
+        groups: Dict[str, list] = {"ALIGNED": [], "MISALIGNED": [], "NEUTRAL": []}
+        for t in self.trades:
+            status = t.get("bias_alignment", "NEUTRAL")
+            if status not in groups:
+                status = "NEUTRAL"
+            groups[status].append(t.get("pnl_pts", 0.0))
+        result = {}
+        for status, pnl_list in groups.items():
+            total = len(pnl_list)
+            if total == 0:
+                continue
+            wins = sum(1 for p in pnl_list if p > 0)
+            net = round(sum(pnl_list), 2)
+            result[status] = {
+                "trades": total, "winners": wins,
+                "win_rate": round(wins / total * 100, 1), "net_pnl": net,
+            }
+        return result
+
+    @property
+    def microstructure_counts(self) -> dict:
+        """Microstructure proxy counts (Phase 6)."""
+        return {
+            "pulse_exhaustion": self.pulse_exhaustion_count,
+            "zone_absorption": self.zone_absorption_count,
+            "spread_noise": self.spread_noise_count,
+        }
+
+    @property
+    def tilt_performance(self) -> Dict[str, dict]:
+        """Performance breakdown by tilt state (Phase 6.1)."""
+        groups: Dict[str, list] = {"BULLISH_TILT": [], "BEARISH_TILT": [], "NEUTRAL": []}
+        for t in self.trades:
+            tilt = t.get("tilt_state", "NEUTRAL")
+            if tilt not in groups:
+                tilt = "NEUTRAL"
+            groups[tilt].append(t.get("pnl_pts", 0.0))
+        result = {}
+        for tilt, pnl_list in groups.items():
+            total = len(pnl_list)
+            if total == 0:
+                continue
+            wins = sum(1 for p in pnl_list if p > 0)
+            net = round(sum(pnl_list), 2)
+            result[tilt] = {
+                "trades": total, "winners": wins,
+                "win_rate": round(wins / total * 100, 1), "net_pnl": net,
+            }
+        return result
+
     def to_dict(self) -> dict:
         return {
             "log_path":        self.log_path,
@@ -636,6 +754,19 @@ class SessionSummary:
             "regime_context_count":      self.regime_context_count,
             "regime_adaptive_count":     self.regime_adaptive_count,
             "regime_performance":        self.regime_performance,
+            # Phase 6
+            "bias_alignment_count":      self.bias_alignment_count,
+            "bar_close_alignment_count": self.bar_close_alignment_count,
+            "slope_override_time_count": self.slope_override_time_count,
+            "conflict_blocked_count":    self.conflict_blocked_count,
+            "bias_alignment_performance": self.bias_alignment_performance,
+            "microstructure_counts":     self.microstructure_counts,
+            # Phase 6.1
+            "tilt_state_count":          self.tilt_state_count,
+            "governance_easy_count":     self.governance_easy_count,
+            "governance_strict_count":   self.governance_strict_count,
+            "tilt_bias_override_count":  self.tilt_bias_override_count,
+            "tilt_performance":          self.tilt_performance,
         }
 
 
@@ -676,6 +807,12 @@ class LogParser:
          vol_context_align_count, greeks_align_count, score_matrix_usage_count,
          reversal_signal_count, zone_entry_counts,
          regime_context_count, regime_adaptive_count, regime_trade_breakdown,
+         # Phase 6
+         p6_bias_align, p6_bar_close, p6_slope_time, p6_conflict_blocked,
+         p6_pulse_exhaust, p6_zone_absorb, p6_spread_noise,
+         # Phase 6.1
+         p61_tilt_state, p61_gov_easy, p61_gov_strict,
+         p612_tilt_bias_override,
          ) = self._scan_file()
 
         if session_types:
@@ -719,6 +856,19 @@ class LogParser:
             regime_context_count=regime_context_count,
             regime_adaptive_count=regime_adaptive_count,
             regime_trade_breakdown=regime_trade_breakdown,
+            # Phase 6
+            bias_alignment_count=p6_bias_align,
+            bar_close_alignment_count=p6_bar_close,
+            slope_override_time_count=p6_slope_time,
+            conflict_blocked_count=p6_conflict_blocked,
+            pulse_exhaustion_count=p6_pulse_exhaust,
+            zone_absorption_count=p6_zone_absorb,
+            spread_noise_count=p6_spread_noise,
+            # Phase 6.1
+            tilt_state_count=p61_tilt_state,
+            governance_easy_count=p61_gov_easy,
+            governance_strict_count=p61_gov_strict,
+            tilt_bias_override_count=p612_tilt_bias_override,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -779,6 +929,21 @@ class LogParser:
         zone_entry_counts: Dict[str, int] = defaultdict(int)  # ZoneA/B/C allowed entries
         regime_context_count: int = 0            # [REGIME_CONTEXT] per-bar count
         regime_adaptive_count: int = 0           # [EXIT AUDIT][REGIME_ADAPTIVE] per-trade
+        # Phase 6 counters
+        bias_alignment_count: int = 0
+        bar_close_alignment_count: int = 0
+        slope_override_time_count: int = 0
+        conflict_blocked_count: int = 0
+        pulse_exhaustion_count: int = 0
+        zone_absorption_count: int = 0
+        spread_noise_count: int = 0
+        # Phase 6.1 counters
+        tilt_state_count: int = 0
+        governance_easy_count: int = 0
+        governance_strict_count: int = 0
+        tilt_bias_override_count: int = 0
+        _last_tilt_state: str = "NEUTRAL"        # last-seen for trade attribution
+        _last_bias_alignment: str = "NEUTRAL"   # last-seen for trade attribution
         # Last-seen regime context for trade attribution
         _last_regime: dict = {"atr_regime": "UNKNOWN", "adx_tier": "UNKNOWN",
                               "day_type": "UNKNOWN", "cpr_width": "UNKNOWN"}
@@ -825,6 +990,9 @@ class LogParser:
                         "zone_age_bars": int(_zage.group(1)) if _zage else 0,
                         # Phase 5: regime at entry (snapshot of last-seen context)
                         "regime_at_entry": dict(_last_regime),
+                        # Phase 6: bias alignment at entry
+                        "bias_alignment": _last_bias_alignment,
+                        "tilt_state": _last_tilt_state,
                     }
                     continue
 
@@ -872,6 +1040,8 @@ class LogParser:
                         "bars_held":    int(d["bars_held"]),
                         "exit_reason":  d["exit_reason"].upper(),
                         "regime_at_entry": dict(_last_regime),
+                        "bias_alignment": _last_bias_alignment,
+                        "tilt_state": _last_tilt_state,
                     })
                     continue
 
@@ -896,6 +1066,8 @@ class LogParser:
                         "lot":          int(d["lot"]) if d.get("lot") else 0,
                         "option_name":  d.get("option_name") or "",
                         "regime_at_entry": dict(_last_regime),
+                        "bias_alignment": _last_bias_alignment,
+                        "tilt_state": _last_tilt_state,
                     })
                     session_types.add(d["session_type"].upper())
                     continue
@@ -949,6 +1121,10 @@ class LogParser:
                 m = _RE_ENTRY_OK.search(line)
                 if m:
                     entry_ok_count += 1
+                    # Phase 6: [BAR_CLOSE_ALIGNMENT] may appear inside [ENTRY OK] line
+                    if _RE_BAR_CLOSE_ALIGNMENT.search(line):
+                        bar_close_alignment_count += 1
+                        tags["BAR_CLOSE_ALIGNMENT"] = tags.get("BAR_CLOSE_ALIGNMENT", 0) + 1
                     continue
 
                 # ── [SIGNAL FIRED] ────────────────────────────────────────
@@ -1186,6 +1362,67 @@ class LogParser:
                     tags["REGIME_ADAPTIVE"] = tags.get("REGIME_ADAPTIVE", 0) + 1
                     continue
 
+                # ── Phase 6: Bias alignment & microstructure ────────────
+                m = _RE_BIAS_ALIGNMENT.search(line)
+                if m:
+                    bias_alignment_count += 1
+                    _last_bias_alignment = m.group("status").upper()
+                    tags["BIAS_ALIGNMENT"] = tags.get("BIAS_ALIGNMENT", 0) + 1
+                    continue
+
+                m = _RE_BAR_CLOSE_ALIGNMENT.search(line)
+                if m:
+                    bar_close_alignment_count += 1
+                    tags["BAR_CLOSE_ALIGNMENT"] = tags.get("BAR_CLOSE_ALIGNMENT", 0) + 1
+                    continue
+
+                if _RE_SLOPE_OVERRIDE_TIME.search(line):
+                    slope_override_time_count += 1
+                    tags["SLOPE_OVERRIDE_TIME"] = tags.get("SLOPE_OVERRIDE_TIME", 0) + 1
+                    continue
+
+                if _RE_CONFLICT_BLOCKED.search(line):
+                    conflict_blocked_count += 1
+                    tags["CONFLICT_BLOCKED"] = tags.get("CONFLICT_BLOCKED", 0) + 1
+                    continue
+
+                if _RE_PULSE_EXHAUSTION.search(line):
+                    pulse_exhaustion_count += 1
+                    tags["PULSE_EXHAUSTION"] = tags.get("PULSE_EXHAUSTION", 0) + 1
+                    continue
+
+                if _RE_ZONE_ABSORPTION.search(line):
+                    zone_absorption_count += 1
+                    tags["ZONE_ABSORPTION"] = tags.get("ZONE_ABSORPTION", 0) + 1
+                    continue
+
+                if _RE_SPREAD_NOISE.search(line):
+                    spread_noise_count += 1
+                    tags["SPREAD_NOISE"] = tags.get("SPREAD_NOISE", 0) + 1
+                    continue
+
+                # ── Phase 6.1: Tilt-based governance ─────────────────────
+                m = _RE_TILT_STATE.search(line)
+                if m:
+                    tilt_state_count += 1
+                    _last_tilt_state = m.group("tilt").upper()
+                    tags["TILT_STATE"] = tags.get("TILT_STATE", 0) + 1
+                    continue
+
+                if _RE_GOVERNANCE_EASY.search(line):
+                    governance_easy_count += 1
+                    tags["GOVERNANCE_EASY"] = tags.get("GOVERNANCE_EASY", 0) + 1
+                    # Phase 6.1.2: sub-count for bias misalignment bypass
+                    if _RE_TILT_BIAS_OVERRIDE.search(line):
+                        tilt_bias_override_count += 1
+                        tags["TILT_BIAS_OVERRIDE"] = tags.get("TILT_BIAS_OVERRIDE", 0) + 1
+                    continue
+
+                if _RE_GOVERNANCE_STRICT.search(line):
+                    governance_strict_count += 1
+                    tags["GOVERNANCE_STRICT"] = tags.get("GOVERNANCE_STRICT", 0) + 1
+                    continue
+
                 # ── P1–P5 tags ────────────────────────────────────────────
                 m = _RE_TAG_ANY.search(line)
                 if m:
@@ -1256,7 +1493,14 @@ class LogParser:
                 vol_context_align_count, greeks_align_count, score_matrix_usage_count,
                 reversal_signal_count, dict(zone_entry_counts),
                 regime_context_count, regime_adaptive_count,
-                {dim: dict(labels) for dim, labels in regime_breakdown.items()})
+                {dim: dict(labels) for dim, labels in regime_breakdown.items()},
+                # Phase 6
+                bias_alignment_count, bar_close_alignment_count,
+                slope_override_time_count, conflict_blocked_count,
+                pulse_exhaustion_count, zone_absorption_count, spread_noise_count,
+                # Phase 6.1
+                tilt_state_count, governance_easy_count, governance_strict_count,
+                tilt_bias_override_count)
 
     @staticmethod
     def _log_ts(line: str) -> str:

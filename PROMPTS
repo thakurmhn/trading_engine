@@ -301,3 +301,212 @@ Phases 3 and 4 are complete. Your task is to implement **Phase 5 — Dashb
 ## Final Goal
 Provide **empirical visibility** into how trades perform across regimes (ATR, ADX, day type, CPR width).  
 This closes the loop between architecture and profitability by quantifying the impact of Phases 3–4 enhancements.
+
+# ============================================================================
+
+# System Prompt: Phase 6 — Bias Alignment & Microstructure Refinement
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Phases 3–5 are complete. Your task is to implement **Phase 6 — Bias Alignment & Microstructure Refinement** without requiring Level‑2 order‑book data.
+
+---
+
+## Scope
+
+### 1. Bar‑Close Alignment Module (`entry_logic.py`)
+- Add checks for bar closes relative to previous bar:
+  - Bullish entry allowed if `close_curr > close_prev` near EMA9/EMA13 and pivot R3/R4.
+  - Bearish entry allowed if `close_curr < close_prev` near EMA9/EMA13 and pivot S3/S4.
+- **Timeframe independence:**  
+  - If **15‑min** bar confirms → allow entry.  
+  - If **3‑min** bar confirms → allow entry.  
+- Indicators must confirm bias state (BULLISH for CALL, BEARISH for PUT) on the respective timeframe.
+- Add `[BAR_CLOSE_ALIGNMENT][TF=15m]` or `[BAR_CLOSE_ALIGNMENT][TF=3m]` attribution tags in `[ENTRY OK]` logs.
+
+### 2. Bias Alignment Attribution (`signals.py`)
+- Extend `detect_signal()` to log bias alignment status:
+  - `ALIGNED`, `MISALIGNED`, `NEUTRAL`.
+- Pass bias alignment into `check_entry_condition()`.
+- Add `[BIAS_ALIGNMENT]` tag in logs and replay output.
+
+### 3. Conflict Governance Refinement (`execution.py`)
+- Add **time‑based override** for slope conflict:
+  - If slope conflict persists > N bars (configurable, default 5), allow entry with `[SLOPE_OVERRIDE_TIME]` tag.
+- Ensure conflict governance logs show `[CONFLICT_BLOCKED]` or `[CONFLICT_OVERRIDDEN]`.
+
+### 4. Microstructure Proxies (`entry_logic.py`)
+- Extend Pulse module:
+  - Detect **burst exhaustion** (tick‑rate spike followed by decay).
+  - Attribute `[PULSE_EXHAUSTION]` vs `[PULSE_SUSTAINED]`.
+- Extend Zone detector:
+  - Detect **zone absorption** (multiple revisits within M bars).
+  - Attribute `[ZONE_ABSORPTION]` vs `[ZONE_REJECTION]`.
+- Add **spread noise proxy**:
+  - If entry/exit premium drift ≤ 2 pts, tag `[SPREAD_NOISE]`.
+
+### 5. Dashboard Extensions (`dashboard.py`)
+- Add **Bias Alignment Performance** section:
+  - Win rate, avg P&L for ALIGNED vs MISALIGNED trades.
+- Add **Microstructure Attribution** section:
+  - Counts and P&L impact of `[PULSE_EXHAUSTION]`, `[ZONE_ABSORPTION]`, `[SPREAD_NOISE]`.
+- Preserve backward compatibility.
+
+### 6. Replay Validation
+- Run `run_offline_replay()` on sessions with known bias misalignment (e.g., 2026‑02‑20).
+- Confirm `[BAR_CLOSE_ALIGNMENT][TF=15m]`, `[BAR_CLOSE_ALIGNMENT][TF=3m]`, `[BIAS_ALIGNMENT]`, `[SLOPE_OVERRIDE_TIME]`, `[PULSE_EXHAUSTION]`, `[ZONE_ABSORPTION]`, `[SPREAD_NOISE]` tags appear in logs.
+- Dashboard attribution sections populate correctly.
+- Ensure reproducibility: same bar → same alignment/microstructure attribution.
+
+---
+
+## Deliverables
+- Updated `entry_logic.py`, `signals.py`, `execution.py`, `dashboard.py`.
+- Replay validation logs with new attribution tags.
+- Dashboard output with bias alignment and microstructure sections.
+- Test suite additions for bar‑close alignment, bias attribution, slope override, pulse exhaustion, zone absorption, spread noise.
+
+---
+
+## Validation Requirements
+- All new tests must pass.
+- Replay sessions must show bias alignment and microstructure attribution consistently.
+- Dashboard metrics must align with replay logs.
+- Backward compatibility confirmed.
+
+---
+
+## Final Goal
+Reduce **bias misaligned losses** and quantify **microstructure noise** without requiring Level‑2 feeds.  
+This ensures entries are allowed when **either timeframe confirms bar‑close alignment with indicator state**, while microstructure proxies provide visibility into short‑term order‑flow dynamics.
+
+# =====================================================
+
+# System Prompt: Phase 6 — Test Suite Implementation
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Phases 3–5 are complete, and Phase 6 parsing + dashboard wiring has been implemented.  
+Your task is to **resume from Task 7: Write test suite for Phase 6**.
+
+---
+
+## Scope
+
+### 1. Test Suite Modules
+- `test_phase6_parser.py`
+  - Verify regex parsing for `[BAR_CLOSE_ALIGNMENT][TF=15m/3m]`, `[BIAS_ALIGNMENT]`, `[SLOPE_OVERRIDE_TIME]`, `[PULSE_EXHAUSTION]`, `[ZONE_ABSORPTION]`, `[SPREAD_NOISE]`.
+  - Confirm counters increment correctly in `SessionSummary`.
+  - Ensure bias_alignment is attached to trade open records.
+  - Backward compatibility: logs without Phase 6 tags parse cleanly.
+
+- `test_phase6_dashboard.py`
+  - Bias Alignment Performance section renders when data exists, skips when empty.
+  - Microstructure Attribution section renders when counts > 0, skips when empty.
+  - Aggregation in `compare_sessions()` includes Phase 6 fields.
+  - Backward compatibility confirmed.
+
+- `test_phase6_entry_logic.py`
+  - CALL entry allowed when bar close > previous close near EMA/pivot with bullish bias.
+  - PUT entry allowed when bar close < previous close near EMA/pivot with bearish bias.
+  - Independent entries allowed on 15m and 3m timeframes.
+  - Attribution tags include timeframe.
+
+- `test_phase6_execution.py`
+  - Slope conflict blocked < N bars.
+  - Entry allowed with `[SLOPE_OVERRIDE_TIME]` when conflict persists > N bars.
+  - Logs show `[CONFLICT_BLOCKED]` vs `[CONFLICT_OVERRIDDEN]`.
+
+- `test_phase6_microstructure.py`
+  - Pulse exhaustion vs sustained bursts.
+  - Zone absorption vs rejection.
+  - Spread noise detection (premium drift ≤ 2 pts).
+
+---
+
+## Deliverables
+- New test files: `test_phase6_parser.py`, `test_phase6_dashboard.py`, `test_phase6_entry_logic.py`, `test_phase6_execution.py`, `test_phase6_microstructure.py`.
+- 100% passing tests across all suites.
+- Replay validation logs confirming Phase 6 tags appear.
+- Dashboard output showing Bias Alignment and Microstructure Attribution sections.
+
+---
+
+## Validation Requirements
+- All Phase 6 tests must pass.
+- Replay sessions (e.g., 2026‑02‑20, 2026‑03‑04, 2026‑03‑05) show Phase 6 tags consistently.
+- Dashboard metrics align with replay logs.
+- Backward compatibility confirmed.
+
+---
+
+## Final Goal
+Ensure Phase 6 implementation is fully validated with automated tests.  
+This guarantees bias alignment attribution, slope override governance, and microstructure proxies are empirically correct and auditable.
+
+
+
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# System Prompt: Phase 6.1 — Tilt‑Based Governance Module
+
+You are a coding agent with full visibility of the trading engine codebase.  
+Phases 3–6 are complete. Your task is to implement **Phase 6.1 — Tilt‑Based Governance Module** to ease governance rules based on CPR and pivot levels.
+
+---
+
+## Scope
+
+### 1. Tilt Detector (`signals.py`)
+- Compute tilt state:
+  - `BULLISH_TILT` → price above CPR and above R3.
+  - `BEARISH_TILT` → price below CPR and below S3.
+  - `NEUTRAL` → price between R3 and S3.
+- Log `[TILT_STATE=BULLISH_TILT]`, `[TILT_STATE=BEARISH_TILT]`, or `[TILT_STATE=NEUTRAL]` tags for replay attribution.
+
+### 2. Governance Relaxation (`execution.py`)
+- If tilt = `BULLISH_TILT`:
+  - Relax bullish blockers (slope mismatch, weak ADX, oscillator extremes).
+  - Allow CALL entries more freely.
+- If tilt = `BEARISH_TILT`:
+  - Relax bearish blockers (slope mismatch, weak ADX, oscillator extremes).
+  - Allow PUT entries more freely.
+- If tilt = `NEUTRAL`:
+  - Enforce strict governance stack (current Phase 6 rules).
+- Ensure logs show `[GOVERNANCE_EASY]` or `[GOVERNANCE_STRICT]` attribution.
+
+### 3. Dashboard Extensions (`dashboard.py`)
+- Add **Tilt Performance Section**:
+  - Sub‑tables for BULLISH_TILT, BEARISH_TILT, NEUTRAL.
+  - Columns: Trades, Wins, WR%, Net P&L.
+- Add governance attribution counts:
+  - `[GOVERNANCE_EASY]` vs `[GOVERNANCE_STRICT]`.
+
+### 4. Replay Validation
+- Run `run_offline_replay()` on sessions with strong tilt (e.g., price trending above R3 or below S3).
+- Confirm `[TILT_STATE]` tags appear in logs.
+- Confirm `[GOVERNANCE_EASY]` entries fire in tilted regimes.
+- Confirm `[GOVERNANCE_STRICT]` entries remain suppressed in neutral zones.
+- Dashboard shows Tilt Performance section.
+
+---
+
+## Deliverables
+- Updated `signals.py`, `execution.py`, `dashboard.py`.
+- Replay validation logs with `[TILT_STATE]` and governance attribution tags.
+- Dashboard output with Tilt Performance section.
+- Test suite additions for tilt detection, governance relaxation, dashboard rendering.
+
+---
+
+## Validation Requirements
+- All new tests must pass.
+- Replay sessions show tilt attribution consistently.
+- Dashboard metrics align with replay logs.
+- Backward compatibility confirmed.
+
+---
+
+## Final Goal
+Ease governance in clear trending regimes (above R3 or below S3) while keeping strict governance in neutral zones.  
+This ensures trades fire when market tilt is obvious, while maintaining discipline in choppy mid‑range conditions.
+
+

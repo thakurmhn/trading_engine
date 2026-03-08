@@ -120,6 +120,7 @@ OSCILLATOR_EXIT_MODE = "TRAIL"   # "HARD" → close immediately; "TRAIL" → loc
 TREND_ENTRY_ADX_MIN  = float(os.getenv("TREND_ENTRY_ADX_MIN",  "18.0"))
 SLOPE_ADX_GATE       = float(os.getenv("SLOPE_ADX_GATE",       "20.0"))
 TIME_SLOPE_ADX_GATE  = float(os.getenv("TIME_SLOPE_ADX_GATE",  "25.0"))   # Path D: post-11:00 flat slope allowed if ADX < this
+SLOPE_CONFLICT_TIME_BARS = int(os.getenv("SLOPE_CONFLICT_TIME_BARS", "5"))  # Phase 6: bars of slope conflict before time override
 ST_RR_RATIO         = float(os.getenv("ST_RR_RATIO",         "2.0"))
 ST_TG_RR_RATIO      = float(os.getenv("ST_TG_RR_RATIO",      "1.0"))
 

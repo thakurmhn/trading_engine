@@ -85,6 +85,7 @@ _ind.classify_cpr_width           = MagicMock(return_value="NORMAL")
 # -- remaining stubs --
 sys.modules["signals"].detect_signal     = MagicMock(return_value=None)
 sys.modules["signals"].get_opening_range = MagicMock(return_value=(None, None))
+sys.modules["signals"].compute_tilt_state = MagicMock(return_value="NEUTRAL")
 sys.modules["orchestration"].update_candles_and_signals = MagicMock()
 sys.modules["orchestration"].build_indicator_dataframe  = MagicMock(return_value=pd.DataFrame())
 sys.modules["position_manager"].make_replay_pm          = MagicMock()

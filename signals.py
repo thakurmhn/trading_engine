@@ -57,6 +57,29 @@ def _safe_float(val, default=None):
         return default
 
 
+def compute_tilt_state(close_price, cpr_levels, camarilla_levels):
+    """Compute market tilt state from current price vs CPR and Camarilla levels.
+
+    Returns:
+        str: "BULLISH_TILT", "BEARISH_TILT", or "NEUTRAL"
+    """
+    if close_price is None or not np.isfinite(close_price):
+        return "NEUTRAL"
+    tc = _safe_float((cpr_levels or {}).get("tc"))
+    bc = _safe_float((cpr_levels or {}).get("bc"))
+    r3 = _safe_float((camarilla_levels or {}).get("r3"))
+    s3 = _safe_float((camarilla_levels or {}).get("s3"))
+    if tc is None or bc is None or r3 is None or s3 is None:
+        return "NEUTRAL"
+    # BULLISH_TILT: price above CPR top AND above R3
+    if close_price > tc and close_price > r3:
+        return "BULLISH_TILT"
+    # BEARISH_TILT: price below CPR bottom AND below S3
+    if close_price < bc and close_price < s3:
+        return "BEARISH_TILT"
+    return "NEUTRAL"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC COUNTERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,7 +470,8 @@ def detect_signal(candles_3m, candles_15m,
                   day_type_result=None,  # NEW: DayTypeResult for threshold modifier
                   osc_relief_active=False,  # NEW: S4/R4 relief override from gate
                   zone_signal=None,      # Phase 4A: zone_detector output
-                  pulse_metrics=None):   # Phase 4B: pulse_module metrics dict
+                  pulse_metrics=None,    # Phase 4B: pulse_module metrics dict
+                  daily_camarilla_levels=None):  # Fixed daily S4/R4 for RSI bypass
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -569,6 +593,24 @@ def detect_signal(candles_3m, candles_15m,
         except Exception:
             pass
 
+    # 5. Previous bar close values (Phase 6: bar-close alignment)
+    close_prev_3m = None
+    if len(candles_3m) >= 2:
+        try:
+            _cpv = float(candles_3m.iloc[-2]["close"])
+            if not pd.isna(_cpv):
+                close_prev_3m = _cpv
+        except Exception:
+            pass
+    close_prev_15m = None
+    if has_15m and len(candles_15m) >= 2:
+        try:
+            _cpv15 = float(candles_15m.iloc[-2]["close"])
+            if not pd.isna(_cpv15):
+                close_prev_15m = _cpv15
+        except Exception:
+            pass
+
     # --- Build indicators dict ---
     def _safe(val):
         try:
@@ -596,6 +638,9 @@ def detect_signal(candles_3m, candles_15m,
         "cpr_width":           cpr_width,
         "entry_type":          entry_type,
         "rsi_prev":            rsi_prev,
+        # Phase 6: bar-close alignment inputs
+        "close_prev_3m":       close_prev_3m,
+        "close_prev_15m":      close_prev_15m,
     }
 
     logging.debug(
@@ -614,6 +659,7 @@ def detect_signal(candles_3m, candles_15m,
         osc_relief_active=osc_relief_active,
         zone_signal=zone_signal,
         pulse_metrics=pulse_metrics,
+        daily_camarilla_levels=daily_camarilla_levels,
     )
 
     # ── [SIGNAL CHECK] — emitted for every bar regardless of outcome ──────────
@@ -690,10 +736,32 @@ def detect_signal(candles_3m, candles_15m,
     state["rsi"]          = _safe_float(last_3m.get("rsi14") or last_3m.get("rsi")) or "?"
     state["cci"]          = _safe_float(last_3m.get("cci20") or last_3m.get("cci")) or "?"
 
+    # Phase 6: Bias alignment attribution
+    _bd = lz_signal.get("breakdown", {})
+    _bias_align = _bd.get("_bar_align_status", "NEUTRAL")
+    _bias_tf = _bd.get("_bar_align_tf")
+    state["bias_alignment"] = _bias_align
+    state["bias_alignment_tf"] = _bias_tf
+    state["spread_noise"] = _bd.get("_spread_noise", False)
+    _ba_tag = f" [BIAS_ALIGNMENT]{_bias_align}"
+    if _bias_tf:
+        _ba_tag += f" TF={_bias_tf}"
+    logging.info(
+        f"[BIAS_ALIGNMENT] side={side} status={_bias_align} "
+        f"tf={_bias_tf or 'NONE'} "
+        f"bias15m={st_bias} bias3m={st_bias_3m}"
+    )
+
+    # Phase 6.1: Tilt state
+    _close_for_tilt = float(last_3m.get("close", 0))
+    _tilt_state = compute_tilt_state(_close_for_tilt, cpr_levels, camarilla_levels)
+    state["tilt_state"] = _tilt_state
+    logging.info(f"[TILT_STATE={_tilt_state}] side={side} close={_close_for_tilt:.2f}")
+
     logging.info(
         f"{GREEN}[SIGNAL FIRED] {side} source={source} "
         f"score={state['score']} strength={state['strength']} "
         f"bias15m={st_bias} bias3m={st_bias_3m} "
-        f"pivot={pivot_reason} {vwap_pos} | {reason}{RESET}"
+        f"pivot={pivot_reason} {vwap_pos}{_ba_tag} | {reason}{RESET}"
     )
     return state

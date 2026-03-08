@@ -247,12 +247,53 @@ class PulseModule:
         self._last_calc_time_ms = 0
         logging.info("[PULSE] Module reset")
     
+    def detect_exhaustion(self, current_time_ms: Optional[float] = None) -> Optional[str]:
+        """Detect burst exhaustion: tick-rate spike followed by decay.
+
+        Returns:
+            "PULSE_EXHAUSTION" if burst was active and rate decayed below 50% of burst peak.
+            "PULSE_SUSTAINED" if burst is still active.
+            None if no burst context.
+        """
+        if current_time_ms is None:
+            current_time_ms = time.time() * 1000
+
+        metrics = self.get_pulse(current_time_ms)
+
+        if not hasattr(self, "_peak_tick_rate"):
+            self._peak_tick_rate = 0.0
+            self._exhaustion_count = 0
+            self._sustained_count = 0
+
+        if metrics.burst_flag:
+            if metrics.tick_rate > self._peak_tick_rate:
+                self._peak_tick_rate = metrics.tick_rate
+            self._sustained_count += 1
+            return "PULSE_SUSTAINED"
+
+        if self._peak_tick_rate > 0 and metrics.tick_rate < 0.5 * self._peak_tick_rate:
+            self._exhaustion_count += 1
+            logging.info(
+                f"[PULSE_EXHAUSTION] peak={self._peak_tick_rate:.1f} "
+                f"current={metrics.tick_rate:.1f} decay_ratio="
+                f"{metrics.tick_rate / self._peak_tick_rate:.2f}"
+            )
+            self._peak_tick_rate = 0.0
+            return "PULSE_EXHAUSTION"
+
+        if self._peak_tick_rate > 0:
+            return "PULSE_SUSTAINED"
+
+        return None
+
     def get_stats(self) -> dict:
         """Get dashboard statistics."""
         return {
             "burst_count": self.burst_count,
             "upward_bursts": self.upward_bursts,
             "downward_bursts": self.downward_bursts,
+            "exhaustion_count": getattr(self, "_exhaustion_count", 0),
+            "sustained_count": getattr(self, "_sustained_count", 0),
         }
     
     def log_stats(self) -> None:
