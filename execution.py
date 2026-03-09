@@ -3302,7 +3302,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         logging.info(f"[PAPER] Spot={spot_price} (from caller — no candles yet)")
 
     # 3. End-of-day force exit
-    if ct > end_time:
+    _ensure_setup()
+    if end_time is not None and ct > end_time:
         logging.info("[PAPER] EOD — closing open positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if paper_info[leg]["trade_flag"] == 1:
@@ -4072,7 +4073,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         logging.warning(f"[LIVE] Spot fetch failed: {e}")
 
     # 3. End-of-day force exit
-    if ct > end_time:
+    _ensure_setup()
+    if end_time is not None and ct > end_time:
         logging.info("[LIVE] EOD — closing positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if live_info[leg]["trade_flag"] == 1:
