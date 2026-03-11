@@ -283,6 +283,10 @@ def compute_summary(
             s_wr = (s_wins / s_total * 100) if s_total else 0
             symbol_stats[sym] = {"pnl": round(s_pnl, 2), "trades": s_total, "win_rate": round(s_wr, 1)}
 
+    avg_win = float(pnl[pnl > 0].mean()) if (pnl > 0).any() else 0.0
+    avg_loss = float(pnl[pnl < 0].mean()) if (pnl < 0).any() else 0.0
+    payoff_ratio = (avg_win / abs(avg_loss)) if avg_loss else (float("inf") if avg_win else 0.0)
+
     return {
         "total_trades":    total,
         "winners":         winners,
@@ -297,6 +301,9 @@ def compute_summary(
         "put_trades":      int(put_mask.sum()),
         "call_pnl_points": round(float(pnl[call_mask].sum()), 2),
         "put_pnl_points":  round(float(pnl[put_mask].sum()), 2),
+        "avg_win_points":  round(avg_win, 2),
+        "avg_loss_points": round(avg_loss, 2),
+        "payoff_ratio":    round(payoff_ratio, 2) if payoff_ratio != float("inf") else float("inf"),
         "config_thresholds": config_thresholds or {},
         "symbol_stats":    symbol_stats,
     }
@@ -317,6 +324,15 @@ def print_summary(summary: dict) -> None:
     print(f"  Net P&L (Rs)   : Rs {summary['net_pnl_rupees']:+,.2f}")
     print(f"  Max win (pts)  : {summary['max_win_points']:+.2f}")
     print(f"  Max loss (pts) : {summary['max_loss_points']:+.2f}")
+    if summary.get("avg_win_points") or summary.get("avg_loss_points"):
+        print(f"  Avg win (pts)  : {summary['avg_win_points']:+.2f}")
+        print(f"  Avg loss (pts) : {summary['avg_loss_points']:+.2f}")
+        pr = summary.get("payoff_ratio")
+        if pr == float('inf'):
+            pr_str = "inf"
+        else:
+            pr_str = f"{pr:.2f}"
+        print(f"  Payoff ratio   : {pr_str}")
     print(sep)
     print(f"  CALL trades    : {summary['call_trades']}  P&L: {summary['call_pnl_points']:+.2f} pts")
     print(f"  PUT  trades    : {summary['put_trades']}  P&L: {summary['put_pnl_points']:+.2f} pts")

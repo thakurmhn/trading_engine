@@ -56,6 +56,7 @@ from indicators import (
 )
 
 from signals import detect_signal, get_opening_range, compute_tilt_state, TrendContinuationState
+import signals as signals_module
 # from tickdb import tick_db
 from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
 from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
@@ -133,6 +134,16 @@ EMA_STRETCH_BLOCK_MULT = 2.5   # Block entries > 2.5x ATR from EMA (mean reversi
 EMA_STRETCH_TAG_MULT = 1.8
 MAX_TRADE_TREND = 8
 MAX_TRADE_SCALP = 12
+
+# Partial exit ladder + trailing regime multipliers
+PARTIAL_PT1_QTY_FRAC = 0.40   # 40% at TP1
+PARTIAL_PT2_QTY_FRAC = 0.30   # 30% at TP2 (legacy TG partial)
+TRAIL_STRONG_MULT = 1.5
+TRAIL_WEAK_MULT   = 0.8
+TRAIL_TREND_DAY_MULT = 1.8
+RISK_SCALING_TREND = 1.0
+RISK_SCALING_RANGE = 0.6
+RISK_SCALING_REVERSAL = 0.7
 
 # ── Phase 6.3: Regime Matrix Constants ────────────────────────────────────────
 # Per-day-type overrides for oscillator floors, cooldowns, and score thresholds.
@@ -1148,7 +1159,12 @@ def _trend_entry_quality_gate(
         _daily_r4 = float(daily_camarilla_levels.get("r4", float("nan")))
         st_details["daily_s4"] = _daily_s4
         st_details["daily_r4"] = _daily_r4
-        if np.isfinite(_daily_s4) and close_val < _daily_s4 and allowed_side == "CALL":
+        _rev_override_daily = bool(
+            reversal_signal
+            and reversal_signal.get("score", 0) >= 80
+            and reversal_signal.get("side") in {"CALL", "PUT"}
+        )
+        if np.isfinite(_daily_s4) and close_val < _daily_s4 and allowed_side == "CALL" and not _rev_override_daily:
             logging.info(
                 f"[ENTRY BLOCKED][DAILY_S4_FILTER] timestamp={timestamp} symbol={symbol} "
                 f"side=CALL close={close_val:.1f} daily_s4={_daily_s4:.1f} "
@@ -1156,7 +1172,7 @@ def _trend_entry_quality_gate(
             )
             st_details["blocked_by"] = "DAILY_S4_FILTER"
             return False, allowed_side, "Price below daily S4 — CALL blocked in bearish regime.", st_details
-        if np.isfinite(_daily_r4) and close_val > _daily_r4 and allowed_side == "PUT":
+        if np.isfinite(_daily_r4) and close_val > _daily_r4 and allowed_side == "PUT" and not _rev_override_daily:
             logging.info(
                 f"[ENTRY BLOCKED][DAILY_R4_FILTER] timestamp={timestamp} symbol={symbol} "
                 f"side=PUT close={close_val:.1f} daily_r4={_daily_r4:.1f} "
@@ -2144,7 +2160,7 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
 
     # 3) PT/TG structured checks
     tg_hit = tg is not None and current_ltp >= tg
-    pt_hit = pt is not None and current_ltp >= pt and not state.get("partial_booked", False)
+    pt_hit = pt is not None and current_ltp >= pt
 
     if bars_held <= 0 and not pt_hit:
         logging.info(
@@ -2156,6 +2172,12 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
 
     # 4) Min-bar maturity gate
     last_adx = float(df_slice["adx14"].iloc[-1]) if ("adx14" in df_slice.columns and len(df_slice) > 0 and pd.notna(df_slice["adx14"].iloc[-1])) else float("nan")
+    entry_atr = state.get("entry_atr", None)
+    cpr_width_state = state.get("cpr_width", "UNKNOWN")
+    strong_trend_regime = bool(
+        state.get("strong_trend_flag")
+        or (np.isfinite(last_adx) and last_adx >= 30.0 and cpr_width_state == "NARROW")
+    )
     tg_adx_override = bool(tg_hit and np.isfinite(last_adx) and last_adx > 40.0)
     if bars_held < min_bars_for_pt_tg and (tg_hit or pt_hit):
         if tg_adx_override:
@@ -2193,53 +2215,63 @@ def check_exit_condition(df_slice, state, option_price=None, option_volume=None,
             state["pt_deferred_logged"] = 1
         return False, None
 
-    if tg_hit:
-        # P2-C: Partial TG exit — first TG hit exits 50% of quantity.
-        # The remaining 50% continues with SL ratcheted to TG (break-even+).
-        # On second trigger (full_tg_booked=True already consumed), full exit.
-        if not state.get("partial_tg_booked", False):
-            partial_qty = max(1, int(state.get("quantity", 0) * PARTIAL_TG_QTY_FRAC))
-            state["partial_tg_booked"] = True
-            state["partial_tg_qty"]    = partial_qty
-            state["stop"]              = tg   # ratchet SL to TG level
-            state["pt_deferred_logged"] = 0
-            audit("TG", "TG_PARTIAL_EXIT", f"ltp>={tg:.2f} qty={partial_qty}")
-            logging.info(
-                f"{GREEN}[EXIT][PARTIAL_EXIT][TG] {side} ltp={current_ltp:.2f} "
-                f"tg={tg:.2f} partial_qty={partial_qty} "
-                f"remaining_qty={state.get('quantity', 0) - partial_qty} "
-                f"SL_ratcheted_to={tg:.2f} bars_held={bars_held}{RESET}"
-            )
-            return True, "TG_PARTIAL_EXIT"
-        else:
-            # Remaining 50% has now run beyond TG — full close
-            audit("TG", "TARGET_HIT", f"ltp>={tg:.2f} full_exit")
-            logging.info(
-                f"{GREEN}[EXIT][TG_HIT][FULL] {side} ltp={current_ltp:.2f} "
-                f"tg={tg:.2f} bars_held={bars_held}{RESET}"
-            )
-            return True, "TARGET_HIT"
+    def _partial_qty(total_qty: int, frac: float) -> int:
+        if total_qty <= 1:
+            return 1
+        raw = max(1, int(round(total_qty * frac)))
+        return min(total_qty - 1, raw) if total_qty > 1 else 1
 
-    if pt_hit and bars_held >= min_bars_for_pt_tg:
-        audit("PT", "PT_HIT", f"ltp>={pt:.2f}")
+    if pt_hit and bars_held >= min_bars_for_pt_tg and not state.get("partial_booked", False):
+        partial_qty = _partial_qty(state.get("quantity", 0), PARTIAL_PT1_QTY_FRAC)
         state["partial_booked"] = True
+        state["partial_pt_qty"] = partial_qty
         state["pt_deferred_logged"] = 0
         if (state.get("stop") or 0) < entry_price:
             state["stop"] = entry_price
+        audit("PT", "PT1_PARTIAL_EXIT", f"ltp>={pt:.2f} qty={partial_qty}")
         logging.info(
-            f"{GREEN}[PARTIAL] {side} ltp={current_ltp:.2f} >= pt={pt:.2f} bars_held={bars_held} "
+            f"{GREEN}[EXIT][PARTIAL_EXIT][TP1] {side} ltp={current_ltp:.2f} "
+            f"pt={pt:.2f} partial_qty={partial_qty} "
+            f"remaining_qty={state.get('quantity', 0) - partial_qty} "
             f"stop_locked={entry_price:.2f}{RESET}"
         )
+        return True, "PT1_PARTIAL_EXIT"
+
+    if tg_hit and state.get("partial_booked", False) and not state.get("partial_tg_booked", False):
+        partial_qty = _partial_qty(state.get("quantity", 0), PARTIAL_PT2_QTY_FRAC)
+        state["partial_tg_booked"] = True
+        state["partial_tg_qty"]    = partial_qty
+        state["pt_deferred_logged"] = 0
+        if pt is not None:
+            state["stop"] = max(state.get("stop", entry_price), pt)
+        audit("TG", "PT2_PARTIAL_EXIT", f"ltp>={tg:.2f} qty={partial_qty}")
+        logging.info(
+            f"{GREEN}[EXIT][PARTIAL_EXIT][TP2] {side} ltp={current_ltp:.2f} "
+            f"tg={tg:.2f} partial_qty={partial_qty} "
+            f"remaining_qty={state.get('quantity', 0) - partial_qty} "
+            f"SL_ratcheted_to={state.get('stop', 'N/A')} bars_held={bars_held}{RESET}"
+        )
+        return True, "PT2_PARTIAL_EXIT"
 
     # Trailing stop update only after maturity.
     pnl = current_ltp - entry_price
-    if bars_held >= min_bars_for_pt_tg and pnl >= 5 and trail_step > 0:
-        new_stop = current_ltp - trail_step
+    trail_step_effective = trail_step
+    trend_day_mode = bool(state.get("trend_day_mode")) or getattr(signals_module, "TREND_DAY_MODE", False)
+    if entry_atr:
+        if trend_day_mode:
+            trail_step_effective = max(trail_step_effective, round(entry_atr * TRAIL_TREND_DAY_MULT, 2))
+        elif strong_trend_regime:
+            trail_step_effective = max(trail_step_effective, round(entry_atr * TRAIL_STRONG_MULT, 2))
+        else:
+            trail_step_effective = max(1.0, min(trail_step_effective, round(entry_atr * TRAIL_WEAK_MULT, 2)))
+    if bars_held >= min_bars_for_pt_tg and pnl >= 5 and trail_step_effective > 0:
+        new_stop = current_ltp - trail_step_effective
         if new_stop > state.get("stop", 0):
             state["stop"] = new_stop
             state["trail_updates"] = state.get("trail_updates", 0) + 1
             logging.info(
-                f"{CYAN}[TRAIL] {side} stop={new_stop:.2f} ltp={current_ltp:.2f} bars_held={bars_held}{RESET}"
+                f"{CYAN}[TRAIL] {side} stop={new_stop:.2f} ltp={current_ltp:.2f} "
+                f"step={trail_step_effective:.2f} strong_trend={strong_trend_regime} trend_day={trend_day_mode} bars_held={bars_held}{RESET}"
             )
 
     # 5) Contextual exits (ATR/CPR/CAMARILLA)
@@ -2434,14 +2466,15 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
 
     # ════════ ATR-SCALED SL — ADX TIER (v4: tighter SL, R:R > 1.0) ════════
     adx_val_f = float(adx_value) if adx_value and np.isfinite(float(adx_value)) else 0.0
+    # Slightly tighter default stops to lift payoff ratio; keep strong-trend protection.
     if adx_val_f > 40:
-        sl_mult  = 1.5
+        sl_mult  = 1.3
         sl_tier  = "ADX_STRONG_40"
     elif adx_val_f > 0 and adx_val_f < 20:
-        sl_mult  = 0.8
+        sl_mult  = 0.75
         sl_tier  = "ADX_WEAK_20"
     else:
-        sl_mult  = 1.2
+        sl_mult  = 1.0
         sl_tier  = "ADX_DEFAULT"
 
     # ════════ ATR EXPANSION — volatile regimes need wider SL breathing room ════════
@@ -2459,12 +2492,12 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     if len(_sl_atr_series) >= 10 and np.isfinite(atr) and atr > 0:
         _atr_sl_ma = float(_sl_atr_series.tail(10).mean())
         if _atr_sl_ma > 0 and atr > 1.5 * _atr_sl_ma:
-            _atr_sl_expand = 1.75
+            _atr_sl_expand = 1.5   # allow modest widening only in extremes
             _sl_atr_tier   = "ATR_HIGH"
         elif _atr_sl_ma > 0 and atr > 1.2 * _atr_sl_ma:
-            _atr_sl_expand = 1.35
+            _atr_sl_expand = 1.2
             _sl_atr_tier   = "ATR_ELEVATED"
-    sl_mult = min(round(sl_mult * _atr_sl_expand, 3), 2.0)
+    sl_mult = min(round(sl_mult * _atr_sl_expand, 3), 1.8)
 
     stop = max(round(entry_price - sl_mult * atr, 2), 1.0)
 
@@ -2472,23 +2505,23 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     # PT/TG are ATR-multiple based. Widened to guarantee SL < PT < TG.
     if atr <= 60:
         regime   = "VERY_LOW"
-        pt_mult  = 1.5
-        tg_mult  = 2.0
+        pt_mult  = 1.7
+        tg_mult  = 2.3
         step_pct = 0.02
     elif atr <= 100:
         regime   = "LOW"
-        pt_mult  = 1.8
-        tg_mult  = 2.5
+        pt_mult  = 2.0
+        tg_mult  = 2.8
         step_pct = 0.025
     elif atr <= 150:
         regime   = "MODERATE"
-        pt_mult  = 2.0
-        tg_mult  = 3.0
+        pt_mult  = 2.2
+        tg_mult  = 3.2
         step_pct = 0.03
     elif atr <= 250:
         regime   = "HIGH"
-        pt_mult  = 2.5
-        tg_mult  = 3.5
+        pt_mult  = 2.7
+        tg_mult  = 3.8
         step_pct = 0.035
     else:
         logging.warning(f"[LEVELS][EXTREME_ATR] {atr:.0f} — skipping trade (too volatile for quick booking)")
@@ -2535,7 +2568,7 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     }
 
 def update_trailing_stop(current_price, entry_price, current_stop,
-                         trail_start_pnl, trail_step_points, buffer_points=12,
+                         trail_start_pnl, trail_step_points, buffer_points=10,
                          atr=None, side="CALL", state=None):
     """
     Update trailing stop once partial target booked.
@@ -2548,15 +2581,15 @@ def update_trailing_stop(current_price, entry_price, current_stop,
     pnl = current_price - entry_price
     if buffer_points is None:
         if atr is None or pd.isna(atr):
-            buffer_points = 12.0
-        elif atr <= 60:
-            buffer_points = 8.0
-        elif atr <= 100:
             buffer_points = 10.0
+        elif atr <= 60:
+            buffer_points = 6.0
+        elif atr <= 100:
+            buffer_points = 8.0
         elif atr <= 150:
-            buffer_points = 12.0
+            buffer_points = 10.0
         else:
-            buffer_points = 14.0
+            buffer_points = 12.0
 
     # Only trail if price has moved enough in favor
     if abs(pnl) >= buffer_points and trail_step_points > 0:
@@ -3028,9 +3061,16 @@ def process_order(state, df_slice, info, spot_price,
         state["exit_check_count"] = check_count + 1
         return False, None
 
-    # P2-C: Partial TG exit — route only the partial quantity; keep position open
-    if exit_reason == "TG_PARTIAL_EXIT":
-        partial_qty = state.get("partial_tg_qty", max(1, qty // 2))
+    # Partial exits ladder — route only the partial quantity; keep position open
+    if exit_reason in {"TG_PARTIAL_EXIT", "PT1_PARTIAL_EXIT", "PT2_PARTIAL_EXIT"}:
+        if exit_reason == "PT1_PARTIAL_EXIT":
+            partial_qty = state.get("partial_pt_qty", max(1, qty // 2))
+        elif exit_reason == "PT2_PARTIAL_EXIT":
+            partial_qty = state.get("partial_tg_qty", max(1, qty // 3))
+        else:
+            partial_qty = state.get("partial_tg_qty", max(1, qty // 2))
+        if qty > 1:
+            partial_qty = min(qty - 1, partial_qty)
         remaining   = max(0, qty - partial_qty)
 
         if account_type.lower() == "paper":
@@ -3057,6 +3097,7 @@ def process_order(state, df_slice, info, spot_price,
             trade = info["call_buy"] if side == "CALL" else info["put_buy"]
             trade["pnl"]     += pnl_value
             trade["quantity"] = remaining
+            state["quantity"] = remaining
             info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
 
             trade["filled_df"].loc[dt.now(time_zone)] = {
@@ -3069,7 +3110,7 @@ def process_order(state, df_slice, info, spot_price,
                 "quantity":    partial_qty,
             }
             logging.info(
-                f"{GREEN}[PARTIAL_EXIT][{account_type.upper()} TG_PARTIAL_EXIT] "
+                f"{GREEN}[PARTIAL_EXIT][{account_type.upper()} {exit_reason}] "
                 f"{side} {symbol} partial_qty={partial_qty} remaining_qty={remaining} "
                 f"Entry={entry:.2f} Exit={exit_price:.2f} PnL={pnl_value:.2f} "
                 f"SL_now={state.get('stop', 'N/A')} PositionId={position_id}{RESET}"
@@ -3758,6 +3799,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         store(paper_info, account_type)
         return
 
+    # Strong reversal signal can flip allowed side even when trend gate passed
+    if _rev_sig_paper and _rev_sig_paper.get("score", 0) >= 80:
+        _rev_side = _rev_sig_paper.get("side")
+        if _rev_side in {"CALL", "PUT"} and _rev_side != allowed_side:
+            logging.info(
+                "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ALLOWEDSIDE] "
+                f"timestamp={ct} symbol={ticker} allowed_side={allowed_side} -> {_rev_side} "
+                f"reason=High-confidence reversal score={_rev_sig_paper.get('score')}"
+            )
+            allowed_side = _rev_side
+
     # TPMA (stored as "vwap" column by build_indicator_dataframe)
     tpma = float(candles_3m["vwap"].iloc[-1]) if "vwap" in candles_3m.columns and not pd.isna(candles_3m["vwap"].iloc[-1]) else None
 
@@ -3856,7 +3908,13 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         f"[SIGNAL][PAPER] {side} score={signal.get('score','?')} "
         f"source={source} tpma={tpma_str} | {reason}"
     )
-    if side != allowed_side:
+    # Allow pivot-led reversal overrides even if Supertrend disagrees
+    _is_reversal_signal = (
+        str(signal.get("pivot_event", "")).upper() == "REJECT"
+        or "REVERSAL" in str(signal.get("reason", "")).upper()
+        or str(signal.get("source", "")).upper().startswith("REVERSAL")
+    )
+    if side != allowed_side and not _is_reversal_signal:
         logging.info(
             "[ENTRY BLOCKED][ST_SIDE_MISMATCH] "
             f"timestamp={ct} symbol={ticker} ST3m_bias={st_details['ST3m_bias']} "
@@ -3866,6 +3924,13 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
         _save_trades_paper()
         store(paper_info, account_type)
         return
+    elif side != allowed_side and _is_reversal_signal:
+        logging.info(
+            "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ST] "
+            f"timestamp={ct} symbol={ticker} signal_side={side} "
+            f"allowed_side_prev={allowed_side} reason=Pivot rejection / reversal override"
+        )
+        allowed_side = side
 
     # Log 15m bias (FIX: no longer hard-blocks on NEUTRAL — scoring handles it)
     if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
@@ -3908,6 +3973,16 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     # pass candles_df so build_dynamic_levels can resolve entry candle
                     _last_bar = candles_3m.iloc[-1] if candles_3m is not None and not candles_3m.empty else None
                     _adx_entry = float(_last_bar.get("adx14", 0)) if _last_bar is not None and pd.notna(_last_bar.get("adx14")) else 0.0
+                    _regime = getattr(signals_module, "CURRENT_REGIME", "UNKNOWN")
+                    qty_mult = 1.0
+                    if _regime == "RANGE":
+                        qty_mult = RISK_SCALING_RANGE
+                    elif _regime == "REVERSAL":
+                        qty_mult = RISK_SCALING_REVERSAL
+                    elif _regime == "TREND":
+                        qty_mult = RISK_SCALING_TREND
+                    scaled_qty = max(1, int(round(quantity * qty_mult)))
+                    logging.info(f"[RISK ADJUSTED – {_regime or 'UNKNOWN'} MODE] base_qty={quantity} scaled_qty={scaled_qty} adx={_adx_entry:.1f}")
                     levels = build_dynamic_levels(
                         entry_price, atr, side,
                         entry_candle=len(candles_3m) - 1,
@@ -3958,7 +4033,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                     position_id = f"{opt_name}_{int(ct.timestamp())}_{paper_info.get('trade_count', 0) + 1}"
                     paper_info[leg].update({
                         "option_name":       opt_name,
-                        "quantity":          quantity,
+                        "quantity":          scaled_qty,
                         "buy_price":         entry_price,
                         "order_type":        ORDER_TYPE,
                         "trade_flag":        1,
@@ -3976,6 +4051,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
                         "tg":                tg,
                         "trail_start":       trail_start,
                         "trail_step":        trail_step,
+                        "entry_atr":         atr,
+                        "adx_entry":         _adx_entry,
+                        "cpr_width":         st_details.get("cpr_width", "NORMAL") if isinstance(st_details, dict) else "NORMAL",
+                        "trend_day_mode":    getattr(signals_module, "TREND_DAY_MODE", False),
+                        "strong_trend_flag": bool((_adx_entry >= 30.0) and (st_details.get("cpr_width", "NORMAL") == "NARROW") if isinstance(st_details, dict) else False),
+                        "regime":            getattr(signals_module, "CURRENT_REGIME", "UNKNOWN"),
                         "trail_updates":     0,
                         "consec_count":      0,
                         "prev_gap":          0,
@@ -5628,35 +5709,45 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 )
                 continue
 
-            fake_time = _FakeTime(ts.hour, ts.minute)
-
-            # Phase 4: zone_revisit_signal already computed at line ~5060
-            _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
-
-
-            try:
-                signal = detect_signal(
-                    candles_3m=slice_3m,
-                    candles_15m=slice_15m,
-                    cpr_levels=cpr,
-                    camarilla_levels=cam,
-                    traditional_levels=trad,
-                    atr=atr,
-                    include_partial=False,
-                    current_time=fake_time,
-                    vwap=tpma,
-                    orb_high=orb_h,
-                    orb_low=orb_l,
-                    day_type_result=_day_type,
-                    osc_relief_active=st_details.get("osc_relief_override", False),
-                    zone_signal=_zone_dict,
-                    daily_camarilla_levels=_daily_cam,
-                    st_details=st_details,  # Phase 6.3: pass gate context for momentum path
+        # Strong reversal signal can flip allowed side even when trend gate passed (replay)
+        if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= 80:
+            _rev_side = _rev_sig_replay.get("side")
+            if _rev_side in {"CALL", "PUT"} and _rev_side != allowed_side:
+                logging.info(
+                    "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ALLOWEDSIDE][REPLAY] "
+                    f"timestamp={bar_time} symbol={sym} allowed_side={allowed_side} -> {_rev_side} "
+                    f"reason=High-confidence reversal score={_rev_sig_replay.get('score')}"
                 )
-            except Exception as e:
-                logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
-                blocker_counts["SIGNAL_ERROR"] = blocker_counts.get("SIGNAL_ERROR", 0) + 1
-                continue
+                allowed_side = _rev_side
+
+        fake_time = _FakeTime(ts.hour, ts.minute)
+
+        # Phase 4: zone_revisit_signal already computed at line ~5060
+        _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
+
+        try:
+            signal = detect_signal(
+                candles_3m=slice_3m,
+                candles_15m=slice_15m,
+                cpr_levels=cpr,
+                camarilla_levels=cam,
+                traditional_levels=trad,
+                atr=atr,
+                include_partial=False,
+                current_time=fake_time,
+                vwap=tpma,
+                orb_high=orb_h,
+                orb_low=orb_l,
+                day_type_result=_day_type,
+                osc_relief_active=st_details.get("osc_relief_override", False),
+                zone_signal=_zone_dict,
+                daily_camarilla_levels=_daily_cam,
+                st_details=st_details,  # Phase 6.3: pass gate context for momentum path
+            )
+        except Exception as e:
+            logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
+            blocker_counts["SIGNAL_ERROR"] = blocker_counts.get("SIGNAL_ERROR", 0) + 1
+            continue
 
             if not signal:
                 blocked_by = signal.get("reason", "SCORE_LOW") if signal else "NO_SIGNAL"
@@ -5682,6 +5773,20 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     blocker_counts["SIGNAL_SKIP"] = blocker_counts.get("SIGNAL_SKIP", 0) + 1
                 continue
 
+            # If a high-confidence reversal signal exists, allow it to override lower-score trend signals
+            if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= 80:
+                if (not signal) or (_rev_sig_replay.get("score", 0) >= signal.get("score", 0)):
+                    logging.info(
+                        "[ENTRY SELECT][REVERSAL_FORCE][REPLAY] "
+                        f"timestamp={bar_time} symbol={sym} forcing_side={_rev_sig_replay.get('side')} "
+                        f"rev_score={_rev_sig_replay.get('score')} prev_score={signal.get('score') if signal else 'NA'}"
+                    )
+                    signal = {
+                        **_rev_sig_replay,
+                        "reason": _rev_sig_replay.get("reason", "REVERSAL_FORCE"),
+                        "source": "REVERSAL_FORCE",
+                    }
+
             # Block WEAK signals — only HIGH/MEDIUM strength allowed
             sig_strength = signal.get("strength", "MEDIUM")
             if sig_strength == "WEAK":
@@ -5696,13 +5801,18 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             score  = signal.get("score", "?")
             reason = signal["reason"]
             source = signal.get("source", "?")
-            if side != allowed_side:
+            _is_reversal_signal = (
+                str(signal.get("pivot_event", "")).upper() == "REJECT"
+                or "REVERSAL" in str(reason).upper()
+                or str(source).upper().startswith("REVERSAL")
+            )
+            if side != allowed_side and not _is_reversal_signal:
                 # Conflict Governance
-                if _rev_sig_paper and _rev_sig_paper.get("side") == allowed_side and _rev_sig_paper.get("score", 0) > score:
-                     logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by stronger Reversal signal {allowed_side}")
+                if _rev_sig_replay and _rev_sig_replay.get("side") == allowed_side and _rev_sig_replay.get("score", 0) > score:
+                    logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by stronger Reversal signal {allowed_side}")
                 else:
-                     logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by ST alignment {allowed_side}")
-                     
+                    logging.info(f"[CONFLICT_BLOCKED] Trend signal {side} blocked by ST alignment {allowed_side}")
+
                 blocker_counts["ST_SIDE_MISMATCH"] = blocker_counts.get("ST_SIDE_MISMATCH", 0) + 1
                 logging.info(
                     "[SIGNAL BLOCKED] "
@@ -5712,6 +5822,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"allowed_side={allowed_side} signal_side={side}"
                 )
                 continue
+            elif side != allowed_side and _is_reversal_signal:
+                logging.info(
+                    "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ST][REPLAY] "
+                    f"timestamp={bar_time} symbol={sym} signal_side={side} "
+                    f"allowed_side_prev={allowed_side} reason=Pivot/oscillator reversal override"
+                )
+                allowed_side = side
                 
             # # Conflict Governance: Check Open Positions
             # if (side == "CALL" and put_open) or (side == "PUT" and call_open):

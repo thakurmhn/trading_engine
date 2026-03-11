@@ -448,6 +448,24 @@ _RE_DAY_BIAS_PENALTY = re.compile(r"\[DAY_BIAS_PENALTY\]", re.IGNORECASE)
 _RE_MOMENTUM_ENTRY = re.compile(r"\[MOMENTUM_ENTRY\]", re.IGNORECASE)
 _RE_SIGNAL_SKIP = re.compile(r"\[SIGNAL_SKIP\]", re.IGNORECASE)
 _RE_COOLDOWN_REDUCED = re.compile(r"\[COOLDOWN_REDUCED\]", re.IGNORECASE)
+_RE_SIGNAL_FIRED = re.compile(
+    r"\[SIGNAL FIRED\]\s+side=(?P<side>CALL|PUT)\s+reason=(?P<reason>[\w_]+)"
+    r".*?score=(?P<score>\d+)/(?P<thresh>\d+)",
+    re.IGNORECASE,
+)
+_RE_SIGNAL_BLOCKED = re.compile(
+    r"\[SIGNAL BLOCKED\]\s+reason=(?P<reason>[^|]+)",
+    re.IGNORECASE,
+)
+_RE_SIGNAL_OVERRIDE = re.compile(r"\[SIGNAL OVERRIDE\]", re.IGNORECASE)
+_RE_SIGNAL_OVERRIDE_TREND = re.compile(r"\[SIGNAL OVERRIDE [–-] TREND MODE\]", re.IGNORECASE)
+_RE_TREND_DAY_DETECTED = re.compile(r"\[TREND DAY DETECTED\]", re.IGNORECASE)
+_RE_TREND_REENTRY = re.compile(r"\[TREND REENTRY\]", re.IGNORECASE)
+_RE_PIVOT_ACCEPTED = re.compile(r"\[PIVOT ACCEPTED\]", re.IGNORECASE)
+_RE_PIVOT_REJECTED = re.compile(r"\[PIVOT REJECTED\]", re.IGNORECASE)
+_RE_REVERSAL_ENTRY = re.compile(r"\[REVERSAL ENTRY\]", re.IGNORECASE)
+_RE_LS_HIGH = re.compile(r"\[LIQUIDITY SWEEP HIGH\]", re.IGNORECASE)
+_RE_LS_LOW  = re.compile(r"\[LIQUIDITY SWEEP LOW\]", re.IGNORECASE)
 
 # [TREND_CONTINUATION][ACTIVATED] bar=120 side=PUT consec_bars=15 ADX=28.3 ...
 _RE_TREND_CONT_ACTIVATED = re.compile(
@@ -514,6 +532,8 @@ class SessionSummary:
     pulse_exhaustion_count: int = 0      # [PULSE_EXHAUSTION] events
     zone_absorption_count: int = 0       # [ZONE_ABSORPTION] events
     spread_noise_count: int = 0          # [SPREAD_NOISE] events
+    signals_fired: int = 0               # [SIGNAL FIRED]
+    signals_blocked: int = 0             # [SIGNAL BLOCKED]
 
     # ── Phase 6.1: Tilt-based governance ────────────────────────────────────────
     tilt_state_count: int = 0            # [TILT_STATE=...] events
@@ -852,7 +872,7 @@ class LogParser:
             )
 
         date_tag = self._extract_date_tag()
-        (trades, session_types, blocked, tags, signals, ok_count,
+        (trades, session_types, blocked, tags, signals, signals_blocked, ok_count,
          open_bias_tag, vs_close_tag, gap_tag, balance_tag,
          day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
          osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,
@@ -889,6 +909,7 @@ class LogParser:
             blocked_counts=dict(blocked),
             tag_counts=dict(tags),
             signals_fired=signals,
+            signals_blocked=signals_blocked,
             entry_ok_count=ok_count,
             open_bias_tag=open_bias_tag,
             vs_close_tag=vs_close_tag,
@@ -956,7 +977,7 @@ class LogParser:
 
         Returns
         -------
-        (trades, session_types, blocked, tags, signals_fired, entry_ok_count,
+        (trades, session_types, blocked, tags, signals_fired, signals_blocked, entry_ok_count,
          open_bias_tag, vs_close_tag, gap_tag, balance_tag,
          day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
          osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,
@@ -975,6 +996,7 @@ class LogParser:
         blocked: Dict[str, int] = defaultdict(int)
         tags: Dict[str, int] = defaultdict(int)
         signals_fired: int = 0
+        signals_blocked: int = 0
         entry_ok_count: int = 0
         open_bias_tag: str = "NONE"               # P5-A: OPEN_HIGH | OPEN_LOW | NONE
         vs_close_tag:  str = "OPEN_CLOSE_EQUAL"   # P5-B
@@ -1216,6 +1238,36 @@ class LogParser:
                 m = _RE_SIGNAL_FIRED.search(line)
                 if m:
                     signals_fired += 1
+                    continue
+                if _RE_SIGNAL_BLOCKED.search(line):
+                    signals_blocked += 1
+                    continue
+                if _RE_SIGNAL_OVERRIDE.search(line):
+                    tags["SIGNAL_OVERRIDE"] = tags.get("SIGNAL_OVERRIDE", 0) + 1
+                    continue
+                if _RE_SIGNAL_OVERRIDE_TREND.search(line):
+                    tags["SIGNAL_OVERRIDE_TREND"] = tags.get("SIGNAL_OVERRIDE_TREND", 0) + 1
+                    continue
+                if _RE_TREND_DAY_DETECTED.search(line):
+                    tags["TREND_DAY_DETECTED"] = tags.get("TREND_DAY_DETECTED", 0) + 1
+                    continue
+                if _RE_TREND_REENTRY.search(line):
+                    tags["TREND_REENTRY"] = tags.get("TREND_REENTRY", 0) + 1
+                    continue
+                if _RE_PIVOT_ACCEPTED.search(line):
+                    tags["PIVOT_ACCEPTED"] = tags.get("PIVOT_ACCEPTED", 0) + 1
+                    continue
+                if _RE_PIVOT_REJECTED.search(line):
+                    tags["PIVOT_REJECTED"] = tags.get("PIVOT_REJECTED", 0) + 1
+                    continue
+                if _RE_REVERSAL_ENTRY.search(line):
+                    tags["REVERSAL_ENTRY"] = tags.get("REVERSAL_ENTRY", 0) + 1
+                    continue
+                if _RE_LS_HIGH.search(line):
+                    tags["LIQ_SWEEP_HIGH"] = tags.get("LIQ_SWEEP_HIGH", 0) + 1
+                    continue
+                if _RE_LS_LOW.search(line):
+                    tags["LIQ_SWEEP_LOW"] = tags.get("LIQ_SWEEP_LOW", 0) + 1
                     continue
 
                 # ── [OPEN_POSITION] (P5-A) — extract bias tag before generic check ──
@@ -1611,7 +1663,7 @@ class LogParser:
                 _label = _regime.get(dim, "UNKNOWN")
                 regime_breakdown[dim][_label].append(_pnl)
 
-        return (effective_trades, session_types, blocked, tags, signals_fired, entry_ok_count,
+        return (effective_trades, session_types, blocked, tags, signals_fired, signals_blocked, entry_ok_count,
                 open_bias_tag, vs_close_tag, gap_tag, balance_tag,
                 day_type_tag, cpr_width_tag, reversal_count, slope_override_count,
                 osc_blocks, osc_overrides, osc_relief_count, trend_loss_count,

@@ -56,24 +56,57 @@ def calculate_traditional_pivots(prev_high, prev_low, prev_close):
     s1 = (2 * pivot) - prev_high
     r2 = pivot + (prev_high - prev_low)
     s2 = pivot - (prev_high - prev_low)
+    r3 = pivot + 2 * (prev_high - prev_low)
+    s3 = pivot - 2 * (prev_high - prev_low)
+    r4 = pivot + 3 * (prev_high - prev_low)
+    s4 = pivot - 3 * (prev_high - prev_low)
+    r5 = pivot + 4 * (prev_high - prev_low)
+    s5 = pivot - 4 * (prev_high - prev_low)
     if prev_high == prev_low:
         r1 = pivot + 0.0005 * pivot
         s1 = pivot - 0.0005 * pivot
         r2 = pivot + 0.001 * pivot
         s2 = pivot - 0.001 * pivot
-    return {"pivot": round(pivot, 2), "r1": round(r1, 2), "s1": round(s1, 2),
-            "r2": round(r2, 2), "s2": round(s2, 2)}
+        r3 = pivot + 0.002 * pivot
+        s3 = pivot - 0.002 * pivot
+        r4 = pivot + 0.003 * pivot
+        s4 = pivot - 0.003 * pivot
+        r5 = pivot + 0.004 * pivot
+        s5 = pivot - 0.004 * pivot
+    return {
+        "pivot": round(pivot, 2),
+        "r1": round(r1, 2), "s1": round(s1, 2),
+        "r2": round(r2, 2), "s2": round(s2, 2),
+        "r3": round(r3, 2), "s3": round(s3, 2),
+        "r4": round(r4, 2), "s4": round(s4, 2),
+        "r5": round(r5, 2), "s5": round(s5, 2),
+    }
 
 def calculate_camarilla_pivots(prev_high, prev_low, prev_close):
     range_val = prev_high - prev_low
     if range_val == 0:
         range_val = 0.001 * prev_close
+    r1 = prev_close + (range_val * 1.1 / 12)
+    r2 = prev_close + (range_val * 1.1 / 6)
     r3 = prev_close + (range_val * 1.1 / 4)
     r4 = prev_close + (range_val * 1.1 / 2)
+    s1 = prev_close - (range_val * 1.1 / 12)
+    s2 = prev_close - (range_val * 1.1 / 6)
     s3 = prev_close - (range_val * 1.1 / 4)
     s4 = prev_close - (range_val * 1.1 / 2)
-    return {"r3": round(r3, 2), "r4": round(r4, 2),
-            "s3": round(s3, 2), "s4": round(s4, 2)}
+    # Extended ladder for extreme moves
+    r5 = (prev_high / max(prev_low, 0.0001)) * prev_close
+    s5 = prev_close - (r5 - prev_close)
+    r6 = prev_close + (range_val * 1.1 * 2)
+    s6 = prev_close - (range_val * 1.1 * 2)
+    return {
+        "r1": round(r1, 2), "r2": round(r2, 2),
+        "r3": round(r3, 2), "r4": round(r4, 2),
+        "r5": round(r5, 2), "r6": round(r6, 2),
+        "s1": round(s1, 2), "s2": round(s2, 2),
+        "s3": round(s3, 2), "s4": round(s4, 2),
+        "s5": round(s5, 2), "s6": round(s6, 2),
+    }
 
 # # ===== ATR =====
 

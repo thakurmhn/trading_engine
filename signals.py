@@ -36,6 +36,14 @@ MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
+# Trend-day detection state (reset each session)
+TREND_DAY_MODE = False
+_trend_detection_logged = False
+_trend_reentry_count = {"CALL": 0, "PUT": 0}
+MAX_TREND_REENTRIES_PER_SIDE = 5
+# Session regime state
+CURRENT_REGIME = "UNKNOWN"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NORMALISE BIAS
@@ -55,6 +63,69 @@ def _safe_float(val, default=None):
         return f if pd.notna(f) else default
     except (ValueError, TypeError):
         return default
+
+
+def _detect_pivot_accept_reject(candles_3m, levels: dict, label: str):
+    """Detect acceptance/rejection at extended pivot ladders.
+
+    Args:
+        candles_3m: DataFrame with at least two rows.
+        levels: dict of pivot levels (traditional or camarilla).
+        label: 'TRADITIONAL' or 'CAMARILLA' (for logging).
+    Returns:
+        tuple (event_type, side, level_name, level_value) or (None, None, None, None)
+    """
+    if candles_3m is None or len(candles_3m) < 2:
+        return (None, None, None, None)
+    last = candles_3m.iloc[-1]
+    prev = candles_3m.iloc[-2]
+    adx_now = _safe_float(last.get("adx14"), 0.0) or 0.0
+    adx_prev = _safe_float(prev.get("adx14"), 0.0) or 0.0
+
+    for name, val in (levels or {}).items():
+        if val is None or not np.isfinite(val):
+            continue
+        close = float(last.get("close", 0))
+        prev_close = float(prev.get("close", 0))
+        high = float(last.get("high", 0))
+        low = float(last.get("low", 0))
+        prev_high = float(prev.get("high", 0))
+        prev_low = float(prev.get("low", 0))
+
+        is_resistance = name.upper().startswith("R")
+        is_support = name.upper().startswith("S")
+        if not (is_resistance or is_support):
+            continue
+
+        # Acceptance: two consecutive closes beyond the pivot
+        if is_resistance and close > val and prev_close > val:
+            logging.info(f"[PIVOT ACCEPTED] {label} {name} side=CALL close={close:.2f} level={val:.2f}")
+            return ("ACCEPT", "CALL", name, val)
+        if is_support and close < val and prev_close < val:
+            logging.info(f"[PIVOT ACCEPTED] {label} {name} side=PUT close={close:.2f} level={val:.2f}")
+            return ("ACCEPT", "PUT", name, val)
+
+        # Liquidity sweep detection (wick through level, close back inside)
+        sweep_high = is_resistance and (high > val) and (close < val)
+        sweep_low  = is_support and (low < val) and (close > val)
+        if sweep_high:
+            logging.info(f"[LIQUIDITY SWEEP HIGH] {label} {name} close={close:.2f} high={high:.2f} level={val:.2f}")
+        if sweep_low:
+            logging.info(f"[LIQUIDITY SWEEP LOW] {label} {name} close={close:.2f} low={low:.2f} level={val:.2f}")
+
+        # Rejection: wick pierces, closes back inside, and ADX softens
+        wick_above = sweep_high or (prev_high > val and prev_close < val)
+        wick_below = sweep_low or (prev_low < val and prev_close > val)
+        adx_down = adx_prev > 0 and adx_now < adx_prev
+
+        if is_resistance and wick_above and adx_down:
+            logging.info(f"[PIVOT REJECTED] {label} {name} side=PUT close={close:.2f} level={val:.2f}")
+            return ("REJECT", "PUT", name, val)
+        if is_support and wick_below and adx_down:
+            logging.info(f"[PIVOT REJECTED] {label} {name} side=CALL close={close:.2f} level={val:.2f}")
+            return ("REJECT", "CALL", name, val)
+
+    return (None, None, None, None)
 
 
 def compute_tilt_state(close_price, cpr_levels, camarilla_levels):
@@ -483,6 +554,15 @@ def detect_signal(candles_3m, candles_15m,
       - HTF/LTF anti-conflict gate (won't buy CALL if 15m=DOWN and 3m=DOWN)
       - Blockers now categorised for better diagnostics
     """
+    global TREND_DAY_MODE, _trend_detection_logged, _trend_reentry_count
+    global CURRENT_REGIME
+
+    # reset per session (first bar guard)
+    if len(candles_3m) <= 1:
+        TREND_DAY_MODE = False
+        _trend_detection_logged = False
+        _trend_reentry_count = {"CALL": 0, "PUT": 0}
+        CURRENT_REGIME = "UNKNOWN"
 
     # --- Partial candle guard ---
     if "is_partial" in candles_3m.columns:
@@ -584,6 +664,45 @@ def detect_signal(candles_3m, candles_15m,
         else:
             entry_type = "CONTINUATION"
 
+    # Trend-day detector: ADX + narrow CPR + early R2/S2 break
+    adx_val = _safe_float(last_3m.get("adx14"), 0.0) or 0.0
+    close_price = float(last_3m.get("close", 0))
+    r2 = _safe_float((traditional_levels or {}).get("r2"))
+    s2 = _safe_float((traditional_levels or {}).get("s2"))
+    # Regime detection (simple heuristic)
+    gap_size = 0.0
+    try:
+        open_price = float(candles_3m.iloc[0].get("open", close_price))
+        prev_close_day = float(candles_15m.iloc[-2].get("close", open_price)) if has_15m and len(candles_15m) > 1 else open_price
+        gap_size = ((open_price - prev_close_day) / prev_close_day) * 100 if prev_close_day else 0.0
+    except Exception:
+        pass
+    early_break = False
+    early_session = False
+    try:
+        if current_time is not None:
+            early_session = current_time.hour < 10 or (current_time.hour == 10 and current_time.minute <= 45)
+    except Exception:
+        early_session = len(candles_3m) <= 60  # fallback: first ~3 hours (3m bars)
+    breakout_r2 = r2 is not None and close_price > r2
+    breakout_s2 = s2 is not None and close_price < s2
+    early_break = early_session and (breakout_r2 or breakout_s2)
+    if adx_val >= 30 and cpr_width == "NARROW" and early_break:
+        CURRENT_REGIME = "TREND"
+        logging.info(f"[REGIME DETECTED – TREND] adx={adx_val:.1f} cpr={cpr_width} early_break={breakout_r2 or breakout_s2}")
+    elif adx_val < 20 and cpr_width in {"WIDE", "NORMAL"}:
+        CURRENT_REGIME = "RANGE"
+        logging.info(f"[REGIME DETECTED – RANGE] adx={adx_val:.1f} cpr={cpr_width}")
+    elif abs(gap_size) > 0.6 and (breakout_r2 or breakout_s2):
+        CURRENT_REGIME = "REVERSAL"
+        logging.info(f"[REGIME DETECTED – REVERSAL] gap={gap_size:.2f}% break={'R2' if breakout_r2 else 'S2'}")
+    if (not TREND_DAY_MODE) and adx_val >= 30 and cpr_width == "NARROW" and early_session and (breakout_r2 or breakout_s2):
+        TREND_DAY_MODE = True
+        _trend_detection_logged = True
+        logging.info(
+            f"[TREND DAY DETECTED] ADX={adx_val:.1f} CPR={cpr_width} breakout={'R2' if breakout_r2 else 'S2'}"
+        )
+
     # 4. RSI previous value (for slope +2 bonus)
     rsi_prev = None
     if len(candles_3m) >= 2:
@@ -603,6 +722,24 @@ def detect_signal(candles_3m, candles_15m,
                 close_prev_3m = _cpv
         except Exception:
             pass
+
+    # Pivot acceptance / rejection detection (extended ladders)
+    ev_type, ev_side, ev_name, ev_val = _detect_pivot_accept_reject(candles_3m, traditional_levels, "TRADITIONAL")
+    if ev_type is None:
+        ev_type, ev_side, ev_name, ev_val = _detect_pivot_accept_reject(candles_3m, camarilla_levels, "CAMARILLA")
+    if ev_type == "REJECT" and ev_side:
+        state = _make_state(ev_side, f"PIVOT_REJECTION_{ev_name}", candles_3m, atr, last_3m, prev_3m)
+        state["pivot_event"] = ev_type
+        state["pivot_level"] = ev_name
+        state["pivot_value"] = ev_val
+        state["trend_day_mode"] = TREND_DAY_MODE
+        state["trend_reentry"] = False
+        state["strength"] = "HIGH"
+        state["regime"] = CURRENT_REGIME
+        logging.info(
+            f"[REVERSAL ENTRY] side={ev_side} level={ev_name} price={close_price:.2f} adx={adx_val:.1f}"
+        )
+        return state
     close_prev_15m = None
     if has_15m and len(candles_15m) >= 2:
         try:
@@ -721,7 +858,9 @@ def detect_signal(candles_3m, candles_15m,
         # Near-miss (within 15 pts of threshold) → INFO so the trader can see why
         _log = logging.info if _gap <= 15 else logging.debug
         _log(
-            f"[SIGNAL BLOCKED] {reason_str} | "
+            f"[SIGNAL BLOCKED] reason={reason_str} "
+            f"bar={len(candles_3m)} side={lz_signal.get('side','?')} "
+            f"score={_sc}/{_thr} gap={_gap:+.0f} "
             f"3m={st_bias_3m} 15m={st_bias} atr={atr:.1f} "
             f"MOM_CALL={indicators.get('momentum_ok_call')} MOM_PUT={indicators.get('momentum_ok_put')} "
             f"breakdown={_bd}"
@@ -729,6 +868,22 @@ def detect_signal(candles_3m, candles_15m,
         return None
 
     side = lz_signal.get("side") or ("CALL" if lz_signal["action"] == "BUY" else "PUT")
+
+    trend_reentry = False
+    if TREND_DAY_MODE and adx_val >= 30 and entry_type in {"PULLBACK", "REJECTION"}:
+        if _trend_reentry_count.get(side, 0) < MAX_TREND_REENTRIES_PER_SIDE:
+            _trend_reentry_count[side] = _trend_reentry_count.get(side, 0) + 1
+            trend_reentry = True
+            logging.info(
+                f"[TREND REENTRY] side={side} reason={entry_type} "
+                f"count={_trend_reentry_count[side]} adx={adx_val:.1f} cpr={cpr_width}"
+            )
+        else:
+            signal_blockers["TREND_REENTRY_CAP"] += 1
+            logging.info(
+                f"[TREND REENTRY BLOCK] side={side} cap={MAX_TREND_REENTRIES_PER_SIDE} reached"
+            )
+            return None
 
     # Final HTF/LTF check on chosen side
     if side == "CALL" and not call_allowed:
@@ -740,6 +895,12 @@ def detect_signal(candles_3m, candles_15m,
 
     reason = lz_signal["reason"]
     state  = _make_state(side, reason, candles_3m, atr, last_3m, prev_3m)
+
+    logging.info(
+        f"[SIGNAL FIRED] side={side} reason={reason} score={_sc}/{_thr} "
+        f"bar={len(candles_3m)} ts={current_time} "
+        f"atr={atr:.1f} st3m={st_bias_3m} st15m={st_bias}"
+    )
 
     if pivot_signal and pivot_signal[0] == side:
         source       = "PIVOT"
@@ -758,6 +919,30 @@ def detect_signal(candles_3m, candles_15m,
     state["source"]       = source
     state["pivot_reason"] = pivot_reason
     state["score"]        = lz_signal.get("score", 0)
+    state["trend_day_mode"] = TREND_DAY_MODE
+    state["trend_reentry"]  = trend_reentry
+    state["regime"] = CURRENT_REGIME
+
+    # Supertrend conflict soft-override: allow downstream scoring to credit trend alignment
+    # when HTF/LTF disagree but trend strength + narrow CPR suggest continuation.
+    st_conflict = st_bias != st_bias_3m
+    adx_val = indicators.get("adx", 0) or 0
+    cpr_width = indicators.get("cpr_width", "NORMAL")
+    if st_conflict and adx_val >= 30 and cpr_width == "NARROW":
+        st_details = st_details or {}
+        st_details["st_conflict_override"] = True
+        state["override_reason"] = "STRONG_TREND_REGIME"
+        logging.info(
+            f"[ST_CONFLICT_OVERRIDE] side={side} adx={adx_val:.1f} "
+            f"st15m={st_bias} st3m={st_bias_3m} cpr={cpr_width} -> allow conflict override"
+        )
+        logging.info(
+            f"[SIGNAL OVERRIDE] strong trend regime detected adx={adx_val:.1f} cpr={cpr_width} side={side}"
+        )
+    if TREND_DAY_MODE and st_conflict:
+        logging.info(
+            f"[SIGNAL OVERRIDE – TREND MODE] side={side} st15m={st_bias} st3m={st_bias_3m} adx={adx_val:.1f}"
+        )
     state["threshold"]    = lz_signal.get("threshold", 50)
     state["breakdown"]    = lz_signal.get("breakdown", {})  # v6: entry score breakdown
     state["strength"]     = lz_signal.get("strength", "MEDIUM")
