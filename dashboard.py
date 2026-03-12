@@ -1094,6 +1094,29 @@ def _write_text_report(session, output_path: Path) -> Path:
         lines.append(f"  Signal skips           : {signal_skip}  (gate open but detect_signal returned None)")
         lines.append(f"  Cooldown reductions    : {cooldown_red}  (regime-specific shorter cooldown)")
 
+    # Phase 6.4: Reversal Detection + Opening ST Relaxation section
+    rev_ema_str   = getattr(session, "reversal_ema_stretch_count", 0)
+    rev_piv_conf  = getattr(session, "reversal_pivot_confirm_count", 0)
+    rev_osc_conf  = getattr(session, "reversal_osc_confirm_count", 0)
+    rev_bias_flip = getattr(session, "reversal_bias_flip_count", 0)
+    rev_cd_relax  = getattr(session, "reversal_cooldown_relax_count", 0)
+    rev_persist   = getattr(session, "reversal_persist_count", 0)
+    st_open_relax = getattr(session, "st_opening_relax_count", 0)
+    rev_capture   = getattr(session, "reversal_capture_count", 0)
+    p64_total = rev_ema_str + rev_piv_conf + rev_osc_conf + rev_bias_flip + rev_cd_relax + rev_persist + st_open_relax + rev_capture
+    if p64_total > 0:
+        lines.append("")
+        lines.append("  REVERSAL DETECTION + ST RELAXATION (Phase 6.4)")
+        lines.append(sep2)
+        lines.append(f"  Reversal EMA stretch   : {rev_ema_str}  (stretched entry via reversal path)")
+        lines.append(f"  Reversal pivot confirm : {rev_piv_conf}  (S3/S4/R3/R4 pivot aligned)")
+        lines.append(f"  Reversal OSC confirm   : {rev_osc_conf}  (oscillator extreme as confirmation)")
+        lines.append(f"  Reversal bias flips    : {rev_bias_flip}  (ST bias flip near reversal)")
+        lines.append(f"  Reversal cooldown relax: {rev_cd_relax}  (cooldown reduced for reversal)")
+        lines.append(f"  Reversal persist       : {rev_persist}  (signal persisted across bars)")
+        lines.append(f"  ST opening relaxation  : {st_open_relax}  (opening window ST override)")
+        lines.append(f"  Reversal captures      : {rev_capture}  (reversal signal captured as trade)")
+
     # Exit governance attribution
     tg_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"TARGET_HIT", "TG_PARTIAL_EXIT"})
     rev_exits = sum(1 for t in session.trades if str(t.get("exit_reason", "")).upper() in {"REVERSAL_EXIT", "MOMENTUM_EXHAUSTION"})
@@ -1466,6 +1489,15 @@ def compare_sessions(
             "momentum_entry_count":          sum(getattr(s, "momentum_entry_count", 0) for s in sessions),
             "signal_skip_count":             sum(getattr(s, "signal_skip_count", 0) for s in sessions),
             "cooldown_reduced_count":        sum(getattr(s, "cooldown_reduced_count", 0) for s in sessions),
+            # Phase 6.4
+            "reversal_ema_stretch_count":    sum(getattr(s, "reversal_ema_stretch_count", 0) for s in sessions),
+            "reversal_pivot_confirm_count":  sum(getattr(s, "reversal_pivot_confirm_count", 0) for s in sessions),
+            "reversal_osc_confirm_count":    sum(getattr(s, "reversal_osc_confirm_count", 0) for s in sessions),
+            "reversal_bias_flip_count":      sum(getattr(s, "reversal_bias_flip_count", 0) for s in sessions),
+            "reversal_cooldown_relax_count": sum(getattr(s, "reversal_cooldown_relax_count", 0) for s in sessions),
+            "reversal_persist_count":        sum(getattr(s, "reversal_persist_count", 0) for s in sessions),
+            "st_opening_relax_count":        sum(getattr(s, "st_opening_relax_count", 0) for s in sessions),
+            "reversal_capture_count":        sum(getattr(s, "reversal_capture_count", 0) for s in sessions),
         }
 
     base = _aggregate(baseline_sessions)

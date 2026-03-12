@@ -467,6 +467,16 @@ _RE_REVERSAL_ENTRY = re.compile(r"\[REVERSAL ENTRY\]", re.IGNORECASE)
 _RE_LS_HIGH = re.compile(r"\[LIQUIDITY SWEEP HIGH\]", re.IGNORECASE)
 _RE_LS_LOW  = re.compile(r"\[LIQUIDITY SWEEP LOW\]", re.IGNORECASE)
 
+# ── Phase 6.4 regex patterns ──────────────────────────────────────────────────
+_RE_REVERSAL_EMA_STRETCH = re.compile(r"\[REVERSAL_EMA_STRETCH\]", re.IGNORECASE)
+_RE_REVERSAL_PIVOT_CONFIRM = re.compile(r"\[REVERSAL_PIVOT_CONFIRM\]", re.IGNORECASE)
+_RE_REVERSAL_OSC_CONFIRM = re.compile(r"\[REVERSAL_OSC_CONFIRM\]", re.IGNORECASE)
+_RE_REVERSAL_BIAS_FLIP = re.compile(r"\[REVERSAL_BIAS_FLIP\]", re.IGNORECASE)
+_RE_REVERSAL_COOLDOWN_RELAX = re.compile(r"\[REVERSAL_COOLDOWN_RELAX\]", re.IGNORECASE)
+_RE_REVERSAL_PERSIST = re.compile(r"\[REVERSAL_PERSIST\]", re.IGNORECASE)
+_RE_ST_OPENING_RELAX = re.compile(r"\[ST_OPENING_RELAX\]", re.IGNORECASE)
+_RE_REVERSAL_CAPTURE = re.compile(r"\[REVERSAL_CAPTURE\]", re.IGNORECASE)
+
 # [TREND_CONTINUATION][ACTIVATED] bar=120 side=PUT consec_bars=15 ADX=28.3 ...
 _RE_TREND_CONT_ACTIVATED = re.compile(
     r"\[TREND_CONTINUATION\]\[ACTIVATED\].*?side=(?P<side>CALL|PUT)",
@@ -554,6 +564,16 @@ class SessionSummary:
     momentum_entry_count: int = 0           # [MOMENTUM_ENTRY] momentum path fired
     signal_skip_count: int = 0              # [SIGNAL_SKIP] gate open but no signal
     cooldown_reduced_count: int = 0         # [COOLDOWN_REDUCED] regime cooldown applied
+
+    # ── Phase 6.4: Reversal Detection + Opening ST Relaxation ─────────────────
+    reversal_ema_stretch_count: int = 0    # [REVERSAL_EMA_STRETCH] EMA stretch reversal gate
+    reversal_pivot_confirm_count: int = 0  # [REVERSAL_PIVOT_CONFIRM] pivot-confirmed reversal
+    reversal_osc_confirm_count: int = 0    # [REVERSAL_OSC_CONFIRM] oscillator as confirmation
+    reversal_bias_flip_count: int = 0      # [REVERSAL_BIAS_FLIP] ST bias flip near reversal
+    reversal_cooldown_relax_count: int = 0 # [REVERSAL_COOLDOWN_RELAX] cooldown reduced for reversal
+    reversal_persist_count: int = 0        # [REVERSAL_PERSIST] signal persisted across bars
+    st_opening_relax_count: int = 0        # [ST_OPENING_RELAX] opening window ST relaxation
+    reversal_capture_count: int = 0        # [REVERSAL_CAPTURE] reversal actually captured
 
     # ── Volatility context tracking ───────────────────────────────────────────
     vix_tier_count:     int = 0   # [VIX_CONTEXT] refreshes logged
@@ -841,6 +861,15 @@ class SessionSummary:
             "momentum_entry_count":          self.momentum_entry_count,
             "signal_skip_count":             self.signal_skip_count,
             "cooldown_reduced_count":        self.cooldown_reduced_count,
+            # Phase 6.4
+            "reversal_ema_stretch_count":    self.reversal_ema_stretch_count,
+            "reversal_pivot_confirm_count":  self.reversal_pivot_confirm_count,
+            "reversal_osc_confirm_count":    self.reversal_osc_confirm_count,
+            "reversal_bias_flip_count":      self.reversal_bias_flip_count,
+            "reversal_cooldown_relax_count": self.reversal_cooldown_relax_count,
+            "reversal_persist_count":        self.reversal_persist_count,
+            "st_opening_relax_count":        self.st_opening_relax_count,
+            "reversal_capture_count":        self.reversal_capture_count,
         }
 
 
@@ -894,6 +923,11 @@ class LogParser:
          osc_trend_override_count, trend_align_override_count,
          day_bias_penalty_count, momentum_entry_count,
          signal_skip_count, cooldown_reduced_count,
+         # Phase 6.4
+         reversal_ema_stretch_count, reversal_pivot_confirm_count,
+         reversal_osc_confirm_count, reversal_bias_flip_count,
+         reversal_cooldown_relax_count, reversal_persist_count,
+         st_opening_relax_count, reversal_capture_count,
          ) = self._scan_file()
 
         if session_types:
@@ -963,6 +997,15 @@ class LogParser:
             momentum_entry_count=momentum_entry_count,
             signal_skip_count=signal_skip_count,
             cooldown_reduced_count=cooldown_reduced_count,
+            # Phase 6.4
+            reversal_ema_stretch_count=reversal_ema_stretch_count,
+            reversal_pivot_confirm_count=reversal_pivot_confirm_count,
+            reversal_osc_confirm_count=reversal_osc_confirm_count,
+            reversal_bias_flip_count=reversal_bias_flip_count,
+            reversal_cooldown_relax_count=reversal_cooldown_relax_count,
+            reversal_persist_count=reversal_persist_count,
+            st_opening_relax_count=st_opening_relax_count,
+            reversal_capture_count=reversal_capture_count,
         )
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -1044,6 +1087,15 @@ class LogParser:
         momentum_entry_count: int = 0
         signal_skip_count: int = 0
         cooldown_reduced_count: int = 0
+        # Phase 6.4 counters
+        reversal_ema_stretch_count: int = 0
+        reversal_pivot_confirm_count: int = 0
+        reversal_osc_confirm_count: int = 0
+        reversal_bias_flip_count: int = 0
+        reversal_cooldown_relax_count: int = 0
+        reversal_persist_count: int = 0
+        st_opening_relax_count: int = 0
+        reversal_capture_count: int = 0
         # Phase 6.2 counters
         trend_cont_activations: int = 0
         trend_cont_entries: int = 0
@@ -1586,6 +1638,40 @@ class LogParser:
                     tags["COOLDOWN_REDUCED"] = tags.get("COOLDOWN_REDUCED", 0) + 1
                     continue
 
+                # ── Phase 6.4: Reversal Detection + Opening ST Relaxation ─
+                if _RE_REVERSAL_EMA_STRETCH.search(line):
+                    reversal_ema_stretch_count += 1
+                    tags["REVERSAL_EMA_STRETCH"] = tags.get("REVERSAL_EMA_STRETCH", 0) + 1
+                    continue
+                if _RE_REVERSAL_PIVOT_CONFIRM.search(line):
+                    reversal_pivot_confirm_count += 1
+                    tags["REVERSAL_PIVOT_CONFIRM"] = tags.get("REVERSAL_PIVOT_CONFIRM", 0) + 1
+                    continue
+                if _RE_REVERSAL_OSC_CONFIRM.search(line):
+                    reversal_osc_confirm_count += 1
+                    tags["REVERSAL_OSC_CONFIRM"] = tags.get("REVERSAL_OSC_CONFIRM", 0) + 1
+                    continue
+                if _RE_REVERSAL_BIAS_FLIP.search(line):
+                    reversal_bias_flip_count += 1
+                    tags["REVERSAL_BIAS_FLIP"] = tags.get("REVERSAL_BIAS_FLIP", 0) + 1
+                    continue
+                if _RE_REVERSAL_COOLDOWN_RELAX.search(line):
+                    reversal_cooldown_relax_count += 1
+                    tags["REVERSAL_COOLDOWN_RELAX"] = tags.get("REVERSAL_COOLDOWN_RELAX", 0) + 1
+                    continue
+                if _RE_REVERSAL_PERSIST.search(line):
+                    reversal_persist_count += 1
+                    tags["REVERSAL_PERSIST"] = tags.get("REVERSAL_PERSIST", 0) + 1
+                    continue
+                if _RE_ST_OPENING_RELAX.search(line):
+                    st_opening_relax_count += 1
+                    tags["ST_OPENING_RELAX"] = tags.get("ST_OPENING_RELAX", 0) + 1
+                    continue
+                if _RE_REVERSAL_CAPTURE.search(line):
+                    reversal_capture_count += 1
+                    tags["REVERSAL_CAPTURE"] = tags.get("REVERSAL_CAPTURE", 0) + 1
+                    continue
+
                 # ── Phase 6.2: Trend continuation ───────────────────────
                 m = _RE_TREND_CONT_ACTIVATED.search(line)
                 if m:
@@ -1686,7 +1772,12 @@ class LogParser:
                 # Phase 6.3
                 osc_trend_override_count, trend_align_override_count,
                 day_bias_penalty_count, momentum_entry_count,
-                signal_skip_count, cooldown_reduced_count)
+                signal_skip_count, cooldown_reduced_count,
+                # Phase 6.4
+                reversal_ema_stretch_count, reversal_pivot_confirm_count,
+                reversal_osc_confirm_count, reversal_bias_flip_count,
+                reversal_cooldown_relax_count, reversal_persist_count,
+                st_opening_relax_count, reversal_capture_count)
 
     @staticmethod
     def _log_ts(line: str) -> str:

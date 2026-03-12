@@ -74,13 +74,22 @@ _CCI_OVERBOUGHT    = 200.0
 _PIVOT_BUFFER_ATR  = 0.30     # price must be within 0.30 × ATR of pivot level
 
 # Startup guard: no reversal signals before this time (warm-up artefacts)
-_STARTUP_GUARD_TIME = dtime(9, 20)   # 09:20 IST
+# Phase 6.4: lowered from 09:20 to 09:03 to allow opening reversal captures.
+# The quality gate + EMA stretch gate still protect against warm-up noise.
+_STARTUP_GUARD_TIME = dtime(9, 3)    # 09:03 IST (first valid 3m bar)
 
 # GAP_DAY score bonus (gap exhaustion reversals)
 _GAP_DAY_BONUS     = 10
 
 # Minimum candle count to compute EMA13
 _MIN_CANDLES       = 15
+
+# Phase 6.4: Snap-back detection — price was stretched but is now reverting
+_SNAPBACK_LOOKBACK = 3   # check last N bars for stretch peak
+_SNAPBACK_REVERT_FRAC = 0.25  # price must have reverted ≥25% of peak stretch
+
+# Phase 6.4: EMA stretch threshold for reversal tag logging
+EMA_STRETCH_REVERSAL_THRESHOLD = 3.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +204,48 @@ def _compute_score(
         score += _GAP_DAY_BONUS
 
     return min(score, 100)
+
+
+def _detect_snapback(closes_arr, ema9_arr, atr: float, side: str) -> dict:
+    """Check if price was more stretched in recent bars and is now snapping back.
+
+    Returns dict with snapback=True/False, peak_stretch, current_stretch, revert_pct.
+    """
+    n = min(_SNAPBACK_LOOKBACK, len(closes_arr) - 1)
+    if n < 1 or atr <= 0:
+        return {"snapback": False, "peak_stretch": 0, "current_stretch": 0, "revert_pct": 0}
+
+    current_stretch = (float(closes_arr[-1]) - float(ema9_arr[-1])) / atr
+
+    # Find peak stretch in the lookback window (excluding current bar)
+    peak_stretch = current_stretch
+    for j in range(1, n + 1):
+        idx = len(closes_arr) - 1 - j
+        if idx < 0:
+            break
+        s = (float(closes_arr[idx]) - float(ema9_arr[idx])) / atr
+        if side == "CALL" and s < peak_stretch:
+            peak_stretch = s
+        elif side == "PUT" and s > peak_stretch:
+            peak_stretch = s
+
+    # Revert fraction: how much of the peak stretch has been recovered
+    if abs(peak_stretch) < 0.01:
+        return {"snapback": False, "peak_stretch": peak_stretch,
+                "current_stretch": current_stretch, "revert_pct": 0}
+
+    if side == "CALL":
+        revert_pct = (current_stretch - peak_stretch) / abs(peak_stretch) if peak_stretch < 0 else 0
+    else:
+        revert_pct = (peak_stretch - current_stretch) / abs(peak_stretch) if peak_stretch > 0 else 0
+
+    snapback = revert_pct >= _SNAPBACK_REVERT_FRAC
+    return {
+        "snapback": snapback,
+        "peak_stretch": round(peak_stretch, 3),
+        "current_stretch": round(current_stretch, 3),
+        "revert_pct": round(revert_pct, 3),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,12 +383,22 @@ def detect_reversal(
     # ── GAP_DAY context ───────────────────────────────────────────────────────
     gap_day = (day_type_tag == "GAP_DAY")
 
+    # ── Phase 6.4: Snap-back detection ──────────────────────────────────────
+    _closes_arr = closes.values
+    _ema9_arr = ema9_series.values
+    snapback_info = _detect_snapback(_closes_arr, _ema9_arr, atr, side)
+
     # ── Score ─────────────────────────────────────────────────────────────────
     strong_osc = (
         (side == "CALL" and (rsi_confirms_call or cci_confirms_call))
         or (side == "PUT"  and (rsi_confirms_put  or cci_confirms_put))
     )
     score = _compute_score(side, stretch, pivot_zone, rsi, cci, strong_osc, gap_day=gap_day)
+
+    # Phase 6.4: Snap-back bonus (+5 pts) — price was more stretched recently
+    # and is now reverting toward mean, increasing reversal probability.
+    if snapback_info["snapback"]:
+        score = min(score + 5, 100)
 
     # Require minimum conviction
     if score < 35:
@@ -378,6 +439,9 @@ def detect_reversal(
         f"osc_context={osc_context}{gap_note}"
     )
 
+    # Phase 6.4 attribution flags
+    _pivot_confirmed = pivot_zone in ("S3", "S4", "S5", "R3", "R4", "R5")
+
     signal = {
         "side":          side,
         "reason":        reason,
@@ -394,6 +458,10 @@ def detect_reversal(
         "atr":           round(atr, 2),
         "gap_boost":     gap_day,
         "osc_context":   osc_context,
+        # Phase 6.4 fields
+        "pivot_confirmed": _pivot_confirmed,
+        "snapback":        snapback_info["snapback"],
+        "snapback_info":   snapback_info,
     }
 
     _color = GREEN if strength == "HIGH" else YELLOW
@@ -404,8 +472,31 @@ def detect_reversal(
         f"ema9={ema9:.1f} ema13={ema13:.1f} close={close:.1f} "
         f"target={target:.1f} stop={stop:.1f} "
         f"osc_context={osc_context}"
-        f"{' gap_boost=True' if gap_day else ''}{RESET}"
+        f"{' gap_boost=True' if gap_day else ''}"
+        f"{' snapback=True' if snapback_info['snapback'] else ''}{RESET}"
     )
+
+    # Phase 6.4 attribution tags
+    if abs(stretch) >= EMA_STRETCH_REVERSAL_THRESHOLD:
+        logging.info(
+            f"[REVERSAL_EMA_STRETCH] side={side} stretch={stretch:.2f}x "
+            f"snapback={snapback_info['snapback']} "
+            f"peak_stretch={snapback_info['peak_stretch']} "
+            f"revert_pct={snapback_info['revert_pct']}"
+        )
+    if _pivot_confirmed:
+        logging.info(
+            f"[REVERSAL_PIVOT_CONFIRM] side={side} pivot_zone={pivot_zone} "
+            f"score_boost=included"
+        )
+    if osc_confirmed:
+        logging.info(
+            f"[REVERSAL_OSC_CONFIRM] side={side} "
+            f"RSI={rsi:.1f if rsi is not None else 'N/A'} "
+            f"CCI={cci:.0f if cci is not None else 'N/A'} "
+            f"reason=Oscillator extreme treated as confirmation"
+        )
+
     return signal
 
 

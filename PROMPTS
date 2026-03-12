@@ -510,6 +510,7 @@ Ease governance in clear trending regimes (above R3 or below S3) while keeping s
 This ensures trades fire when market tilt is obvious, while maintaining discipline in choppy mid‑range conditions.
 
 
+<<<<<<< Updated upstream
 ===================================================================
 
 # SYSTEM PROMPT
@@ -886,3 +887,110 @@ Reduced drawdown
 If these improvements are not achieved, explain why and propose further adjustments.
 
 Your output must be **fully reproducible and supported by replay evidence**.
+=======
+# ===========================================================
+
+# Phase 6.4 System Prompt — Reversal Detection + Opening ST Relaxation
+
+Instruction to Agent:
+Implement reversal detection logic and scoped Supertrend relaxation for the opening window. Ensure reversal signals are captured when EMA stretch, oscillator extremes, and pivot confirmation align. Remove slope conflict checks beyond 3‑minute slope — only 3m slope is retained for bias confirmation. Maintain backward compatibility — all prior Phase 6.2 and 6.3 tests must remain green.
+
+## Fixes & Logic Adjustments
+
+1. Reversal Detection Module
+   - EMA Stretch Reversal Gate:
+     Condition: price stretched > 3× EMA9/EMA13, then snaps back toward pivots
+     Action: allow reversal entry path
+     Tag: [REVERSAL_EMA_STRETCH]
+
+   - Pivot Confirmation:
+     Condition: reversal aligns with S3/S4 or R3/R4 pivots
+     Action: boost reversal score +10
+     Tag: [REVERSAL_PIVOT_CONFIRM]
+
+   - Oscillator Extreme Confirmation:
+     Condition: RSI/CCI extremes present at reversal point
+     Action: treat as confirmation, not blocker
+     Tag: [REVERSAL_OSC_CONFIRM]
+
+   - Bias Flip Attribution:
+     Condition: Supertrend or bias flips within 3 bars of reversal
+     Action: log bias flip and allow entry
+     Tag: [REVERSAL_BIAS_FLIP]
+
+   - Cooldown Relaxation for Reversals:
+     Condition: wrong‑side exit followed by reversal confirmation
+     Action: reduce cooldown to 3 bars
+     Tag: [REVERSAL_COOLDOWN_RELAX]
+
+   - Reversal Signal Persistence:
+     Condition: reversal signal valid with score ≥70
+     Action: persist signal until captured or invalidated
+     Tag: [REVERSAL_PERSIST]
+
+2. Opening Supertrend Relaxation
+   - Scope: first 20 minutes (`bar_time <= 09:20`)
+   - Action:
+     - Relax ST bias lag; allow reversal/scalp entries when EMA + ADX confirm
+     - EMA stretch remains strict (no relaxation)
+   - Tags:
+     - [ST_OPENING_RELAX]
+     - [REVERSAL_CAPTURE]
+
+3. Slope Conflict Removal
+   - Remove slope mismatch checks between 3m and 15m ST slopes
+   - Retain only 3m slope for bias confirmation
+   - Attribution tags [ST_SLOPE_CONFLICT] and [SLOPE_MISMATCH] deprecated
+
+## Regime Matrix Extension
+TRENDING_DAY:
+  - Opening ST relaxation applies
+  - Reversal entries allowed if EMA + ADX confirm
+
+RANGE_DAY:
+  - ST relaxation applies but oscillator gating remains strict
+
+GAP_DAY:
+  - ST relaxation applies
+  - Gap‑aligned reversal entries boosted +10 score
+
+BALANCE_DAY:
+  - ST relaxation suppressed
+
+HIGH_VOL:
+  - ST relaxation applies with ATR‑scaled thresholds
+
+## Dashboard Attribution
+[REVERSAL_EMA_STRETCH]
+[REVERSAL_PIVOT_CONFIRM]
+[REVERSAL_OSC_CONFIRM]
+[REVERSAL_BIAS_FLIP]
+[REVERSAL_COOLDOWN_RELAX]
+[REVERSAL_PERSIST]
+[ST_OPENING_RELAX]
+[REVERSAL_CAPTURE]
+
+## Validation Checklist
+- Replay Benchmarks:
+  - March 2 → confirm reversal bounce at 09:15 captured
+  - March 9 → confirm reversal signals at 09:21, 09:24, 09:27 captured with ST relaxation
+  - March 4 → validate reversal detection in opening volatility
+  - March 5 → ensure suppression holds on range day
+
+- Negative Controls:
+  - Balance days → confirm ST relaxation does not fire
+  - Ordinary pullbacks → reversal logic suppressed
+  - Confirm slope conflict removal does not break prior governance
+
+- Backward Compatibility:
+  - Run full Phase 6.2 + 6.3 suites → confirm no regressions
+
+## Deliverable
+A structured Replay Validation Report per benchmark day, showing:
+- Signals fired, tags logged, scores adjusted
+- Entries captured or suppressed with attribution
+- Survivability and P&L impact
+- Confirmation that fixes respect regime boundaries
+- Confirmation that slope conflict removal is effective
+- Confirmation that backward compatibility is preserved
+>>>>>>> Stashed changes

@@ -11,7 +11,7 @@ try:
 except ImportError:
     fyersModel = None  # offline replay doesn't need fyers SDK
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time as dtime, timedelta
 
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
@@ -156,28 +156,50 @@ REGIME_MATRIX = {
         "COUNTER_PENALTY": -15, # Strong penalty for counter-trend
         "COOLDOWN_LOSS": 5,     # 15 min cooldown (reduced from 10)
         "COOLDOWN_WIN": 3,      # 9 min cooldown
+        "ST_OPENING_RELAX": True,   # Phase 6.4: allow opening ST relaxation
+        "REVERSAL_ALLOWED": True,   # Phase 6.4: reversal entries if EMA + ADX confirm
+        "REVERSAL_SCORE_BONUS": 0,  # Phase 6.4: additional score bonus for reversals
     },
     "RANGE_DAY": {
         "RSI_FLOOR": None,      # Standard oscillator bounds
         "COUNTER_PENALTY": 0,   # Both sides valid
         "COOLDOWN_LOSS": 10,    # Standard
         "COOLDOWN_WIN": 5,
+        "ST_OPENING_RELAX": True,   # Phase 6.4: ST relaxation allowed
+        "REVERSAL_ALLOWED": True,   # Phase 6.4: reversal entries allowed
+        "REVERSAL_SCORE_BONUS": 0,
     },
     "GAP_DAY": {
         "RSI_FLOOR": 5,        # Near-zero for gap-aligned
         "COUNTER_PENALTY": -10, # Penalty first 30 min, relaxes later
         "COOLDOWN_LOSS": 10,
         "COOLDOWN_WIN": 5,
+        "ST_OPENING_RELAX": True,    # Phase 6.4: ST relaxation allowed
+        "REVERSAL_ALLOWED": True,    # Phase 6.4: gap-aligned reversal entries
+        "REVERSAL_SCORE_BONUS": 10,  # Phase 6.4: +10 for gap-aligned reversals
     },
     "BALANCE_DAY": {
         "RSI_FLOOR": None,      # Tightened bounds (standard)
         "COUNTER_PENALTY": 0,   # Both sides valid
         "COOLDOWN_LOSS": 7,     # Moderate
         "COOLDOWN_WIN": 5,
+        "ST_OPENING_RELAX": False,  # Phase 6.4: suppressed on balance days
+        "REVERSAL_ALLOWED": True,
+        "REVERSAL_SCORE_BONUS": 0,
+    },
+    "HIGH_VOL": {
+        "RSI_FLOOR": 0,        # Phase 6.4: no RSI floor in high vol
+        "COUNTER_PENALTY": -5,  # Mild penalty
+        "COOLDOWN_LOSS": 7,
+        "COOLDOWN_WIN": 3,
+        "ST_OPENING_RELAX": True,   # Phase 6.4: ST relaxation with ATR-scaled thresholds
+        "REVERSAL_ALLOWED": True,
+        "REVERSAL_SCORE_BONUS": 0,
     },
 }
-# Fallback for HIGH_VOL or unclassified days — uses standard logic.
-_REGIME_DEFAULT = {"RSI_FLOOR": None, "COUNTER_PENALTY": 0, "COOLDOWN_LOSS": 10, "COOLDOWN_WIN": 5}
+# Fallback for unclassified days — uses standard logic.
+_REGIME_DEFAULT = {"RSI_FLOOR": None, "COUNTER_PENALTY": 0, "COOLDOWN_LOSS": 10, "COOLDOWN_WIN": 5,
+                   "ST_OPENING_RELAX": False, "REVERSAL_ALLOWED": True, "REVERSAL_SCORE_BONUS": 0}
 
 #===========================================================
 # Initalize filled_df
@@ -1181,6 +1203,51 @@ def _trend_entry_quality_gate(
             st_details["blocked_by"] = "DAILY_R4_FILTER"
             return False, allowed_side, "Price above daily R4 — PUT blocked in bullish regime.", st_details
 
+    # ── Phase 6.4: Opening ST Relaxation ──────────────────────────────────────
+    # In the first 20 minutes (bar_time <= 09:20), ST bias may be unreliable
+    # due to warm-up lag. When a reversal signal with EMA + ADX confirmation
+    # is present, treat the reversal side as the allowed side even if ST
+    # alignment/conflict would normally block it.
+    # Suppressed on BALANCE_DAY (both sides equally valid, no stretch expected).
+    _opening_st_relax_applied = False
+    _opening_relax_bar_limit = dtime(9, 20) if not hasattr(dtime, '__func__') else dtime(9, 20)
+    _dt_tag_for_relax = (
+        getattr(getattr(day_type_result, "name", None), "value", "UNKNOWN")
+        if day_type_result else "UNKNOWN"
+    )
+    _is_opening_window = False
+    try:
+        _bar_t = (
+            timestamp.time() if hasattr(timestamp, "time") else timestamp
+        )
+        _is_opening_window = _bar_t <= _opening_relax_bar_limit
+    except Exception:
+        pass
+    _balance_day_block = _dt_tag_for_relax in ("BALANCE_DAY", "BALANCE")
+    if (not aligned
+            and _is_opening_window
+            and not _balance_day_block
+            and isinstance(reversal_signal, dict)
+            and reversal_signal.get("side") in ("CALL", "PUT")
+            and np.isfinite(adx_val) and adx_val >= 25.0):
+        allowed_side = reversal_signal["side"]
+        aligned = True  # Override alignment for this reversal
+        _opening_st_relax_applied = True
+        st_details["st_opening_relax"] = True
+        st_details["st_conflict_override"] = True
+        st_details["st_conflict_override_reason"] = (
+            f"ST_OPENING_RELAX: reversal_side={allowed_side} "
+            f"score={reversal_signal.get('score')} adx={adx_val:.1f} "
+            f"stretch={reversal_signal.get('stretch')}"
+        )
+        logging.info(
+            f"{GREEN}[ST_OPENING_RELAX] timestamp={timestamp} symbol={symbol} "
+            f"side={allowed_side} reversal_score={reversal_signal.get('score')} "
+            f"adx={adx_val:.1f} stretch={reversal_signal.get('stretch')} "
+            f"day_type={_dt_tag_for_relax} "
+            f"reason=Opening window ST relaxation — reversal + ADX confirm direction{RESET}"
+        )
+
     if not aligned:
         candidate_side = None
         if st_details.get("ST3m_bias") == "BULLISH":
@@ -1478,6 +1545,18 @@ def _trend_entry_quality_gate(
             and reversal_signal.get("side") == allowed_side
             and float(reversal_signal.get("score", 0)) >= 70.0
         )
+        # Phase 6.4: Snap-back reversal override — price was stretched further
+        # in recent bars and is now snapping back toward pivots. Lower the
+        # score threshold to 50 when snap-back is confirmed + pivot aligned.
+        _ema_snapback_override = False
+        if (not _ema_override
+                and isinstance(reversal_signal, dict)
+                and reversal_signal.get("side") == allowed_side
+                and reversal_signal.get("snapback", False)
+                and reversal_signal.get("pivot_confirmed", False)
+                and float(reversal_signal.get("score", 0)) >= 50.0):
+            _ema_snapback_override = True
+            _ema_override = True
         # Daily Camarilla override: if price below daily S4 (PUT) or above daily R4 (CALL),
         # the EMA stretch is trend continuation on a gap/breakout day, not overextension.
         _ema_daily_override = False
@@ -1490,16 +1569,29 @@ def _trend_entry_quality_gate(
                 _ema_daily_override = True
         if _ema_override or _ema_daily_override:
             _ovr_reason = (
-                "Aligned high-score reversal override."
-                if _ema_override
-                else f"Daily Camarilla trend continuation: {'below S4' if allowed_side == 'PUT' else 'above R4'}"
+                "Snap-back reversal override (pivot_confirmed + score≥50)."
+                if _ema_snapback_override
+                else (
+                    "Aligned high-score reversal override."
+                    if _ema_override
+                    else f"Daily Camarilla trend continuation: {'below S4' if allowed_side == 'PUT' else 'above R4'}"
+                )
             )
             st_details["ema_stretch_override"] = True
+            if _ema_snapback_override:
+                st_details["reversal_ema_stretch_override"] = True
             logging.info(
                 "[EMA_STRETCH][OVERRIDE] "
                 f"timestamp={timestamp} symbol={symbol} side={allowed_side} "
                 f"stretch={ema_stretch_mult:.2f}x reason={_ovr_reason}"
             )
+            if _ema_snapback_override:
+                logging.info(
+                    f"[REVERSAL_EMA_STRETCH] timestamp={timestamp} symbol={symbol} "
+                    f"side={allowed_side} stretch={ema_stretch_mult:.2f}x "
+                    f"snapback_revert={reversal_signal.get('snapback_info', {}).get('revert_pct', 0)} "
+                    f"reversal_score={reversal_signal.get('score')}"
+                )
         else:
             st_details["ema_stretch_blocked"] = True
             logging.info(
@@ -3442,7 +3534,22 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY", 
     if paper_info.get("last_exit_time"):
         elapsed = (ct - paper_info["last_exit_time"]).total_seconds()
         if elapsed < COOLDOWN_SECONDS:
-            if breakdown_ctx.get("opening_s4_breakdown", False) or breakdown_ctx.get("opening_r4_breakout", False):
+            # Phase 6.4: Reversal cooldown relaxation — allow early re-entry
+            # when reversal confirmation fires during cooldown (score ≥ 70).
+            _rev_cd_paper = detect_reversal(
+                candles_3m, cam_pre,
+                current_time=ct,
+                day_type_tag=getattr(getattr(_paper_day_type, "name", None), "value", None) if _paper_day_type else None,
+            ) if len(candles_3m) >= 15 else None
+            if (_rev_cd_paper is not None
+                    and _rev_cd_paper.get("score", 0) >= 70
+                    and elapsed >= 30):  # at least 30s elapsed
+                logging.info(
+                    f"[REVERSAL_COOLDOWN_RELAX] elapsed={elapsed:.0f}s "
+                    f"side={_rev_cd_paper['side']} score={_rev_cd_paper['score']} "
+                    f"reason=Reversal confirmation during paper cooldown, bypass allowed"
+                )
+            elif breakdown_ctx.get("opening_s4_breakdown", False) or breakdown_ctx.get("opening_r4_breakout", False):
                 tag = "OPENING_S4_BREAKDOWN" if breakdown_ctx.get("opening_s4_breakdown", False) else "OPENING_R4_BREAKOUT"
                 logging.info(
                     f"[ENTRY COOLDOWN BYPASS][{tag}] elapsed={elapsed:.0f}s "
@@ -5290,6 +5397,11 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         # Replacing the former inline _PM class — thresholds live in position_manager.py
         pm = make_replay_pm(lot_size=quantity)
         cooldown_until = 0   # bar index after which new entries are allowed again
+        _prev_st3m_bias = None  # Phase 6.4: track ST bias for flip detection
+        _last_reversal_bar = -999  # Phase 6.4: bar index of last reversal signal
+        _persisted_rev_sig = None  # Phase 6.4: persisted reversal signal
+        _persisted_rev_bar = -999  # Phase 6.4: bar at which reversal was first detected
+        _REVERSAL_PERSIST_BARS = 5  # Phase 6.4: max bars to persist a reversal signal
 
         # ── Day Type Classifier — initialized once per session ────────────
         # Uses previous day OHLC from the first replay bar to build pivot context.
@@ -5524,8 +5636,34 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
 
             # ── COOLDOWN — bars immediately after an exit ─────────────────────
             if i < cooldown_until:
-                blocker_counts["COOLDOWN"] = blocker_counts.get("COOLDOWN", 0) + 1
-                continue
+                # Phase 6.4: Reversal Cooldown Relaxation — if a reversal signal
+                # fires during cooldown with score ≥ 70, reduce remaining cooldown
+                # to max 3 bars from exit (allow early re-entry on confirmed reversal).
+                _rev_cd_sig = detect_reversal(
+                    slice_3m, cam,
+                    current_time=bar_time,
+                    day_type_tag=_rev_day_type_tag,
+                ) if len(slice_3m) >= 15 else None
+                if (_rev_cd_sig is not None
+                        and _rev_cd_sig.get("score", 0) >= 70
+                        and i >= (cooldown_until - 7)):  # only relax if within 7 bars of end
+                    _rev_cd_new = min(cooldown_until, i + 1)  # allow entry next bar
+                    logging.info(
+                        f"[REVERSAL_COOLDOWN_RELAX] bar={i} side={_rev_cd_sig['side']} "
+                        f"score={_rev_cd_sig['score']} cooldown_was={cooldown_until} "
+                        f"cooldown_now={_rev_cd_new} "
+                        f"reason=Reversal confirmation during cooldown, reduced wait"
+                    )
+                    cooldown_until = _rev_cd_new
+                    # Re-check — if relaxed cooldown is satisfied, fall through
+                    if i >= cooldown_until:
+                        pass  # continue to entry logic below
+                    else:
+                        blocker_counts["COOLDOWN"] = blocker_counts.get("COOLDOWN", 0) + 1
+                        continue
+                else:
+                    blocker_counts["COOLDOWN"] = blocker_counts.get("COOLDOWN", 0) + 1
+                    continue
 
             # ── POST-MARKET GATE — no entries after close ─────────────────────
             if bar_t >= 15 * 60 + 30:
@@ -5660,6 +5798,44 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 current_time=bar_time,
                 day_type_tag=_rev_day_type_tag,
             )
+            # Phase 6.4: Track reversal signal bar for bias flip detection
+            if _rev_sig_replay is not None:
+                _last_reversal_bar = i
+
+            # Phase 6.4: Reversal Signal Persistence — if a fresh reversal fires
+            # with score ≥ 70, persist it for up to 5 bars until captured or invalidated.
+            if _rev_sig_replay is not None and _rev_sig_replay.get("score", 0) >= 70:
+                _persisted_rev_sig = _rev_sig_replay
+                _persisted_rev_bar = i
+                logging.info(
+                    f"[REVERSAL_PERSIST] bar={i} timestamp={bar_time} "
+                    f"side={_rev_sig_replay['side']} score={_rev_sig_replay['score']} "
+                    f"persist_until_bar={i + _REVERSAL_PERSIST_BARS}"
+                )
+            elif _rev_sig_replay is None and _persisted_rev_sig is not None:
+                # Use persisted signal if still within window
+                if (i - _persisted_rev_bar) <= _REVERSAL_PERSIST_BARS:
+                    _rev_sig_replay = _persisted_rev_sig
+                else:
+                    # Expired — invalidate
+                    _persisted_rev_sig = None
+
+            # Phase 6.4: Bias Flip Attribution — detect when ST3m bias changes
+            # within 3 bars of a reversal signal and log for attribution.
+            _cur_st3m_bias = str(last_row.get("supertrend_bias", "NEUTRAL")).upper()
+            if (_prev_st3m_bias is not None
+                    and _cur_st3m_bias != _prev_st3m_bias
+                    and _cur_st3m_bias in ("BULLISH", "BEARISH")
+                    and (i - _last_reversal_bar) <= 3):
+                _flip_side = "CALL" if _cur_st3m_bias == "BULLISH" else "PUT"
+                logging.info(
+                    f"[REVERSAL_BIAS_FLIP] bar={i} timestamp={bar_time} "
+                    f"bias_from={_prev_st3m_bias} bias_to={_cur_st3m_bias} "
+                    f"reversal_bar={_last_reversal_bar} bars_since_reversal={i - _last_reversal_bar} "
+                    f"flip_side={_flip_side}"
+                )
+            _prev_st3m_bias = _cur_st3m_bias
+
             _fb_sig_replay = detect_failed_breakout(slice_3m, cam)
             quality_ok, allowed_side, gate_reason, st_details = _trend_entry_quality_gate(
                 candles_3m=slice_3m,
@@ -5936,6 +6112,20 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             # This locks out all subsequent bars from calling detect_signal
             # until this trade is exited.
             pm.open(i, bar_time, bar_close, entry_premium, signal)
+
+            # Phase 6.4: Reversal capture attribution
+            if (_rev_sig_replay is not None
+                    and _rev_sig_replay.get("side") == signal.get("side")):
+                logging.info(
+                    f"[REVERSAL_CAPTURE] bar={i} timestamp={bar_time} "
+                    f"side={signal.get('side')} reversal_score={_rev_sig_replay.get('score')} "
+                    f"stretch={_rev_sig_replay.get('stretch')} "
+                    f"pivot_zone={_rev_sig_replay.get('pivot_zone')} "
+                    f"st_opening_relax={st_details.get('st_opening_relax', False)} "
+                    f"ema_stretch_override={st_details.get('reversal_ema_stretch_override', False)}"
+                )
+                # Consume persisted reversal signal after capture
+                _persisted_rev_sig = None
 
         # ── Force close if still open at end of data ──────────────────────────
         if pm.is_open():
