@@ -1,36 +1,47 @@
-"""Market context — bridges to root context modules.
-
-Re-exports regime detection, day classification, and sentiment analysis.
-"""
+"""Market context — regime detection, day classification, and sentiment analysis."""
 from __future__ import annotations
 
-import importlib as _il
+# ── tbot_core.context.regime ────────────────────────────────────
+from tbot_core.context.regime import (
+    RegimeContext,
+    compute_regime_context,
+    compute_scalp_regime_context,
+    log_regime_context,
+    classify_atr_regime,
+    classify_adx_tier,
+)
 
-# ── Root regime_context.py ───────────────────────────────────────
-_rc = _il.import_module("regime_context")
-RegimeContext = _rc.RegimeContext
-compute_regime_context = _rc.compute_regime_context
+# ── tbot_core.context.day_type ──────────────────────────────────
+from tbot_core.context.day_type import (
+    DayTypeClassifier,
+    DayTypeResult,
+    DayType,
+    PivotContext,
+    build_pivot_context,
+    make_day_type_classifier,
+    apply_day_type_to_threshold,
+    apply_day_type_to_pm,
+)
 
-# ── Root day_type.py ─────────────────────────────────────────────
-_dt = _il.import_module("day_type")
-DayTypeClassifier = _dt.DayTypeClassifier
-DayTypeResult = _dt.DayTypeResult
-apply_day_type_to_threshold = _dt.apply_day_type_to_threshold
-apply_day_type_to_pm = _dt.apply_day_type_to_pm
-
-# ── Root daily_sentiment.py ──────────────────────────────────────
-_ds = _il.import_module("daily_sentiment")
-get_daily_sentiment = _ds.get_daily_sentiment
-get_daily_sentiment_from_candles = _ds.get_daily_sentiment_from_candles
-compute_intraday_sentiment = _ds.compute_intraday_sentiment
-classify_day_type = _ds.classify_day_type
-get_opening_bias = _ds.get_opening_bias
-get_open_position_bias = _ds.get_open_position_bias
+# ── tbot_core.context.sentiment ─────────────────────────────────
+from tbot_core.context.sentiment import (
+    get_daily_sentiment,
+    get_daily_sentiment_from_candles,
+    compute_intraday_sentiment,
+    classify_day_type,
+    get_opening_bias,
+    get_open_position_bias,
+)
 
 __all__ = [
-    "RegimeContext", "compute_regime_context",
-    "DayTypeClassifier", "DayTypeResult",
+    # regime
+    "RegimeContext", "compute_regime_context", "compute_scalp_regime_context",
+    "log_regime_context", "classify_atr_regime", "classify_adx_tier",
+    # day_type
+    "DayTypeClassifier", "DayTypeResult", "DayType", "PivotContext",
+    "build_pivot_context", "make_day_type_classifier",
     "apply_day_type_to_threshold", "apply_day_type_to_pm",
+    # sentiment
     "get_daily_sentiment", "get_daily_sentiment_from_candles",
     "compute_intraday_sentiment", "classify_day_type",
     "get_opening_bias", "get_open_position_bias",

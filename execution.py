@@ -5477,23 +5477,31 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 _session_open_price = float(bar_close)
 
             # ── Day Type Classifier — update every bar ─────────────────────────
-            # Initialize DTC on first bar using previous-session OHLC
+            # Initialize DTC on first bar using aggregated previous-day OHLC
             if _dtc is None and len(slice_3m) >= 2:
                 try:
-                    prev_bar = slice_3m.iloc[-2]
-                    _cpr0  = calculate_cpr(float(prev_bar["high"]),
-                                           float(prev_bar["low"]),
-                                           float(prev_bar["close"]))
-                    _cam0  = calculate_camarilla_pivots(float(prev_bar["high"]),
-                                                        float(prev_bar["low"]),
-                                                        float(prev_bar["close"]))
+                    # Aggregate previous trading day's H/L/C (not single bar)
+                    _dates_col = slice_3m[sc3].astype(str).str[:10]
+                    _today_str = date_str or _dates_col.iloc[-1]
+                    _prev_mask = _dates_col < _today_str
+                    if _prev_mask.any():
+                        _prev_bars = slice_3m[_prev_mask]
+                        _last_prev_date = _dates_col[_prev_mask].iloc[-1]
+                        _day_bars = _prev_bars[_dates_col[_prev_mask] == _last_prev_date]
+                        _ph = float(_day_bars["high"].max())
+                        _pl = float(_day_bars["low"].min())
+                        _pc = float(_day_bars.iloc[-1]["close"])
+                    else:
+                        prev_bar = slice_3m.iloc[-2]
+                        _ph = float(prev_bar["high"])
+                        _pl = float(prev_bar["low"])
+                        _pc = float(prev_bar["close"])
+                    _cpr0  = calculate_cpr(_ph, _pl, _pc)
+                    _cam0  = calculate_camarilla_pivots(_ph, _pl, _pc)
                     _dtc   = make_day_type_classifier(
-                        _cam0, _cpr0,
-                        float(prev_bar["high"]),
-                        float(prev_bar["low"]),
-                        float(prev_bar["close"]),
+                        _cam0, _cpr0, _ph, _pl, _pc,
                     )
-                    _session_prev_close = float(prev_bar["close"])
+                    _session_prev_close = _pc
                     _daily_cam = _cam0  # fixed for entire session
                     logging.info(
                         f"[DAY TYPE] Classifier initialized "
@@ -5686,6 +5694,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             if _trend_cont.is_active and _trend_cont.can_re_enter(bar_close, atr):
                 _tc_side = _trend_cont.active_side
                 entry_premium = round(bar_close * 0.006, 1)
+                _tc_day_tag = (
+                    getattr(getattr(_day_type, "name", None), "value", "UNKNOWN")
+                    if _day_type is not None else "UNKNOWN"
+                )
                 _tc_signal = {
                     "side": _tc_side,
                     "reason": "TREND_CONTINUATION",
@@ -5705,6 +5717,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     "trend_continuation": True,
                     "continuation_num": _trend_cont.continuation_count + 1,
                     "open_bias_aligned": "ALIGNED",
+                    "day_type": _tc_day_tag,
                 }
                 logging.info(
                     f"[TREND_CONTINUATION_OVERRIDE] bar={i} {bar_time} "
@@ -5803,8 +5816,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 _last_reversal_bar = i
 
             # Phase 6.4: Reversal Signal Persistence — if a fresh reversal fires
-            # with score ≥ 70, persist it for up to 5 bars until captured or invalidated.
-            if _rev_sig_replay is not None and _rev_sig_replay.get("score", 0) >= 70:
+            # with score ≥ 70 (or ≥ 60 at extreme pivot S4/S5/R4/R5), persist for up to 5 bars.
+            _rev_persist_zone = _rev_sig_replay.get("pivot_zone", "") if _rev_sig_replay else ""
+            _rev_persist_thr = 60 if _rev_persist_zone in ("S4", "S5", "R4", "R5") else 70
+            if _rev_sig_replay is not None and _rev_sig_replay.get("score", 0) >= _rev_persist_thr:
                 _persisted_rev_sig = _rev_sig_replay
                 _persisted_rev_bar = i
                 logging.info(
@@ -5885,72 +5900,56 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 )
                 continue
 
-        # Strong reversal signal can flip allowed side even when trend gate passed (replay)
-        if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= 80:
-            _rev_side = _rev_sig_replay.get("side")
-            if _rev_side in {"CALL", "PUT"} and _rev_side != allowed_side:
-                logging.info(
-                    "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ALLOWEDSIDE][REPLAY] "
-                    f"timestamp={bar_time} symbol={sym} allowed_side={allowed_side} -> {_rev_side} "
-                    f"reason=High-confidence reversal score={_rev_sig_replay.get('score')}"
-                )
-                allowed_side = _rev_side
-
-        fake_time = _FakeTime(ts.hour, ts.minute)
-
-        # Phase 4: zone_revisit_signal already computed at line ~5060
-        _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
-
-        try:
-            signal = detect_signal(
-                candles_3m=slice_3m,
-                candles_15m=slice_15m,
-                cpr_levels=cpr,
-                camarilla_levels=cam,
-                traditional_levels=trad,
-                atr=atr,
-                include_partial=False,
-                current_time=fake_time,
-                vwap=tpma,
-                orb_high=orb_h,
-                orb_low=orb_l,
-                day_type_result=_day_type,
-                osc_relief_active=st_details.get("osc_relief_override", False),
-                zone_signal=_zone_dict,
-                daily_camarilla_levels=_daily_cam,
-                st_details=st_details,  # Phase 6.3: pass gate context for momentum path
-            )
-        except Exception as e:
-            logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
-            blocker_counts["SIGNAL_ERROR"] = blocker_counts.get("SIGNAL_ERROR", 0) + 1
-            continue
-
-            if not signal:
-                blocked_by = signal.get("reason", "SCORE_LOW") if signal else "NO_SIGNAL"
-                blocker_counts[blocked_by] += 1
-                # Phase 6.3: Signal Skip Sentinel Audit — gate passed but signal scorer
-                # returned nothing.  Log for attribution when override was active.
-                _gate_override = (
-                    st_details.get("st_conflict_override")
-                    or st_details.get("osc_trend_override")
-                    or st_details.get("osc_relief_override")
-                    or st_details.get("tilt_osc_override")
-                )
-                if _gate_override:
+            # Strong reversal signal can flip allowed side even when trend gate passed (replay)
+            # Lower threshold (65) for extreme pivot zones (S4/S5/R4/R5); standard (80) otherwise
+            _rev_pivot = _rev_sig_replay.get("pivot_zone", "") if _rev_sig_replay else ""
+            _rev_force_thr = 65 if _rev_pivot in ("S4", "S5", "R4", "R5") else 80
+            if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= _rev_force_thr:
+                _rev_side = _rev_sig_replay.get("side")
+                if _rev_side in {"CALL", "PUT"} and _rev_side != allowed_side:
                     logging.info(
-                        f"[SIGNAL_SKIP] bar={i} timestamp={bar_time} symbol={sym} "
-                        f"allowed_side={allowed_side} gate_overrides="
-                        f"st_conflict={st_details.get('st_conflict_override', False)} "
-                        f"osc_trend={st_details.get('osc_trend_override', False)} "
-                        f"osc_relief={st_details.get('osc_relief_override', False)} "
-                        f"tilt={st_details.get('tilt_osc_override', False)} "
-                        f"reason=Quality gate passed with override but detect_signal returned no signal"
+                        "[ENTRY ALLOWED][REVERSAL_OVERRIDE_ALLOWEDSIDE][REPLAY] "
+                        f"timestamp={bar_time} symbol={sym} allowed_side={allowed_side} -> {_rev_side} "
+                        f"reason=High-confidence reversal score={_rev_sig_replay.get('score')}"
                     )
-                    blocker_counts["SIGNAL_SKIP"] = blocker_counts.get("SIGNAL_SKIP", 0) + 1
+                    allowed_side = _rev_side
+
+            fake_time = _FakeTime(ts.hour, ts.minute)
+
+            # Phase 4: zone_revisit_signal already computed at line ~5060
+            _zone_dict = _zone_revisit_signal if isinstance(_zone_revisit_signal, dict) else None
+
+            try:
+                signal = detect_signal(
+                    candles_3m=slice_3m,
+                    candles_15m=slice_15m,
+                    cpr_levels=cpr,
+                    camarilla_levels=cam,
+                    traditional_levels=trad,
+                    atr=atr,
+                    include_partial=False,
+                    current_time=fake_time,
+                    vwap=tpma,
+                    orb_high=orb_h,
+                    orb_low=orb_l,
+                    day_type_result=_day_type,
+                    osc_relief_active=st_details.get("osc_relief_override", False),
+                    zone_signal=_zone_dict,
+                    daily_camarilla_levels=_daily_cam,
+                    st_details=st_details,  # Phase 6.3: pass gate context for momentum path
+                )
+            except Exception as e:
+                logging.warning(f"[REPLAY bar={i}] detect_signal error: {e}")
+                blocker_counts["SIGNAL_ERROR"] = blocker_counts.get("SIGNAL_ERROR", 0) + 1
                 continue
 
             # If a high-confidence reversal signal exists, allow it to override lower-score trend signals
-            if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= 80:
+            # This MUST run before the 'if not signal' gate so reversals can create entries
+            # even when detect_signal returns None (oscillators at extreme levels).
+            # Lower threshold (65) for extreme pivot zones (S4/S5/R4/R5); standard (80) otherwise
+            _rev_pivot2 = _rev_sig_replay.get("pivot_zone", "") if _rev_sig_replay else ""
+            _rev_force_thr2 = 65 if _rev_pivot2 in ("S4", "S5", "R4", "R5") else 80
+            if _rev_sig_replay and _rev_sig_replay.get("score", 0) >= _rev_force_thr2:
                 if (not signal) or (_rev_sig_replay.get("score", 0) >= signal.get("score", 0)):
                     logging.info(
                         "[ENTRY SELECT][REVERSAL_FORCE][REPLAY] "
@@ -5962,6 +5961,10 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                         "reason": _rev_sig_replay.get("reason", "REVERSAL_FORCE"),
                         "source": "REVERSAL_FORCE",
                     }
+
+            if not signal:
+                blocker_counts["NO_SIGNAL"] = blocker_counts.get("NO_SIGNAL", 0) + 1
+                continue
 
             # Block WEAK signals — only HIGH/MEDIUM strength allowed
             sig_strength = signal.get("strength", "MEDIUM")
@@ -6005,7 +6008,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     f"allowed_side_prev={allowed_side} reason=Pivot/oscillator reversal override"
                 )
                 allowed_side = side
-                
+            
             # # Conflict Governance: Check Open Positions
             # if (side == "CALL" and put_open) or (side == "PUT" and call_open):
             #     logging.info(f"[CONFLICT_BLOCKED] Opposing position already open. Blocking {side} entry.")

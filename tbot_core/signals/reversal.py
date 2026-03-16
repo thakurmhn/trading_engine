@@ -492,8 +492,8 @@ def detect_reversal(
     if osc_confirmed:
         logging.info(
             f"[REVERSAL_OSC_CONFIRM] side={side} "
-            f"RSI={f'{rsi:.1f}' if rsi is not None else 'N/A'} "
-            f"CCI={f'{cci:.0f}' if cci is not None else 'N/A'} "
+            f"RSI={rsi:.1f if rsi is not None else 'N/A'} "
+            f"CCI={cci:.0f if cci is not None else 'N/A'} "
             f"reason=Oscillator extreme treated as confirmation"
         )
 
@@ -519,4 +519,5 @@ def get_reversal_signal(
 __all__ = [
     "detect_reversal",
     "get_reversal_signal",
+    "EMA_STRETCH_REVERSAL_THRESHOLD",
 ]
